@@ -52,6 +52,11 @@ void UAIDAOrchestrator::Deinitialize()
 		IConsoleManager::Get().UnregisterConsoleObject(PingCommand);
 		PingCommand = nullptr;
 	}
+	if (SayCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(SayCommand);
+		SayCommand = nullptr;
+	}
 	LLMClient.Reset();
 	Session.Reset();
 
@@ -252,6 +257,28 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Send a one-shot test prompt to the configured LLM and log the reply. Usage: AIDA.Ping [prompt...]"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Ping),
 		ECVF_Default);
+
+	SayCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Say"),
+		TEXT("Inject a chat request through the full relay path (run on server/host). Usage: AIDA.Say [text...]"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Say),
+		ECVF_Default);
+}
+
+void UAIDAOrchestrator::Say(const TArray<FString>& Args)
+{
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Say runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	FAIDARequester Requester;
+	Requester.Author = TEXT("DebugPlayer");
+	Requester.PlayerId = TEXT("debug");
+
+	const FString Text = Args.Num() > 0 ? FString::Join(Args, TEXT(" ")) : TEXT("Hello from AIDA.Say");
+	HandleChatRequest(Requester, Text);
 }
 
 void UAIDAOrchestrator::Ping(const TArray<FString>& Args)

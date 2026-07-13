@@ -70,6 +70,13 @@ private:
 	/** `AIDA.Ping [prompt]` — one-shot completion against the configured LLM; logs the reply. */
 	void Ping(const TArray<FString>& Args);
 
+	/**
+	 * `AIDA.Say [text]` — inject a chat request server-side (as a debug "player") through the full
+	 * relay path: posts the player message and streams the AIDA reply, both fanning out to all
+	 * clients. Run on the server/host to verify Slice 1 replication without a widget.
+	 */
+	void Say(const TArray<FString>& Args);
+
 	FAIDAConfig Config;
 	bool bConfigLoaded = false;
 
@@ -79,4 +86,5 @@ private:
 	FAIDARateLimiter RateLimiter;
 	FAIDAPermissionService Permissions;
 	IConsoleCommand* PingCommand = nullptr;
+	IConsoleCommand* SayCommand = nullptr;
 };

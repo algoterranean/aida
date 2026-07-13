@@ -20,17 +20,26 @@ Unit tests (`Tests/AIDATests.cpp`): `AIDA.Session.*`, `AIDA.Policy.RateLimiter`,
 
 ## Slice 1 verification — WITHOUT a widget (do this first)
 
-The relay logs everything, so the streaming round-trip is verifiable before any UMG work.
+The relay logs everything, and `AIDA.Say` injects a chat through the full relay path, so the streaming
+round-trip is verifiable before any UMG work. (`AIDA.Ping` does NOT — it calls the LLM directly and
+bypasses the relay/replication; it only proves the server-side LLM stream.)
 
-1. Build `FactoryEditor`, open the editor, set **Play → Net Mode = Play As Listen Server**, **2 players**.
-2. In the Output Log filter on `LogAIDA` and raise verbosity: console `Log LogAIDA Verbose`.
-3. Server currently has no client send path yet without the widget, so drive it from the host: with a
-   local RCO present on the listen-server host, call `AIDAChatRelay::SubmitChat` — easiest via a
-   temporary console exec or the widget (below). For a pure-C++ smoke test, `AIDA.Ping <prompt>` still
-   exercises the LLM stream server-side (logs `AIDA delta:`).
-4. On the **second** client's Output Log you should see `[relay] MsgBegin …`, several `[relay] MsgChunk …`
-   lines arriving incrementally, then `[relay] MsgEnd … ok`. That is the P1 core: two clients watching
-   one answer stream in live.
+1. Build `FactoryEditor`, open the editor. In the toolbar next to Play: set **Net Mode = Play As Listen
+   Server** and **Number of Players = 2**. Press Play — you get two game windows (window 1 = host/server,
+   window 2 = a remote client).
+2. Open the Output Log (Window → Output Log). Raise verbosity so the relay traces show: in the console
+   type `Log LogAIDA Verbose`. Do this for whichever window(s) you want to watch — Output Log is shared
+   in PIE, but each client's `[relay]` lines are prefixed by its own world, so watch the log while
+   focusing each window, or add `-LogCmds="LogAIDA Verbose"`.
+3. In the **host window** (window 1) press `~` for the console and run: `AIDA.Say hello there`.
+   - This posts the "DebugPlayer" message (fans out Begin+Chunk+End) and, if an LLM is configured,
+     streams the AIDA reply out too. Even with no LLM configured you still see the player message and a
+     System notice replicate — enough to prove the relay.
+4. Expected in the log for the **second client** (window 2): `[relay] MsgBegin id=… author=DebugPlayer`,
+   then `[relay] MsgChunk id=… seq=0 …` (and more seqs as the AIDA reply streams), then
+   `[relay] MsgEnd … ok`. Seeing those on the non-host client is the P1 core: two clients watching one
+   answer stream in live. If the LLM is configured you'll watch the AIDA reply arrive in incremental
+   chunks rather than one blob.
 
 ## Slice 2 — author the ChatWidget Blueprint (editor, GUI)
 
