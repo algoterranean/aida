@@ -2,8 +2,10 @@
 
 #include "AIDA.h"
 #include "Core/AIDAConfigLoader.h"
+#include "Adapters/LLMClient.h"
 #include "Engine/World.h"
 #include "Misc/Paths.h"
+#include "HAL/IConsoleManager.h"
 #include "Interfaces/IPluginManager.h"
 
 bool UAIDAOrchestrator::ShouldCreateSubsystem(UObject* Outer) const
@@ -34,6 +36,55 @@ void UAIDAOrchestrator::OnWorldBeginPlay(UWorld& InWorld)
 
 	UE_LOG(LogAIDA, Log, TEXT("AIDA orchestrator starting (netmode=%d)."), static_cast<int32>(InWorld.GetNetMode()));
 	LoadConfig();
+	RegisterConsoleCommands();
+}
+
+void UAIDAOrchestrator::Deinitialize()
+{
+	if (PingCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(PingCommand);
+		PingCommand = nullptr;
+	}
+	LLMClient.Reset();
+
+	Super::Deinitialize();
+}
+
+void UAIDAOrchestrator::RegisterConsoleCommands()
+{
+	if (PingCommand)
+	{
+		return; // already registered (OnWorldBeginPlay can fire per-world)
+	}
+
+	PingCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Ping"),
+		TEXT("Send a one-shot test prompt to the configured LLM and log the reply. Usage: AIDA.Ping [prompt...]"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Ping),
+		ECVF_Default);
+}
+
+void UAIDAOrchestrator::Ping(const TArray<FString>& Args)
+{
+	if (!LLMClient.IsValid() || !LLMClient->IsReady())
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Ping: LLM client not ready (config not loaded, or provider not implemented)."));
+		return;
+	}
+
+	const FString Prompt = Args.Num() > 0 ? FString::Join(Args, TEXT(" ")) : TEXT("Reply with a short, friendly hello.");
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Ping -> \"%s\""), *Prompt);
+
+	LLMClient->Complete(Prompt,
+		[](const FString& Text)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("AIDA reply: %s"), *Text);
+		},
+		[](int32 Status, const FString& Message)
+		{
+			UE_LOG(LogAIDA, Error, TEXT("AIDA.Ping failed (HTTP %d): %s"), Status, *Message);
+		});
 }
 
 FString UAIDAOrchestrator::ResolveConfigPath(FString& OutSource) const
@@ -72,6 +123,10 @@ void UAIDAOrchestrator::LoadConfig()
 			*Source,
 			*Config.Provider.Type, *Config.Provider.BaseUrl, *Config.Provider.Model,
 			Config.Provider.ApiKey.IsEmpty() ? TEXT("<none>") : TEXT("<set:redacted>"));
+
+		LLMClient = MakeShared<FLLMClient>(Config);
+		UE_LOG(LogAIDA, Log, TEXT("LLM client %s. Run console command 'AIDA.Ping' to test a round-trip."),
+			LLMClient->IsReady() ? TEXT("ready") : TEXT("NOT ready (provider unimplemented)"));
 	}
 	else
 	{
