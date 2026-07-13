@@ -1,0 +1,77 @@
+{
+  "schemaVersion": "0.1.0",
+  "_comment": "Tool catalog exposed to the model. Schemas are validated at load; admin overrides are hot-validated. Changes here require a schemaVersion bump and a changelog entry (docs/DEV.md coding rule 7). tier ∈ chat|query|act. Each tool MUST state an output bound.",
+  "tools": [
+    {
+      "name": "get_factory_overview",
+      "tier": "query",
+      "description": "Aggregated factory summary (clusters, balance, power). Always fits in context (~1-2k tokens).",
+      "outputBound": "~2k tokens; single aggregate object",
+      "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+    },
+    {
+      "name": "inspect_cluster",
+      "tier": "query",
+      "description": "Drill into one cluster's machines and flows.",
+      "outputBound": "machines paginated, 50 per page with 'N more' hint",
+      "parameters": {
+        "type": "object",
+        "properties": { "id": { "type": "string", "description": "Cluster ID from get_factory_overview." } },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_item_balance",
+      "tier": "query",
+      "description": "Net production/consumption per item across the factory, with deficit flags.",
+      "outputBound": "one row per item; truncated to top 100 by |net|",
+      "parameters": {
+        "type": "object",
+        "properties": { "item": { "type": "string", "description": "Optional item class/name; omit for all." } },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "find_bottleneck",
+      "tier": "query",
+      "description": "Trace the limiting stage for an item's production chain.",
+      "outputBound": "single trace, max 20 stages",
+      "parameters": {
+        "type": "object",
+        "properties": { "item": { "type": "string" } },
+        "required": ["item"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_resource_nodes",
+      "tier": "query",
+      "description": "Resource node positions, purity, occupancy.",
+      "outputBound": "paginated, 100 nodes per page",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "region": { "type": "string", "description": "Optional named region filter." },
+          "untapped_only": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "add_note",
+      "tier": "query",
+      "description": "Persist a location-tagged annotation, attributed to the requesting player.",
+      "outputBound": "single note ID",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" },
+          "position": { "type": "string", "description": "Optional humanized position; defaults to player location." }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

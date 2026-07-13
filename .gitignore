@@ -1,0 +1,40 @@
+# --- Unreal / build artifacts ---
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+*.sln
+*.suo
+*.VC.db
+*.VC.opendb
+.vs/
+
+# Compiled binaries
+*.obj
+*.pch
+*.dll
+*.lib
+*.so
+*.dylib
+*.exe
+*.a
+
+# Built map data
+*_BuiltData.uasset
+
+# --- Secrets: never commit API keys or real server config ---
+# Ship config.example.jsonc only; the real config with the server-only apiKey is ignored.
+**/secrets*
+**/config.jsonc
+**/config.json
+!**/config.example.jsonc
+
+# --- Local dev server runtime data ---
+tools/devserver/data/
+tools/devserver/config/
+tools/devserver/mods/
+
+# --- OS ---
+Thumbs.db
+.DS_Store

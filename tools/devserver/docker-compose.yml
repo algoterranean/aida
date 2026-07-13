@@ -1,0 +1,28 @@
+# Local Linux dedicated server for AIDA multiplayer / LinuxServer testing (docs/DEV.md §1.7).
+#
+#   docker compose up -d          start the server
+#   docker compose logs -f        watch logs (AIDA's first-run privacy disclosure prints here)
+#   docker compose restart        after dropping a new Alpakit LinuxServer build into ./mods
+#
+# Drop the Alpakit LinuxServer output of AIDA into ./mods, and AIDA config into ./config/Configs/AIDA/.
+services:
+  satisfactory:
+    image: wolveix/satisfactory-server:latest
+    container_name: aida-devserver
+    restart: unless-stopped
+    ports:
+      - "7777:7777/udp"
+      - "7777:7777/tcp"
+    volumes:
+      - ./data:/config/gamefiles          # game install + saves (persisted)
+      - ./config:/config/config           # server config incl. Configs/AIDA/
+      - ./mods:/config/gamefiles/FactoryGame/Mods   # Alpakit LinuxServer output goes here
+    environment:
+      - MAXPLAYERS=4
+      - PGID=1000
+      - PUID=1000
+      - STEAMBETA=false
+      - AUTOPAUSE=true
+      - AUTOSAVEONDISCONNECT=true
+    # TLS note: FHttpModule on Linux dedicated servers occasionally needs certificate-bundle
+    # configuration for outbound LLM HTTPS. If AIDA reports a TLS error class in the log, see docs.

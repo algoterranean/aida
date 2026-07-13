@@ -1,0 +1,33 @@
+// AIDA server configuration — EXAMPLE.
+// Copy to `Configs/AIDA/config.jsonc` on the server (or FactoryGame/Configs/AIDA/) and fill in.
+// The apiKey field is SERVER-ONLY: the orchestrator reads it once at init; it never enters
+// any replicated struct or client-reachable path. Never commit a real key (see .gitignore).
+{
+  "provider": {
+    "type": "openai-compatible",                 // "openai-compatible" | "anthropic"
+    "baseUrl": "http://localhost:11434/v1",      // OpenAI, Anthropic, or Ollama/LAN. Ollama shown (free, local).
+    "apiKey": "",                                // SERVER-ONLY. Leave empty for keyless local endpoints.
+    "model": "llama3.1",
+    "maxOutputTokens": 1024,
+    "visionModel": ""                            // optional, Phase 5
+  },
+  "limits": {
+    "perPlayerPerMinute": 4,
+    "globalPerMinute": 12,
+    "maxToolRoundTrips": 5,
+    "dailyTokenBudget": 0                         // 0 = unlimited
+  },
+  "permissions": {
+    "chat": "everyone",
+    "query": "everyone",
+    "act": []                                     // allowlist of Epic account IDs, e.g. ["<epic-account-id>"]
+  },
+  "privacy": {
+    "sendFactoryData": true,
+    "sendPlayerNames": true,
+    "sendChatHistoryDepth": 20,
+    "logPromptsToSidecar": false
+  },
+  "snapshots": { "intervalMinutes": 30, "keep": 200 },
+  "prompts": { "systemPromptFile": "prompts/system.md", "toolsFile": "tools.json" }
+}

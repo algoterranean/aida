@@ -1,0 +1,32 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"SemVersion": "0.1.0",
+	"FriendlyName": "AIDA",
+	"Description": "AI Design Assistant for Satisfactory: an LLM-powered in-game assistant with factory-state awareness, map intelligence, shared memory, and (later phases) AI-proposed construction. Server-authoritative, multiplayer-first.",
+	"Category": "Modding",
+	"CreatedBy": "AIDA contributors",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"GameVersion": ">=491125",
+	"Modules": [
+		{
+			"Name": "AIDA",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "SML",
+			"Enabled": true
+		}
+	]
+}
