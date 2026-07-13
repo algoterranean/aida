@@ -27,8 +27,8 @@ $ErrorActionPreference = 'Stop'
 $build = Join-Path $Engine 'Engine\Build\BatchFiles\Build.bat'
 $ubt   = Join-Path $Engine 'Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.exe'
 
-if (-not (Test-Path $build))   { throw "Build.bat not found at $build — is -Engine correct?" }
-if (-not (Test-Path $Project)) { throw "Project not found at $Project — is -Project correct?" }
+if (-not (Test-Path $build))   { throw "Build.bat not found at $build -- is -Engine correct?" }
+if (-not (Test-Path $Project)) { throw "Project not found at $Project -- is -Project correct?" }
 
 if ($GenerateProjectFiles) {
 	Write-Host "Generating project files for $Project ..." -ForegroundColor Cyan
@@ -37,7 +37,7 @@ if ($GenerateProjectFiles) {
 }
 
 if ($Platform -eq 'Linux' -and -not $env:LINUX_MULTIARCH_ROOT) {
-	Write-Warning "LINUX_MULTIARCH_ROOT is not set — the Linux cross-compile toolchain (v25_clang-18.1.0-rockylinux8) may be missing."
+	Write-Warning "LINUX_MULTIARCH_ROOT is not set -- the Linux cross-compile toolchain (v25_clang-18.1.0-rockylinux8) may be missing."
 }
 
 Write-Host "Building $Target | $Platform | $Config" -ForegroundColor Cyan
