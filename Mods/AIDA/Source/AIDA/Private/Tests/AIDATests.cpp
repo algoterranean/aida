@@ -3,6 +3,9 @@
 #if WITH_AUTOMATION_TESTS
 
 #include "Core/AIDAConfigLoader.h"
+#include "Core/AIDASessionManager.h"
+#include "Core/AIDARateLimiter.h"
+#include "Core/AIDAPermissionService.h"
 #include "Adapters/AnthropicAdapter.h"
 #include "Adapters/OpenAICompatAdapter.h"
 #include "Adapters/SSEStream.h"
@@ -185,6 +188,121 @@ bool FAIDASSEFramingTest::RunTest(const FString&)
 	{
 		TestEqual(TEXT("second line content"), Lines[1], FString(TEXT("x")));
 	}
+	return true;
+}
+
+// ─────────────────────────── SessionManager (transcript) ───────────────────────────
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASessionAssemblyTest, "AIDA.Session.StreamingAssembly",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASessionAssemblyTest::RunTest(const FString&)
+{
+	// No relay set — the session still owns the authoritative transcript (fan-out is a no-op).
+	FAIDASessionManager Session(200);
+
+	const FGuid PlayerId = Session.PostPlayerMessage(TEXT("Alice"), TEXT("hello"));
+	const FGuid AidaId = Session.BeginAIDAMessage(TEXT("AIDA"));
+	Session.AppendDelta(AidaId, TEXT("Hi "));
+	Session.AppendDelta(AidaId, TEXT("there"));
+	Session.CompleteMessage(AidaId);
+
+	FAIDATranscriptEntry Player, Aida;
+	TestTrue(TEXT("player message retained"), Session.GetMessageBody(PlayerId, Player));
+	TestEqual(TEXT("player author"), Player.Header.Author, TEXT("Alice"));
+	TestEqual(TEXT("player body"), Player.Body, TEXT("hello"));
+
+	TestTrue(TEXT("aida message retained"), Session.GetMessageBody(AidaId, Aida));
+	TestEqual(TEXT("aida body is concatenation of deltas"), Aida.Body, TEXT("Hi there"));
+	TestTrue(TEXT("aida kind"), Aida.Header.Kind == EAIDAMsgKind::AIDA);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASessionRingBufferTest, "AIDA.Session.RingBufferPrune",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASessionRingBufferTest::RunTest(const FString&)
+{
+	FAIDASessionManager Session(2); // keep only the two most recent messages
+
+	const FGuid First = Session.PostPlayerMessage(TEXT("A"), TEXT("1"));
+	Session.PostPlayerMessage(TEXT("B"), TEXT("2"));
+	Session.PostPlayerMessage(TEXT("C"), TEXT("3"));
+
+	TestEqual(TEXT("bounded to max"), Session.Num(), 2);
+
+	FAIDATranscriptEntry Dummy;
+	TestFalse(TEXT("oldest pruned"), Session.GetMessageBody(First, Dummy));
+
+	TArray<FAIDATranscriptEntry> Recent;
+	Session.GetRecentTranscript(Recent);
+	TestEqual(TEXT("recent count"), Recent.Num(), 2);
+	if (Recent.Num() == 2)
+	{
+		TestEqual(TEXT("oldest kept is B"), Recent[0].Body, TEXT("2"));
+		TestEqual(TEXT("newest is C"), Recent[1].Body, TEXT("3"));
+	}
+	return true;
+}
+
+// ─────────────────────────── RateLimiter (token bucket) ───────────────────────────
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDARateLimiterTest, "AIDA.Policy.RateLimiter",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDARateLimiterTest::RunTest(const FString&)
+{
+	FAIDALimitsConfig Limits;
+	Limits.PerPlayerPerMinute = 2;
+	Limits.GlobalPerMinute = 100; // don't let the global bucket interfere
+	FAIDARateLimiter Limiter(Limits);
+
+	FString Reason;
+	TestTrue(TEXT("1st admitted"), Limiter.TryConsume(TEXT("p1"), 0.0, Reason));
+	TestTrue(TEXT("2nd admitted (burst = capacity)"), Limiter.TryConsume(TEXT("p1"), 0.0, Reason));
+	TestFalse(TEXT("3rd denied at same instant"), Limiter.TryConsume(TEXT("p1"), 0.0, Reason));
+	TestTrue(TEXT("denial has a reason"), !Reason.IsEmpty());
+
+	// A different player has their own bucket.
+	TestTrue(TEXT("other player unaffected"), Limiter.TryConsume(TEXT("p2"), 0.0, Reason));
+
+	// After 30s at 2/min, one token has refilled.
+	TestTrue(TEXT("refills over time"), Limiter.TryConsume(TEXT("p1"), 30.0, Reason));
+	TestFalse(TEXT("but not two"), Limiter.TryConsume(TEXT("p1"), 30.0, Reason));
+
+	// 0 disables the limit entirely.
+	FAIDALimitsConfig Unlimited;
+	Unlimited.PerPlayerPerMinute = 0;
+	Unlimited.GlobalPerMinute = 0;
+	FAIDARateLimiter Free(Unlimited);
+	bool bAll = true;
+	for (int32 i = 0; i < 50; ++i) { bAll &= Free.TryConsume(TEXT("p"), 0.0, Reason); }
+	TestTrue(TEXT("0 = unlimited"), bAll);
+	return true;
+}
+
+// ─────────────────────────── PermissionService (tiers) ───────────────────────────
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAPermissionTest, "AIDA.Policy.Permissions",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAPermissionTest::RunTest(const FString&)
+{
+	FAIDAPermissionsConfig Perms;
+	Perms.Chat = TEXT("everyone");
+	Perms.Query = TEXT("everyone");
+	Perms.Act = { TEXT("admin-1") };
+	FAIDAPermissionService Service(Perms);
+
+	TestTrue(TEXT("chat open to everyone"), Service.IsAllowed(EAIDATier::Chat, TEXT("anyone")));
+	TestTrue(TEXT("query open to everyone"), Service.IsAllowed(EAIDATier::Query, TEXT("anyone")));
+	TestTrue(TEXT("act allows listed id"), Service.IsAllowed(EAIDATier::Act, TEXT("admin-1")));
+	TestFalse(TEXT("act denies unlisted id"), Service.IsAllowed(EAIDATier::Act, TEXT("rando")));
+	TestFalse(TEXT("act denies empty id"), Service.IsAllowed(EAIDATier::Act, FString()));
+
+	// A restricted chat tier falls back to the act allowlist.
+	FAIDAPermissionsConfig Restricted;
+	Restricted.Chat = TEXT("act");
+	Restricted.Act = { TEXT("admin-1") };
+	FAIDAPermissionService RestrictedService(Restricted);
+	TestTrue(TEXT("restricted chat allows admin"), RestrictedService.IsAllowed(EAIDATier::Chat, TEXT("admin-1")));
+	TestFalse(TEXT("restricted chat denies non-admin"), RestrictedService.IsAllowed(EAIDATier::Chat, TEXT("rando")));
 	return true;
 }
 

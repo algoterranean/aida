@@ -24,6 +24,12 @@ public:
 	 */
 	void Complete(const FString& UserText, FAIDAOnChunk OnChunk, FAIDAOnComplete OnComplete, FAIDAOnError OnError);
 
+	/**
+	 * Full multi-turn completion: the caller supplies the assembled message history (already
+	 * privacy-filtered). Same streaming/callback contract as Complete().
+	 */
+	void CompleteChat(const TArray<FAIDAChatMessage>& Messages, FAIDAOnChunk OnChunk, FAIDAOnComplete OnComplete, FAIDAOnError OnError);
+
 private:
 	TSharedPtr<ILLMAdapter> Adapter;
 	FString Model;
