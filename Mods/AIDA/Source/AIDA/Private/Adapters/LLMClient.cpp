@@ -2,6 +2,7 @@
 
 #include "AIDA.h"
 #include "Adapters/AnthropicAdapter.h"
+#include "Adapters/OpenAICompatAdapter.h"
 
 FLLMClient::FLLMClient(const FAIDAConfig& Config)
 {
@@ -12,11 +13,14 @@ FLLMClient::FLLMClient(const FAIDAConfig& Config)
 	{
 		Adapter = MakeShared<FAnthropicAdapter>(Config.Provider.BaseUrl, Config.Provider.ApiKey);
 	}
+	else if (Config.Provider.Type == TEXT("openai-compatible"))
+	{
+		Adapter = MakeShared<FOpenAICompatAdapter>(Config.Provider.BaseUrl, Config.Provider.ApiKey);
+	}
 	else
 	{
-		// OpenAICompatAdapter (OpenAI / Ollama / vLLM) is a later increment.
 		UE_LOG(LogAIDA, Warning,
-			TEXT("LLMClient: provider type '%s' not implemented yet (only 'anthropic' for now)."),
+			TEXT("LLMClient: unknown provider type '%s' (expected 'anthropic' or 'openai-compatible')."),
 			*Config.Provider.Type);
 	}
 }

@@ -1,6 +1,9 @@
 #include "Core/AIDAConfigLoader.h"
 
-#include "JsonObjectConverter.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -62,11 +65,80 @@ bool FAIDAConfigLoader::LoadFromString(const FString& Jsonc, FAIDAConfig& OutCon
 {
 	const FString Json = StripJsonComments(Jsonc);
 
-	FAIDAConfig Parsed;
-	if (!FJsonObjectConverter::JsonObjectStringToUStruct(Json, &Parsed, 0, 0))
+	TSharedPtr<FJsonObject> Root;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
 	{
 		OutError = TEXT("config is not valid JSON after comment stripping");
 		return false;
+	}
+
+	// Parse explicitly against the documented camelCase keys (docs/ARCHITECTURE.md §7).
+	// We do NOT use FJsonObjectConverter: its case-standardization does not strip Unreal's
+	// bool 'b' prefix on read, so "sendFactoryData" would silently miss bSendFactoryData.
+	FAIDAConfig Parsed;
+
+	const TSharedPtr<FJsonObject>* Provider = nullptr;
+	if (Root->TryGetObjectField(TEXT("provider"), Provider) && Provider)
+	{
+		(*Provider)->TryGetStringField(TEXT("type"), Parsed.Provider.Type);
+		(*Provider)->TryGetStringField(TEXT("baseUrl"), Parsed.Provider.BaseUrl);
+		(*Provider)->TryGetStringField(TEXT("apiKey"), Parsed.Provider.ApiKey);
+		(*Provider)->TryGetStringField(TEXT("model"), Parsed.Provider.Model);
+		(*Provider)->TryGetStringField(TEXT("visionModel"), Parsed.Provider.VisionModel);
+		int32 MaxTokens;
+		if ((*Provider)->TryGetNumberField(TEXT("maxOutputTokens"), MaxTokens)) { Parsed.Provider.MaxOutputTokens = MaxTokens; }
+	}
+
+	const TSharedPtr<FJsonObject>* Limits = nullptr;
+	if (Root->TryGetObjectField(TEXT("limits"), Limits) && Limits)
+	{
+		int32 I; int64 I64;
+		if ((*Limits)->TryGetNumberField(TEXT("perPlayerPerMinute"), I)) { Parsed.Limits.PerPlayerPerMinute = I; }
+		if ((*Limits)->TryGetNumberField(TEXT("globalPerMinute"), I)) { Parsed.Limits.GlobalPerMinute = I; }
+		if ((*Limits)->TryGetNumberField(TEXT("maxToolRoundTrips"), I)) { Parsed.Limits.MaxToolRoundTrips = I; }
+		if ((*Limits)->TryGetNumberField(TEXT("dailyTokenBudget"), I64)) { Parsed.Limits.DailyTokenBudget = I64; }
+	}
+
+	const TSharedPtr<FJsonObject>* Permissions = nullptr;
+	if (Root->TryGetObjectField(TEXT("permissions"), Permissions) && Permissions)
+	{
+		(*Permissions)->TryGetStringField(TEXT("chat"), Parsed.Permissions.Chat);
+		(*Permissions)->TryGetStringField(TEXT("query"), Parsed.Permissions.Query);
+		const TArray<TSharedPtr<FJsonValue>>* Act = nullptr;
+		if ((*Permissions)->TryGetArrayField(TEXT("act"), Act) && Act)
+		{
+			for (const TSharedPtr<FJsonValue>& Value : *Act)
+			{
+				FString Id;
+				if (Value.IsValid() && Value->TryGetString(Id)) { Parsed.Permissions.Act.Add(Id); }
+			}
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* Privacy = nullptr;
+	if (Root->TryGetObjectField(TEXT("privacy"), Privacy) && Privacy)
+	{
+		(*Privacy)->TryGetBoolField(TEXT("sendFactoryData"), Parsed.Privacy.bSendFactoryData);
+		(*Privacy)->TryGetBoolField(TEXT("sendPlayerNames"), Parsed.Privacy.bSendPlayerNames);
+		int32 Depth;
+		if ((*Privacy)->TryGetNumberField(TEXT("sendChatHistoryDepth"), Depth)) { Parsed.Privacy.SendChatHistoryDepth = Depth; }
+		(*Privacy)->TryGetBoolField(TEXT("logPromptsToSidecar"), Parsed.Privacy.bLogPromptsToSidecar);
+	}
+
+	const TSharedPtr<FJsonObject>* Snapshots = nullptr;
+	if (Root->TryGetObjectField(TEXT("snapshots"), Snapshots) && Snapshots)
+	{
+		int32 I;
+		if ((*Snapshots)->TryGetNumberField(TEXT("intervalMinutes"), I)) { Parsed.Snapshots.IntervalMinutes = I; }
+		if ((*Snapshots)->TryGetNumberField(TEXT("keep"), I)) { Parsed.Snapshots.Keep = I; }
+	}
+
+	const TSharedPtr<FJsonObject>* Prompts = nullptr;
+	if (Root->TryGetObjectField(TEXT("prompts"), Prompts) && Prompts)
+	{
+		(*Prompts)->TryGetStringField(TEXT("systemPromptFile"), Parsed.Prompts.SystemPromptFile);
+		(*Prompts)->TryGetStringField(TEXT("toolsFile"), Parsed.Prompts.ToolsFile);
 	}
 
 	if (!Validate(Parsed, OutError))
