@@ -77,9 +77,14 @@ void UAIDAOrchestrator::Ping(const TArray<FString>& Args)
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Ping -> \"%s\""), *Prompt);
 
 	LLMClient->Complete(Prompt,
+		[](const FString& Delta)
+		{
+			// One line per streamed delta so the incremental arrival is visible in the Output Log.
+			UE_LOG(LogAIDA, Log, TEXT("AIDA delta: %s"), *Delta);
+		},
 		[](const FString& Text)
 		{
-			UE_LOG(LogAIDA, Log, TEXT("AIDA reply: %s"), *Text);
+			UE_LOG(LogAIDA, Log, TEXT("AIDA reply (complete): %s"), *Text);
 		},
 		[](int32 Status, const FString& Message)
 		{

@@ -27,7 +27,7 @@ FLLMClient::FLLMClient(const FAIDAConfig& Config)
 
 FLLMClient::~FLLMClient() = default;
 
-void FLLMClient::Complete(const FString& UserText, FAIDAOnComplete OnComplete, FAIDAOnError OnError)
+void FLLMClient::Complete(const FString& UserText, FAIDAOnChunk OnChunk, FAIDAOnComplete OnComplete, FAIDAOnError OnError)
 {
 	if (!Adapter.IsValid())
 	{
@@ -45,5 +45,5 @@ void FLLMClient::Complete(const FString& UserText, FAIDAOnComplete OnComplete, F
 	Msg.Content = UserText;
 	Req.Messages.Add(MoveTemp(Msg));
 
-	Adapter->Complete(Req, MoveTemp(OnComplete), MoveTemp(OnError));
+	Adapter->Complete(Req, MoveTemp(OnChunk), MoveTemp(OnComplete), MoveTemp(OnError));
 }

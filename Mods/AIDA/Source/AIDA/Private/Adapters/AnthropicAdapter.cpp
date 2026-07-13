@@ -1,14 +1,50 @@
 #include "Adapters/AnthropicAdapter.h"
 
 #include "AIDA.h"
+#include "Adapters/SSEStream.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
-#include "Interfaces/IHttpResponse.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+
+namespace
+{
+	/** Anthropic SSE: a `content_block_delta` event whose delta is a `text_delta` carries reply text. */
+	FString ExtractAnthropicDelta(const FString& DataJson)
+	{
+		TSharedPtr<FJsonObject> Json;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(DataJson);
+		if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
+		{
+			return FString();
+		}
+
+		FString Type;
+		if (!Json->TryGetStringField(TEXT("type"), Type) || Type != TEXT("content_block_delta"))
+		{
+			return FString();
+		}
+
+		const TSharedPtr<FJsonObject>* Delta = nullptr;
+		if (!Json->TryGetObjectField(TEXT("delta"), Delta) || !Delta)
+		{
+			return FString();
+		}
+
+		FString DeltaType;
+		if (!(*Delta)->TryGetStringField(TEXT("type"), DeltaType) || DeltaType != TEXT("text_delta"))
+		{
+			return FString();
+		}
+
+		FString Text;
+		(*Delta)->TryGetStringField(TEXT("text"), Text);
+		return Text;
+	}
+}
 
 FAnthropicAdapter::FAnthropicAdapter(const FString& InBaseUrl, const FString& InApiKey)
 	: BaseUrl(InBaseUrl)
@@ -16,11 +52,15 @@ FAnthropicAdapter::FAnthropicAdapter(const FString& InBaseUrl, const FString& In
 {
 }
 
-FString FAnthropicAdapter::BuildRequestBody(const FAIDACompletionRequest& Request)
+FString FAnthropicAdapter::BuildRequestBody(const FAIDACompletionRequest& Request, bool bStream)
 {
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("model"), Request.Model);
 	Root->SetNumberField(TEXT("max_tokens"), Request.MaxTokens);
+	if (bStream)
+	{
+		Root->SetBoolField(TEXT("stream"), true);
+	}
 	if (!Request.System.IsEmpty())
 	{
 		Root->SetStringField(TEXT("system"), Request.System);
@@ -42,7 +82,8 @@ FString FAnthropicAdapter::BuildRequestBody(const FAIDACompletionRequest& Reques
 	return Body;
 }
 
-void FAnthropicAdapter::Complete(const FAIDACompletionRequest& Request, FAIDAOnComplete OnComplete, FAIDAOnError OnError)
+void FAnthropicAdapter::Complete(const FAIDACompletionRequest& Request, FAIDAOnChunk OnChunk,
+	FAIDAOnComplete OnComplete, FAIDAOnError OnError)
 {
 	FString Url = BaseUrl;
 	Url.RemoveFromEnd(TEXT("/"));
@@ -54,60 +95,10 @@ void FAnthropicAdapter::Complete(const FAIDACompletionRequest& Request, FAIDAOnC
 	HttpRequest->SetHeader(TEXT("content-type"), TEXT("application/json"));
 	HttpRequest->SetHeader(TEXT("anthropic-version"), TEXT("2023-06-01"));
 	HttpRequest->SetHeader(TEXT("x-api-key"), ApiKey);
-	HttpRequest->SetContentAsString(BuildRequestBody(Request));
+	HttpRequest->SetContentAsString(BuildRequestBody(Request, /*bStream=*/true));
 
-	HttpRequest->OnProcessRequestComplete().BindLambda(
-		[OnComplete = MoveTemp(OnComplete), OnError = MoveTemp(OnError)]
-		(FHttpRequestPtr /*Req*/, FHttpResponsePtr Resp, bool bOk)
-		{
-			if (!bOk || !Resp.IsValid())
-			{
-				if (OnError) { OnError(0, TEXT("no response / connection failed")); }
-				return;
-			}
-
-			const int32 Status = Resp->GetResponseCode();
-			const FString Content = Resp->GetContentAsString();
-
-			if (Status < 200 || Status >= 300)
-			{
-				// Body carries Anthropic's error object; callers log it (never the key).
-				if (OnError) { OnError(Status, Content); }
-				return;
-			}
-
-			TSharedPtr<FJsonObject> Json;
-			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
-			if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
-			{
-				if (OnError) { OnError(Status, TEXT("could not parse response JSON")); }
-				return;
-			}
-
-			// { "content": [ { "type": "text", "text": "..." }, ... ] }
-			FString Text;
-			const TArray<TSharedPtr<FJsonValue>>* ContentArr = nullptr;
-			if (Json->TryGetArrayField(TEXT("content"), ContentArr) && ContentArr)
-			{
-				for (const TSharedPtr<FJsonValue>& Item : *ContentArr)
-				{
-					const TSharedPtr<FJsonObject> Obj = Item.IsValid() ? Item->AsObject() : nullptr;
-					if (!Obj.IsValid())
-					{
-						continue;
-					}
-					FString Type;
-					if (Obj->TryGetStringField(TEXT("type"), Type) && Type == TEXT("text"))
-					{
-						FString Fragment;
-						Obj->TryGetStringField(TEXT("text"), Fragment);
-						Text += Fragment;
-					}
-				}
-			}
-
-			if (OnComplete) { OnComplete(Text); }
-		});
+	AIDADriveSSEStream(HttpRequest, FAIDASSEDeltaExtractor(&ExtractAnthropicDelta),
+		MoveTemp(OnChunk), MoveTemp(OnComplete), MoveTemp(OnError));
 
 	HttpRequest->ProcessRequest();
 }

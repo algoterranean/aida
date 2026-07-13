@@ -18,8 +18,11 @@ public:
 
 	bool IsReady() const { return Adapter.IsValid(); }
 
-	/** Convenience: a single user turn using the configured model / system prompt. */
-	void Complete(const FString& UserText, FAIDAOnComplete OnComplete, FAIDAOnError OnError);
+	/**
+	 * Convenience: a single user turn using the configured model / system prompt.
+	 * OnChunk fires per streamed delta (may be unset); then exactly one of OnComplete/OnError.
+	 */
+	void Complete(const FString& UserText, FAIDAOnChunk OnChunk, FAIDAOnComplete OnComplete, FAIDAOnError OnError);
 
 private:
 	TSharedPtr<ILLMAdapter> Adapter;

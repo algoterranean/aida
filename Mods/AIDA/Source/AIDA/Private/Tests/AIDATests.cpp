@@ -4,6 +4,8 @@
 
 #include "Core/AIDAConfigLoader.h"
 #include "Adapters/AnthropicAdapter.h"
+#include "Adapters/OpenAICompatAdapter.h"
+#include "Adapters/SSEStream.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -101,6 +103,8 @@ bool FAIDAAnthropicBodyTest::RunTest(const FString&)
 	TestEqual(TEXT("model"), Json->GetStringField(TEXT("model")), TEXT("test-model"));
 	TestEqual(TEXT("max_tokens"), (int32)Json->GetNumberField(TEXT("max_tokens")), 256);
 	TestEqual(TEXT("system"), Json->GetStringField(TEXT("system")), TEXT("you are a test"));
+	// Default build is non-streaming: the "stream" field must be absent so callers opt in explicitly.
+	TestFalse(TEXT("stream absent by default"), Json->HasField(TEXT("stream")));
 
 	const TArray<TSharedPtr<FJsonValue>>* Messages = nullptr;
 	TestTrue(TEXT("messages is an array"), Json->TryGetArrayField(TEXT("messages"), Messages) && Messages);
@@ -113,6 +117,73 @@ bool FAIDAAnthropicBodyTest::RunTest(const FString&)
 	else
 	{
 		AddError(TEXT("expected exactly one message"));
+	}
+	return true;
+}
+
+// Helper: parse a body string to a JSON object for the streaming-flag assertions below.
+static TSharedPtr<FJsonObject> ParseJsonObject(const FString& Body)
+{
+	TSharedPtr<FJsonObject> Json;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Body);
+	FJsonSerializer::Deserialize(Reader, Json);
+	return Json;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAStreamFlagTest, "AIDA.Adapters.StreamFlag",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAStreamFlagTest::RunTest(const FString&)
+{
+	FAIDACompletionRequest Req;
+	Req.Model = TEXT("m");
+	Req.Messages.Add({ TEXT("user"), TEXT("hi") });
+
+	// Both providers must set "stream": true when asked, and omit it otherwise.
+	const TSharedPtr<FJsonObject> AnthStream = ParseJsonObject(FAnthropicAdapter::BuildRequestBody(Req, true));
+	TestTrue(TEXT("anthropic stream=true present"), AnthStream.IsValid() && AnthStream->HasField(TEXT("stream")));
+	TestTrue(TEXT("anthropic stream=true value"), AnthStream.IsValid() && AnthStream->GetBoolField(TEXT("stream")));
+
+	const TSharedPtr<FJsonObject> OaiStream = ParseJsonObject(FOpenAICompatAdapter::BuildRequestBody(Req, true));
+	TestTrue(TEXT("openai stream=true present"), OaiStream.IsValid() && OaiStream->HasField(TEXT("stream")));
+	TestTrue(TEXT("openai stream=true value"), OaiStream.IsValid() && OaiStream->GetBoolField(TEXT("stream")));
+
+	const TSharedPtr<FJsonObject> OaiNoStream = ParseJsonObject(FOpenAICompatAdapter::BuildRequestBody(Req));
+	TestFalse(TEXT("openai stream absent by default"), OaiNoStream.IsValid() && OaiNoStream->HasField(TEXT("stream")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASSEFramingTest, "AIDA.Adapters.SSEFraming",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASSEFramingTest::RunTest(const FString&)
+{
+	FAIDASSEBuffer Buffer;
+	TArray<FString> Lines;
+	const auto Collect = [&Lines](const FString& Line) { Lines.Add(Line); };
+
+	// A multi-byte UTF-8 codepoint (é = 0xC3 0xA9) split across two Feed() calls must survive intact,
+	// and a line only completes once its terminating '\n' arrives.
+	const uint8 Chunk1[] = { 'd', 'a', 't', 'a', ':', ' ', 'c', 0xC3 };
+	const uint8 Chunk2[] = { 0xA9, '\r', '\n', 'x' }; // finish é, CRLF, then a partial next line
+	Buffer.Feed(Chunk1, sizeof(Chunk1), Collect);
+	TestEqual(TEXT("no line until newline arrives"), Lines.Num(), 0);
+
+	Buffer.Feed(Chunk2, sizeof(Chunk2), Collect);
+	TestEqual(TEXT("one complete line"), Lines.Num(), 1);
+	if (Lines.Num() == 1)
+	{
+		// Build "data: cé" from the codepoint so the assertion doesn't depend on this file's encoding.
+		FString Expected = TEXT("data: c");
+		Expected.AppendChar(static_cast<TCHAR>(0x00E9)); // é
+		TestEqual(TEXT("CRLF trimmed, multi-byte decoded across chunks"), Lines[0], Expected);
+	}
+
+	// The trailing 'x' stays buffered until its own newline.
+	const uint8 Chunk3[] = { '\n' };
+	Buffer.Feed(Chunk3, sizeof(Chunk3), Collect);
+	TestEqual(TEXT("second line flushed"), Lines.Num(), 2);
+	if (Lines.Num() == 2)
+	{
+		TestEqual(TEXT("second line content"), Lines[1], FString(TEXT("x")));
 	}
 	return true;
 }

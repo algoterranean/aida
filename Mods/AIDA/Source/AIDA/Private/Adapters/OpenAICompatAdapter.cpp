@@ -1,14 +1,50 @@
 #include "Adapters/OpenAICompatAdapter.h"
 
 #include "AIDA.h"
+#include "Adapters/SSEStream.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
-#include "Interfaces/IHttpResponse.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+
+namespace
+{
+	/** OpenAI SSE: each chunk is `choices[0].delta.content` (absent on role-only / finish frames). */
+	FString ExtractOpenAIDelta(const FString& DataJson)
+	{
+		TSharedPtr<FJsonObject> Json;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(DataJson);
+		if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
+		{
+			return FString();
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
+		if (!Json->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
+		{
+			return FString();
+		}
+
+		const TSharedPtr<FJsonObject> Choice = (*Choices)[0]->AsObject();
+		if (!Choice.IsValid())
+		{
+			return FString();
+		}
+
+		const TSharedPtr<FJsonObject>* Delta = nullptr;
+		if (!Choice->TryGetObjectField(TEXT("delta"), Delta) || !Delta)
+		{
+			return FString();
+		}
+
+		FString Content;
+		(*Delta)->TryGetStringField(TEXT("content"), Content);
+		return Content;
+	}
+}
 
 FOpenAICompatAdapter::FOpenAICompatAdapter(const FString& InBaseUrl, const FString& InApiKey)
 	: BaseUrl(InBaseUrl)
@@ -16,11 +52,15 @@ FOpenAICompatAdapter::FOpenAICompatAdapter(const FString& InBaseUrl, const FStri
 {
 }
 
-FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Request)
+FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Request, bool bStream)
 {
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("model"), Request.Model);
 	Root->SetNumberField(TEXT("max_tokens"), Request.MaxTokens);
+	if (bStream)
+	{
+		Root->SetBoolField(TEXT("stream"), true);
+	}
 
 	// OpenAI carries the system prompt as the first message (unlike Anthropic's top-level "system").
 	TArray<TSharedPtr<FJsonValue>> Messages;
@@ -46,7 +86,8 @@ FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Req
 	return Body;
 }
 
-void FOpenAICompatAdapter::Complete(const FAIDACompletionRequest& Request, FAIDAOnComplete OnComplete, FAIDAOnError OnError)
+void FOpenAICompatAdapter::Complete(const FAIDACompletionRequest& Request, FAIDAOnChunk OnChunk,
+	FAIDAOnComplete OnComplete, FAIDAOnError OnError)
 {
 	FString Url = BaseUrl;
 	Url.RemoveFromEnd(TEXT("/"));
@@ -60,53 +101,10 @@ void FOpenAICompatAdapter::Complete(const FAIDACompletionRequest& Request, FAIDA
 	{
 		HttpRequest->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *ApiKey));
 	}
-	HttpRequest->SetContentAsString(BuildRequestBody(Request));
+	HttpRequest->SetContentAsString(BuildRequestBody(Request, /*bStream=*/true));
 
-	HttpRequest->OnProcessRequestComplete().BindLambda(
-		[OnComplete = MoveTemp(OnComplete), OnError = MoveTemp(OnError)]
-		(FHttpRequestPtr /*Req*/, FHttpResponsePtr Resp, bool bOk)
-		{
-			if (!bOk || !Resp.IsValid())
-			{
-				if (OnError) { OnError(0, TEXT("no response / connection failed")); }
-				return;
-			}
-
-			const int32 Status = Resp->GetResponseCode();
-			const FString Content = Resp->GetContentAsString();
-
-			if (Status < 200 || Status >= 300)
-			{
-				if (OnError) { OnError(Status, Content); }
-				return;
-			}
-
-			TSharedPtr<FJsonObject> Json;
-			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
-			if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
-			{
-				if (OnError) { OnError(Status, TEXT("could not parse response JSON")); }
-				return;
-			}
-
-			// { "choices": [ { "message": { "role": "assistant", "content": "..." } } ] }
-			FString Text;
-			const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
-			if (Json->TryGetArrayField(TEXT("choices"), Choices) && Choices && Choices->Num() > 0)
-			{
-				const TSharedPtr<FJsonObject> Choice = (*Choices)[0]->AsObject();
-				if (Choice.IsValid())
-				{
-					const TSharedPtr<FJsonObject>* MsgObj = nullptr;
-					if (Choice->TryGetObjectField(TEXT("message"), MsgObj) && MsgObj)
-					{
-						(*MsgObj)->TryGetStringField(TEXT("content"), Text);
-					}
-				}
-			}
-
-			if (OnComplete) { OnComplete(Text); }
-		});
+	AIDADriveSSEStream(HttpRequest, FAIDASSEDeltaExtractor(&ExtractOpenAIDelta),
+		MoveTemp(OnChunk), MoveTemp(OnComplete), MoveTemp(OnError));
 
 	HttpRequest->ProcessRequest();
 }
