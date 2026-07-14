@@ -4,6 +4,7 @@
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Components/Button.h"
+#include "Components/CanvasPanelSlot.h"
 #include "Components/EditableTextBox.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
@@ -26,6 +27,68 @@ void UAIDAChatWidget::NativeConstruct()
 	if (TranscriptText)
 	{
 		TranscriptText->SetAutoWrapText(true);
+	}
+
+	// This is an overlay shown on top of live gameplay AND menus (pause/escape). Only the input row
+	// should capture the mouse; the transcript covers most of the viewport and would otherwise eat
+	// clicks meant for whatever is underneath. Make the read-only transcript click-through so the menu
+	// beneath it stays usable. InputBox + SendButton keep their default (hit-testable) visibility.
+	// (The root canvas panel is already SelfHitTestInvisible, so empty space passes clicks through.)
+	if (TranscriptScroll)
+	{
+		TranscriptScroll->SetVisibility(ESlateVisibility::HitTestInvisible);
+	}
+	if (TranscriptText)
+	{
+		TranscriptText->SetVisibility(ESlateVisibility::HitTestInvisible);
+	}
+	SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+
+	// --- Layout + font tuning (driven here so the BP stays a pure, positionless view) ---
+	// Tweakables (slate units ~= design px). Bump ToolbarClearance if the input row overlaps the hotbar.
+	constexpr float Margin          = 20.f;  // outer margin from screen edges
+	constexpr float InputHeight     = 44.f;  // height of the input box / Send button row
+	constexpr float SendWidth       = 140.f; // width of the Send button
+	constexpr float RowGap          = 12.f;  // gap between transcript, input box, and Send button
+	constexpr float ToolbarClearance= 96.f;  // approx Satisfactory hotbar height to clear at the bottom
+	constexpr float FontSize        = 12.f;  // just above the console font; default UMG is 24
+	// Input row's bottom edge sits this far above the screen bottom: toolbar height + a 20px margin.
+	const float BottomInset = ToolbarClearance + Margin;
+
+	// Transcript: stretch to fill from top+margin down to just above the input row.
+	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(TranscriptScroll ? TranscriptScroll->Slot : nullptr))
+	{
+		CanvasSlot->SetAnchors(FAnchors(0.f, 0.f, 1.f, 1.f)); // stretch both axes
+		CanvasSlot->SetOffsets(FMargin(Margin, Margin, Margin, BottomInset + InputHeight + RowGap));
+	}
+	// Input box: bottom row, stretched horizontally but leaving room for the Send button on the right.
+	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(InputBox ? InputBox->Slot : nullptr))
+	{
+		CanvasSlot->SetAnchors(FAnchors(0.f, 1.f, 1.f, 1.f)); // stretch X, pin to bottom edge
+		CanvasSlot->SetAlignment(FVector2D(0.f, 1.f));
+		CanvasSlot->SetOffsets(FMargin(Margin, -BottomInset, SendWidth + RowGap + Margin, InputHeight));
+	}
+	// Send button: bottom-right corner, fixed width, aligned with the input row.
+	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(SendButton ? SendButton->Slot : nullptr))
+	{
+		CanvasSlot->SetAnchors(FAnchors(1.f, 1.f, 1.f, 1.f)); // pin to bottom-right corner
+		CanvasSlot->SetAlignment(FVector2D(1.f, 1.f));
+		CanvasSlot->SetOffsets(FMargin(-Margin, -BottomInset, SendWidth, InputHeight));
+	}
+
+	// Fonts: shrink both the transcript and the input box to just above console size.
+	if (TranscriptText)
+	{
+		FSlateFontInfo Font = TranscriptText->GetFont();
+		Font.Size = FontSize;
+		TranscriptText->SetFont(Font);
+
+		if (InputBox)
+		{
+			FSlateFontInfo InputFont = Font; // reuse the transcript's (known-valid) font family
+			InputBox->WidgetStyle.TextStyle.Font = InputFont;
+			InputBox->SynchronizeProperties();
+		}
 	}
 
 	// The relay is a replicated actor and may not have arrived on this client yet — retry until it has.
