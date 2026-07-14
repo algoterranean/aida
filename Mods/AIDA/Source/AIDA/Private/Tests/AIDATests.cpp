@@ -12,6 +12,7 @@
 #include "Tools/AIDAToolRegistry.h"
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
+#include "Tools/AIDAMapTools.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -867,6 +868,61 @@ bool FAIDAFactoryToolsBalanceClusterTest::RunTest(const FString&)
 	// Unknown cluster -> error object.
 	const TSharedPtr<FJsonObject> BadCluster = AIDAParseTestJson(AIDAFactoryTools::BuildClusterJson(Agg, 99));
 	TestTrue(TEXT("unknown cluster yields an error"), BadCluster.IsValid() && BadCluster->HasField(TEXT("error")));
+	return true;
+}
+
+static FAIDAResourceNode AIDAMakeTestNode(const FString& Resource, const FString& Purity, bool bOccupied)
+{
+	FAIDAResourceNode N;
+	N.Resource = Resource;
+	N.Purity = Purity;
+	N.bOccupied = bOccupied;
+	return N;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAMapToolsNodesTest, "AIDA.MapTools.ResourceNodes",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAMapToolsNodesTest::RunTest(const FString&)
+{
+	TArray<FAIDAResourceNode> Nodes;
+	Nodes.Add(AIDAMakeTestNode(TEXT("Iron Ore"), TEXT("Pure"), /*occupied*/ true));
+	Nodes.Add(AIDAMakeTestNode(TEXT("Iron Ore"), TEXT("Pure"), false));
+	Nodes.Add(AIDAMakeTestNode(TEXT("Iron Ore"), TEXT("Normal"), false));
+	Nodes.Add(AIDAMakeTestNode(TEXT("Copper Ore"), TEXT("Impure"), false));
+
+	// Unfiltered: 4 nodes, 3 free, grouped into 3 (resource,purity) buckets sorted by key.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDAMapTools::BuildResourceNodesJson(Nodes, FString(), false));
+		if (!TestNotNull(TEXT("nodes json parses"), Root.Get())) { return false; }
+		TestEqual(TEXT("total nodes"), Root->GetIntegerField(TEXT("nodes")), 4);
+		TestEqual(TEXT("free nodes"), Root->GetIntegerField(TEXT("free")), 3);
+
+		const TArray<TSharedPtr<FJsonValue>>& By = Root->GetArrayField(TEXT("byResource"));
+		TestEqual(TEXT("three buckets"), By.Num(), 3);
+		if (By.Num() == 3)
+		{
+			// Sorted keys: "Copper Ore|Impure", "Iron Ore|Normal", "Iron Ore|Pure".
+			TestEqual(TEXT("first bucket resource"), By[0]->AsObject()->GetStringField(TEXT("resource")), FString(TEXT("Copper Ore")));
+			const TSharedPtr<FJsonObject> IronPure = By[2]->AsObject();
+			TestEqual(TEXT("iron/pure total"), IronPure->GetIntegerField(TEXT("total")), 2);
+			TestEqual(TEXT("iron/pure free"), IronPure->GetIntegerField(TEXT("free")), 1);
+		}
+		TestFalse(TEXT("no freeNodes list unless untapped_only"), Root->HasField(TEXT("freeNodes")));
+	}
+
+	// Resource filter (case-insensitive substring): only the 3 iron nodes.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDAMapTools::BuildResourceNodesJson(Nodes, TEXT("iron"), false));
+		TestEqual(TEXT("filtered to iron"), Root->GetIntegerField(TEXT("nodes")), 3);
+	}
+
+	// Untapped-only: 3 free nodes and a listed freeNodes array.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDAMapTools::BuildResourceNodesJson(Nodes, FString(), true));
+		TestEqual(TEXT("untapped count"), Root->GetIntegerField(TEXT("nodes")), 3);
+		TestTrue(TEXT("freeNodes listed"), Root->HasField(TEXT("freeNodes")));
+		TestEqual(TEXT("freeNodes length"), Root->GetArrayField(TEXT("freeNodes")).Num(), 3);
+	}
 	return true;
 }
 

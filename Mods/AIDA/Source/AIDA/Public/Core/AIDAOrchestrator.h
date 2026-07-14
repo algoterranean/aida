@@ -8,6 +8,7 @@
 #include "Core/AIDAPermissionService.h"
 #include "Tools/AIDAToolRegistry.h"
 #include "Factory/AIDAFactoryIndex.h" // TTL-cached factory extractor + FAIDAFactoryAggregates
+#include "Map/AIDAMapService.h"       // TTL-cached resource-node scan
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
 #include "AIDAOrchestrator.generated.h"
@@ -113,6 +114,9 @@ private:
 	/** `AIDA.Index` — dump the aggregated factory overview to the log (extraction check, no LLM). */
 	void Index(const TArray<FString>& Args);
 
+	/** `AIDA.Nodes` — dump the resource-node summary to the log (map-scan check, no LLM). */
+	void Nodes(const TArray<FString>& Args);
+
 	/** Extract (TTL-cached) + aggregate the current factory. Server/authoritative worlds only. */
 	FAIDAFactoryAggregates SnapshotAggregates();
 
@@ -129,8 +133,10 @@ private:
 	FAIDAPermissionService Permissions;
 	FAIDAToolRegistry Tools;
 	FAIDAFactoryIndex FactoryIndex;
+	FAIDAMapService MapService;
 	IConsoleCommand* PingCommand = nullptr;
 	IConsoleCommand* SayCommand = nullptr;
 	IConsoleCommand* ToolPingCommand = nullptr;
 	IConsoleCommand* IndexCommand = nullptr;
+	IConsoleCommand* NodesCommand = nullptr;
 };

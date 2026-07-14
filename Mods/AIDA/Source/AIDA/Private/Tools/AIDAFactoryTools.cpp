@@ -1,10 +1,9 @@
 #include "Tools/AIDAFactoryTools.h"
 
 #include "Factory/AIDAFactoryAggregator.h"
+#include "Tools/AIDAToolJson.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
 
 namespace
 {
@@ -16,15 +15,6 @@ namespace
 
 	/** Round to one decimal place — plenty for rates/power and keeps token counts down. */
 	double Round1(double V) { return FMath::RoundToDouble(V * 10.0) / 10.0; }
-
-	FString ToCompactJson(const TSharedRef<FJsonObject>& Obj)
-	{
-		FString Out;
-		const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
-		FJsonSerializer::Serialize(Obj, Writer);
-		return Out;
-	}
 
 	/** Centroid humanized to whole metres (world units are cm), as [x, y] — Z dropped for the overview. */
 	TArray<TSharedPtr<FJsonValue>> CentroidMetres(const FVector& Centroid)
@@ -127,7 +117,7 @@ FString AIDAFactoryTools::BuildOverviewJson(const FAIDAFactoryAggregates& Aggreg
 	}
 	Root->SetArrayField(TEXT("power"), PowerArr);
 
-	return ToCompactJson(Root);
+	return AIDAToCompactJson(Root);
 }
 
 FString AIDAFactoryTools::BuildItemBalanceJson(const FAIDAFactoryAggregates& Aggregates, const FString& ItemFilter)
@@ -144,12 +134,12 @@ FString AIDAFactoryTools::BuildItemBalanceJson(const FAIDAFactoryAggregates& Agg
 				O->SetNumberField(TEXT("consumed"), Round1(B.Consumed));
 				O->SetNumberField(TEXT("net"), Round1(B.Net()));
 				O->SetBoolField(TEXT("deficit"), B.IsDeficit());
-				return ToCompactJson(O);
+				return AIDAToCompactJson(O);
 			}
 		}
 		const TSharedRef<FJsonObject> Err = MakeShared<FJsonObject>();
 		Err->SetStringField(TEXT("error"), FString::Printf(TEXT("no item '%s' in the factory balance"), *ItemFilter));
-		return ToCompactJson(Err);
+		return AIDAToCompactJson(Err);
 	}
 
 	// Whole-factory: biggest deficits first, then the rest, bounded.
@@ -173,7 +163,7 @@ FString AIDAFactoryTools::BuildItemBalanceJson(const FAIDAFactoryAggregates& Agg
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetArrayField(TEXT("items"), Arr);
 	if (Items.Num() > Shown) { Root->SetNumberField(TEXT("itemsOmitted"), Items.Num() - Shown); }
-	return ToCompactJson(Root);
+	return AIDAToCompactJson(Root);
 }
 
 FString AIDAFactoryTools::BuildClusterJson(const FAIDAFactoryAggregates& Aggregates, int32 ClusterId)
@@ -184,7 +174,7 @@ FString AIDAFactoryTools::BuildClusterJson(const FAIDAFactoryAggregates& Aggrega
 	{
 		const TSharedRef<FJsonObject> Err = MakeShared<FJsonObject>();
 		Err->SetStringField(TEXT("error"), FString::Printf(TEXT("no cluster with id %d"), ClusterId));
-		return ToCompactJson(Err);
+		return AIDAToCompactJson(Err);
 	}
 
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -210,5 +200,5 @@ FString AIDAFactoryTools::BuildClusterJson(const FAIDAFactoryAggregates& Aggrega
 	Root->SetArrayField(TEXT("machineIds"), Ids);
 	if (Cluster->MachineIds.Num() > Shown) { Root->SetNumberField(TEXT("machineIdsOmitted"), Cluster->MachineIds.Num() - Shown); }
 
-	return ToCompactJson(Root);
+	return AIDAToCompactJson(Root);
 }

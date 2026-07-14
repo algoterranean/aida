@@ -5,6 +5,7 @@
 #include "Adapters/LLMClient.h"
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
+#include "Tools/AIDAMapTools.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
@@ -88,6 +89,11 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(IndexCommand);
 		IndexCommand = nullptr;
+	}
+	if (NodesCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(NodesCommand);
+		NodesCommand = nullptr;
 	}
 	LLMClient.Reset();
 	Session.Reset();
@@ -343,6 +349,24 @@ void UAIDAOrchestrator::RegisterTools()
 		}
 	});
 
+	Tools.Register({
+		TEXT("get_resource_nodes"),
+		TEXT("Resource nodes on the map, grouped by resource and purity (total vs free). Pass 'resource' to filter, or 'untapped_only' to see only unoccupied nodes (with grid coordinates)."),
+		TEXT(R"({"type":"object","properties":{"resource":{"type":"string","description":"Optional resource name to filter to (e.g. \"Iron Ore\")."},"untapped_only":{"type":"boolean","description":"If true, only nodes with no extractor built on them."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Resource;
+			Args->TryGetStringField(TEXT("resource"), Resource);
+			bool bUntappedOnly = false;
+			Args->TryGetBoolField(TEXT("untapped_only"), bUntappedOnly);
+
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			return FAIDAToolResult::Ok(AIDAMapTools::BuildResourceNodesJson(MapService.GetNodes(World, Now), Resource, bUntappedOnly));
+		}
+	});
+
 	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
 }
 
@@ -477,6 +501,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Extract + aggregate the factory and log the overview JSON (checks Phase 2 extraction without the LLM). Run on server/host. Usage: AIDA.Index"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Index),
 		ECVF_Default);
+
+	NodesCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Nodes"),
+		TEXT("Scan resource nodes and log the grouped summary JSON (checks Phase 2 map scan without the LLM). Run on server/host. Usage: AIDA.Nodes"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Nodes),
+		ECVF_Default);
 }
 
 void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
@@ -533,6 +563,21 @@ void UAIDAOrchestrator::Index(const TArray<FString>& /*Args*/)
 
 	const FString Overview = AIDAFactoryTools::BuildOverviewJson(SnapshotAggregates());
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Index overview: %s"), *Overview);
+}
+
+void UAIDAOrchestrator::Nodes(const TArray<FString>& /*Args*/)
+{
+	// Node scan iterates world actors — server/host only.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Nodes runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+	const FString Json = AIDAMapTools::BuildResourceNodesJson(MapService.GetNodes(World, Now), FString(), /*bUntappedOnly=*/false);
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Nodes summary: %s"), *Json);
 }
 
 void UAIDAOrchestrator::Say(const TArray<FString>& Args)
