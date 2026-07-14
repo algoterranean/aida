@@ -22,4 +22,7 @@ namespace AIDAFactoryTools
 
 	/** inspect_cluster: one cluster's census, net flows, efficiency, and (bounded) machine ids. */
 	FString BuildClusterJson(const FAIDAFactoryAggregates& Aggregates, int32 ClusterId);
+
+	/** find_bottleneck: a status, a plain-language explanation, and the supporting numbers. */
+	FString BuildBottleneckJson(const FAIDABottleneckResult& Result);
 }

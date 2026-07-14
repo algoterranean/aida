@@ -292,6 +292,95 @@ TArray<FAIDAPowerReport> FAIDAFactoryAggregator::BuildPowerReport(const TArray<F
 	return Reports;
 }
 
+FAIDABottleneckResult FAIDAFactoryAggregator::FindBottleneck(const FAIDAFactorySnapshot& Snapshot,
+	const FString& Item, const FAIDAAggregatorConfig& Config)
+{
+	FAIDABottleneckResult Result;
+	Result.Item = Item;
+
+	const TArray<FAIDAItemBalance> Balance = BuildBalanceSheet(Snapshot.Machines, Config);
+	auto FindBalance = [&Balance](const FString& Key) -> const FAIDAItemBalance*
+	{
+		return Balance.FindByPredicate([&Key](const FAIDAItemBalance& B) { return B.Item.Equals(Key, ESearchCase::IgnoreCase); });
+	};
+
+	const FAIDAItemBalance* Target = FindBalance(Item);
+	if (!Target)
+	{
+		Result.Kind = EAIDABottleneck::UnknownItem;
+		return Result;
+	}
+	Result.Produced = Target->Produced;
+	Result.Consumed = Target->Consumed;
+
+	// Machines that output the item.
+	TArray<const FAIDAMachine*> Producers;
+	for (const FAIDAMachine& M : Snapshot.Machines)
+	{
+		for (const FAIDAItemRate& O : M.Outputs)
+		{
+			if (O.Item.Equals(Item, ESearchCase::IgnoreCase)) { Producers.Add(&M); break; }
+		}
+	}
+	Result.ProducerCount = Producers.Num();
+	if (Producers.Num() == 0)
+	{
+		Result.Kind = EAIDABottleneck::NoProducers;
+		return Result;
+	}
+
+	double ProductivitySum = 0.0;
+	TSet<FString> InputItems;
+	TSet<int32> ProducerCircuits;
+	for (const FAIDAMachine* M : Producers)
+	{
+		if (!M->bProducing) { ++Result.ProducersIdle; }
+		ProductivitySum += M->Productivity;
+		for (const FAIDAItemRate& In : M->Inputs) { InputItems.Add(In.Item); }
+		if (M->CircuitId != 0) { ProducerCircuits.Add(M->CircuitId); }
+	}
+	Result.AvgProductivity = static_cast<float>(ProductivitySum / Producers.Num());
+
+	// Upstream: producer inputs that are themselves in factory-wide deficit.
+	for (const FString& In : InputItems)
+	{
+		if (const FAIDAItemBalance* B = FindBalance(In))
+		{
+			if (B->IsDeficit(Config.RateTolerance)) { Result.StarvedInputs.Add({ In, -B->Net() }); }
+		}
+	}
+	Result.StarvedInputs.Sort([](const FAIDAItemRate& A, const FAIDAItemRate& B) { return A.PerMinute > B.PerMinute; });
+
+	// Power: any producer circuit over capacity?
+	const TArray<FAIDAPowerReport> Power = BuildPowerReport(Snapshot.Machines, Snapshot.Circuits);
+	int32 OverloadedCircuit = -1;
+	for (const FAIDAPowerReport& P : Power)
+	{
+		if (ProducerCircuits.Contains(P.CircuitId) && P.IsOverloaded()) { OverloadedCircuit = P.CircuitId; break; }
+	}
+
+	// Attribute the constraint — upstream deficit is the root cause, so it wins over local symptoms.
+	if (Result.StarvedInputs.Num() > 0)
+	{
+		Result.Kind = EAIDABottleneck::Upstream;
+		Result.LimitingDetail = Result.StarvedInputs[0].Item;
+	}
+	else if (OverloadedCircuit >= 0)
+	{
+		Result.Kind = EAIDABottleneck::Power;
+		Result.LimitingDetail = FString::FromInt(OverloadedCircuit);
+	}
+	else if (Result.ProducersIdle > 0)
+	{
+		Result.Kind = EAIDABottleneck::OutputBackedUp;
+	}
+	else
+	{
+		Result.Kind = EAIDABottleneck::None;
+	}
+	return Result;
+}
+
 FAIDAFactoryAggregates FAIDAFactoryAggregator::Aggregate(const FAIDAFactorySnapshot& Snapshot,
 	const FAIDAAggregatorConfig& Config)
 {

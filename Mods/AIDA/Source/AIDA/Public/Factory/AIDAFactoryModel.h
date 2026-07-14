@@ -129,3 +129,29 @@ struct FAIDAFactoryAggregates
 	TArray<FAIDALogisticsFlow> Flows;
 	TArray<FAIDAPowerReport> Power;
 };
+
+/** Why is `Item` production limited — a graph-free heuristic over balance, machine state, and power. */
+enum class EAIDABottleneck : uint8
+{
+	None,          // producers running fine; supply meets demand
+	UnknownItem,   // nothing produces or consumes the item
+	NoProducers,   // the item is consumed but nothing produces it
+	Upstream,      // a producer input is itself in factory-wide deficit (see LimitingDetail)
+	Power,         // producers sit on an overloaded circuit (LimitingDetail = circuit id)
+	OutputBackedUp // producers are idle though inputs and power are fine (output full / demand-limited)
+};
+
+struct FAIDABottleneckResult
+{
+	FString Item;
+	EAIDABottleneck Kind = EAIDABottleneck::None;
+	FString LimitingDetail;             // the starved upstream item, or the overloaded circuit id, as text
+	double Produced = 0.0;
+	double Consumed = 0.0;
+	int32 ProducerCount = 0;
+	int32 ProducersIdle = 0;            // producers not currently producing
+	float AvgProductivity = 1.0f;       // mean [0,1] across producers
+	TArray<FAIDAItemRate> StarvedInputs; // producer inputs in factory-wide deficit, magnitude positive
+
+	double Net() const { return Produced - Consumed; }
+};

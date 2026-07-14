@@ -51,4 +51,12 @@ public:
 	/** Per-circuit power: capacity/produced/battery from circuit stats, consumption summed from machine loads. */
 	static TArray<FAIDAPowerReport> BuildPowerReport(const TArray<FAIDAMachine>& Machines,
 		const TArray<FAIDAPowerCircuitStats>& Circuits);
+
+	/**
+	 * Diagnose why one item's production is limited, without the belt/pipe graph: locate its producers,
+	 * then attribute the constraint to a starved upstream input (in factory-wide deficit), an overloaded
+	 * power circuit, or idle-with-inputs (output backed up). Upstream is preferred as the root cause.
+	 */
+	static FAIDABottleneckResult FindBottleneck(const FAIDAFactorySnapshot& Snapshot, const FString& Item,
+		const FAIDAAggregatorConfig& Config = FAIDAAggregatorConfig());
 };

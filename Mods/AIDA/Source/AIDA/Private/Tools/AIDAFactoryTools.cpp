@@ -202,3 +202,51 @@ FString AIDAFactoryTools::BuildClusterJson(const FAIDAFactoryAggregates& Aggrega
 
 	return AIDAToCompactJson(Root);
 }
+
+FString AIDAFactoryTools::BuildBottleneckJson(const FAIDABottleneckResult& Result)
+{
+	const TCHAR* Status = TEXT("ok");
+	FString Explanation;
+	switch (Result.Kind)
+	{
+	case EAIDABottleneck::None:
+		Status = TEXT("ok");
+		Explanation = FString::Printf(TEXT("Producers of %s are keeping up; no clear bottleneck."), *Result.Item);
+		break;
+	case EAIDABottleneck::UnknownItem:
+		Status = TEXT("unknown_item");
+		Explanation = FString::Printf(TEXT("Nothing in the factory produces or consumes %s."), *Result.Item);
+		break;
+	case EAIDABottleneck::NoProducers:
+		Status = TEXT("no_producers");
+		Explanation = FString::Printf(TEXT("%s is consumed but nothing produces it."), *Result.Item);
+		break;
+	case EAIDABottleneck::Upstream:
+		Status = TEXT("starved_upstream");
+		Explanation = FString::Printf(TEXT("%s is limited upstream: %s is in deficit."), *Result.Item, *Result.LimitingDetail);
+		break;
+	case EAIDABottleneck::Power:
+		Status = TEXT("power_limited");
+		Explanation = FString::Printf(TEXT("%s's machines sit on overloaded power circuit %s."), *Result.Item, *Result.LimitingDetail);
+		break;
+	case EAIDABottleneck::OutputBackedUp:
+		Status = TEXT("output_backed_up");
+		Explanation = FString::Printf(TEXT("%s's machines are idle despite available inputs and power — output is backing up or demand-limited."), *Result.Item);
+		break;
+	}
+
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("item"), Result.Item);
+	Root->SetStringField(TEXT("status"), Status);
+	Root->SetStringField(TEXT("explanation"), Explanation);
+	Root->SetNumberField(TEXT("produced"), Round1(Result.Produced));
+	Root->SetNumberField(TEXT("consumed"), Round1(Result.Consumed));
+	Root->SetNumberField(TEXT("net"), Round1(Result.Net()));
+	Root->SetNumberField(TEXT("producers"), Result.ProducerCount);
+	Root->SetNumberField(TEXT("idle"), Result.ProducersIdle);
+	Root->SetNumberField(TEXT("avgProductivity"), Round1(Result.AvgProductivity));
+	if (!Result.LimitingDetail.IsEmpty()) { Root->SetStringField(TEXT("limiting"), Result.LimitingDetail); }
+	if (Result.StarvedInputs.Num() > 0) { Root->SetArrayField(TEXT("starvedInputs"), RatesToJson(Result.StarvedInputs)); }
+
+	return AIDAToCompactJson(Root);
+}

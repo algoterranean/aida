@@ -871,6 +871,69 @@ bool FAIDAFactoryToolsBalanceClusterTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryBottleneckTest, "AIDA.Factory.Bottleneck",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryBottleneckTest::RunTest(const FString&)
+{
+	// Upstream: a constructor makes IronPlate from IronIngot, but nothing makes IronIngot -> starved.
+	{
+		FAIDAMachine Ctor = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Constructor"));
+		Ctor.Inputs = { { TEXT("IronIngot"), 30.0 } };
+		Ctor.Outputs = { { TEXT("IronPlate"), 20.0 } };
+		Ctor.bProducing = false;
+		FAIDAFactorySnapshot Snap; Snap.Machines = { Ctor };
+
+		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("IronPlate"));
+		TestTrue(TEXT("upstream-limited"), R.Kind == EAIDABottleneck::Upstream);
+		TestEqual(TEXT("limiting input is IronIngot"), R.LimitingDetail, FString(TEXT("IronIngot")));
+		TestEqual(TEXT("one starved input"), R.StarvedInputs.Num(), 1);
+
+		const TSharedPtr<FJsonObject> J = AIDAParseTestJson(AIDAFactoryTools::BuildBottleneckJson(R));
+		if (TestNotNull(TEXT("bottleneck json parses"), J.Get()))
+		{
+			TestEqual(TEXT("status"), J->GetStringField(TEXT("status")), FString(TEXT("starved_upstream")));
+		}
+	}
+
+	// No producers: something burns Coal but nothing mines it.
+	{
+		FAIDAMachine Gen = AIDAMakeTestMachine(2, FVector::ZeroVector, TEXT("CoalGenerator"));
+		Gen.Inputs = { { TEXT("Coal"), 15.0 } };
+		FAIDAFactorySnapshot Snap; Snap.Machines = { Gen };
+		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("Coal"));
+		TestTrue(TEXT("no producers"), R.Kind == EAIDABottleneck::NoProducers);
+	}
+
+	// Unknown item: not produced or consumed anywhere.
+	{
+		FAIDAMachine M = AIDAMakeTestMachine(3, FVector::ZeroVector, TEXT("Smelter"));
+		M.Outputs = { { TEXT("IronIngot"), 30.0 } };
+		FAIDAFactorySnapshot Snap; Snap.Machines = { M };
+		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("Plutonium"));
+		TestTrue(TEXT("unknown item"), R.Kind == EAIDABottleneck::UnknownItem);
+	}
+
+	// Power: inputs are satisfied, but the producer's circuit is over capacity.
+	{
+		FAIDAMachine Miner = AIDAMakeTestMachine(4, FVector::ZeroVector, TEXT("Miner"));
+		Miner.Outputs = { { TEXT("IronOre"), 30.0 } };
+		FAIDAMachine Smelter = AIDAMakeTestMachine(5, FVector::ZeroVector, TEXT("Smelter"));
+		Smelter.Inputs = { { TEXT("IronOre"), 30.0 } };
+		Smelter.Outputs = { { TEXT("IronIngot"), 30.0 } };
+		Smelter.bProducing = true;
+		Smelter.CircuitId = 1;
+		Smelter.PowerMW = 10.0;
+		FAIDAFactorySnapshot Snap;
+		Snap.Machines = { Miner, Smelter };
+		Snap.Circuits.Add({ 1, /*Produced*/ 5.0, /*Capacity*/ 5.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
+
+		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("IronIngot"));
+		TestTrue(TEXT("power-limited"), R.Kind == EAIDABottleneck::Power);
+		TestEqual(TEXT("overloaded circuit id"), R.LimitingDetail, FString(TEXT("1")));
+	}
+	return true;
+}
+
 static FAIDAResourceNode AIDAMakeTestNode(const FString& Resource, const FString& Purity, bool bOccupied)
 {
 	FAIDAResourceNode N;
