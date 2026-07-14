@@ -71,3 +71,11 @@ void AIDADriveSSEStream(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Htt
  * translation units don't emit a duplicate symbol in unity builds.
  */
 TSharedRef<FJsonObject> AIDAParseObjectOrEmpty(const FString& JsonStr);
+
+/**
+ * Parse a tool's parameter schema into a valid JSON-Schema object: like AIDAParseObjectOrEmpty, but
+ * guarantees `"type":"object"` and a `"properties"` object exist. No-arg tools pass an empty schema,
+ * and providers reject a tool whose input_schema is missing `type` (Anthropic: "input_schema.type:
+ * Field required").
+ */
+TSharedRef<FJsonObject> AIDAParseToolSchema(const FString& JsonStr);

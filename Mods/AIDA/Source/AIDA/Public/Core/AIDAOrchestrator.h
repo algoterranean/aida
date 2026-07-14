@@ -69,8 +69,8 @@ private:
 	void RegisterRelay();
 	AAIDAChatRelay* GetRelay();
 
-	/** Kick off the streaming LLM reply for an accepted request. */
-	void StartAIDAReply();
+	/** Kick off the streaming LLM reply (through the tool loop) for an accepted request. */
+	void StartAIDAReply(const FAIDARequester& Requester);
 
 	/** Register the built-in tools exposed to the model (Phase 2 Slice 0: an echo verifier). */
 	void RegisterTools();

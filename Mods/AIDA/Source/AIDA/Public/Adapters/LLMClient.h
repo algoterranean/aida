@@ -18,6 +18,9 @@ public:
 
 	bool IsReady() const { return Adapter.IsValid(); }
 
+	/** Set the system prompt prepended to every completion (identity + tool guidance). */
+	void SetSystemPrompt(const FString& InPrompt) { SystemPrompt = InPrompt; }
+
 	/**
 	 * Convenience: a single user turn using the configured model / system prompt.
 	 * OnChunk fires per streamed delta (may be unset); then exactly one of OnComplete/OnError.

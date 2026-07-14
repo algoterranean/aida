@@ -421,6 +421,32 @@ static FAIDACompletionRequest MakeToolRequest()
 	return Req;
 }
 
+// Regression: a no-arg tool passes an empty schema; providers require input_schema.type, so it must
+// default to an object schema (Anthropic rejected the empty {} with "input_schema.type: Field required").
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDANoArgToolSchemaTest, "AIDA.Adapters.NoArgToolSchema",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDANoArgToolSchemaTest::RunTest(const FString&)
+{
+	FAIDACompletionRequest Req;
+	Req.Model = TEXT("test-model");
+	Req.MaxTokens = 128;
+	Req.Tools.Add({ TEXT("get_factory_overview"), TEXT("overview"), TEXT("") }); // empty schema
+	Req.Messages.Add({ TEXT("user"), TEXT("hi") });
+
+	const TSharedPtr<FJsonObject> Json = ParseJsonObject(FAnthropicAdapter::BuildRequestBody(Req));
+	const TArray<TSharedPtr<FJsonValue>>* ToolsArr = nullptr;
+	if (!TestTrue(TEXT("tools array of 1"), Json.IsValid() && Json->TryGetArrayField(TEXT("tools"), ToolsArr) && ToolsArr && ToolsArr->Num() == 1))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Schema = nullptr;
+	if (TestTrue(TEXT("input_schema is an object"), (*ToolsArr)[0]->AsObject()->TryGetObjectField(TEXT("input_schema"), Schema) && Schema))
+	{
+		TestEqual(TEXT("input_schema.type defaults to object"), (*Schema)->GetStringField(TEXT("type")), FString(TEXT("object")));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAAnthropicToolWireTest, "AIDA.Adapters.AnthropicToolWireFormat",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAAnthropicToolWireTest::RunTest(const FString&)

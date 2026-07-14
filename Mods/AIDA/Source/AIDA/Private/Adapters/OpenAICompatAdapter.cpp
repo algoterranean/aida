@@ -81,7 +81,7 @@ FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Req
 			{
 				Fn->SetStringField(TEXT("description"), Def.Description);
 			}
-			Fn->SetObjectField(TEXT("parameters"), AIDAParseObjectOrEmpty(Def.InputSchemaJson));
+			Fn->SetObjectField(TEXT("parameters"), AIDAParseToolSchema(Def.InputSchemaJson));
 			T->SetObjectField(TEXT("function"), Fn);
 			Tools.Add(MakeShared<FJsonValueObject>(T));
 		}

@@ -10,6 +10,21 @@
 #include "Resources/FGResourceDescriptor.h"
 #include "Resources/FGItemDescriptor.h"
 
+namespace
+{
+	/** Clean purity label from the enum (GetResourcePurityText carries rich-text markup like "<Bold>(Pure)</>"). */
+	FString PurityName(EResourcePurity Purity)
+	{
+		switch (Purity)
+		{
+		case EResourcePurity::RP_Inpure: return TEXT("Impure");
+		case EResourcePurity::RP_Normal: return TEXT("Normal");
+		case EResourcePurity::RP_Pure:   return TEXT("Pure");
+		default:                         return TEXT("Unknown");
+		}
+	}
+}
+
 void FAIDAMapService::ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResourceNode>& OutNodes)
 {
 	OutNodes.Reset();
@@ -31,7 +46,7 @@ void FAIDAMapService::ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResour
 		FAIDAResourceNode Out;
 		const TSubclassOf<UFGResourceDescriptor> ResourceClass = Node->GetResourceClass();
 		Out.Resource = ResourceClass ? UFGItemDescriptor::GetItemName(ResourceClass).ToString() : FString(TEXT("Unknown"));
-		Out.Purity = Node->GetResourcePurityText().ToString();
+		Out.Purity = PurityName(Node->GetResourcePurity());
 		Out.bOccupied = Node->IsOccupied();
 		Out.Location = Node->GetActorLocation();
 		if (Grid) { Out.Grid = Grid->GetWorldGridCoordinatesForLocation(Out.Location); }

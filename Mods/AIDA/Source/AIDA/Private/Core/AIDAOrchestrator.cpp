@@ -27,6 +27,25 @@ namespace
 		default:                  return EAIDATier::Query;
 		}
 	}
+
+	/** AIDA's persona + tool guidance. Prepended to every chat completion so the model uses the tools. */
+	const TCHAR* GAIDASystemPrompt = TEXT(
+		"You are AIDA, an assistant embedded inside the factory-building game Satisfactory. You help the "
+		"player understand and optimize THEIR live factory on the current save.\n\n"
+		"You have tools that read the player's ACTUAL factory and world. Always call the relevant tool to "
+		"answer a question about the factory instead of guessing or asking the player for data you can look "
+		"up yourself:\n"
+		"- get_factory_overview(): machine clusters, the biggest item deficits, and power per circuit.\n"
+		"- get_item_balance(item?): net production vs consumption per item; deficits first.\n"
+		"- inspect_cluster(id): one cluster's building census, net inputs/outputs, and efficiency.\n"
+		"- find_bottleneck(item): why an item's production is limited (starved input, power, or backed up).\n"
+		"- get_resource_nodes(resource?, untapped_only?): map resource nodes by purity and occupancy.\n\n"
+		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
+		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
+		"resources, call a tool first and answer from the real numbers it returns.\n\n"
+		"Style: this is an in-game chat overlay, so keep answers short, concrete, and plain-text (no markdown "
+		"headings or long bullet lists). You are NOT a general-purpose or coding assistant — stay focused on "
+		"this Satisfactory factory.");
 }
 
 bool UAIDAOrchestrator::ShouldCreateSubsystem(UObject* Outer) const
@@ -207,7 +226,7 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 
 	Session->PostPlayerMessage(Requester.Author, Trimmed);
 
-	StartAIDAReply();
+	StartAIDAReply(Requester);
 }
 
 void UAIDAOrchestrator::BuildChatContext(TArray<FAIDAChatMessage>& OutMessages) const
@@ -252,7 +271,7 @@ void UAIDAOrchestrator::BuildChatContext(TArray<FAIDAChatMessage>& OutMessages) 
 	}
 }
 
-void UAIDAOrchestrator::StartAIDAReply()
+void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester)
 {
 	if (!LLMClient.IsValid() || !LLMClient->IsReady())
 	{
@@ -265,9 +284,14 @@ void UAIDAOrchestrator::StartAIDAReply()
 	BuildChatContext(Context);
 
 	const FGuid MsgId = Session->BeginAIDAMessage(TEXT("AIDA"));
-	TWeakObjectPtr<UAIDAOrchestrator> Weak(this);
 
-	LLMClient->CompleteChat(Context,
+	// Route the visible chat through the tool loop so the model can inspect the factory before answering.
+	// Shared so the message history survives the async tool rounds.
+	const TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages =
+		MakeShared<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe>(MoveTemp(Context));
+
+	TWeakObjectPtr<UAIDAOrchestrator> Weak(this);
+	RunToolLoop(Messages, Requester, MaxToolRoundTrips,
 		[Weak, MsgId](const FString& Delta)
 		{
 			if (UAIDAOrchestrator* O = Weak.Get(); O && O->Session.IsValid())
@@ -677,6 +701,7 @@ void UAIDAOrchestrator::LoadConfig()
 			Config.Provider.ApiKey.IsEmpty() ? TEXT("<none>") : TEXT("<set:redacted>"));
 
 		LLMClient = MakeShared<FLLMClient>(Config);
+		LLMClient->SetSystemPrompt(GAIDASystemPrompt);
 		RateLimiter.Configure(Config.Limits);
 		Permissions.Configure(Config.Permissions);
 		UE_LOG(LogAIDA, Log, TEXT("LLM client %s. Run console command 'AIDA.Ping' to test a round-trip."),

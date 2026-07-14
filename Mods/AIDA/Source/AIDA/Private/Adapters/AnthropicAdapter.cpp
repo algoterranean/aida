@@ -97,7 +97,7 @@ FString FAnthropicAdapter::BuildRequestBody(const FAIDACompletionRequest& Reques
 			{
 				T->SetStringField(TEXT("description"), Def.Description);
 			}
-			T->SetObjectField(TEXT("input_schema"), AIDAParseObjectOrEmpty(Def.InputSchemaJson));
+			T->SetObjectField(TEXT("input_schema"), AIDAParseToolSchema(Def.InputSchemaJson));
 			Tools.Add(MakeShared<FJsonValueObject>(T));
 		}
 		Root->SetArrayField(TEXT("tools"), Tools);

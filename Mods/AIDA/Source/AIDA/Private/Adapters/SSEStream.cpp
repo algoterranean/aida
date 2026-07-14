@@ -22,6 +22,20 @@ TSharedRef<FJsonObject> AIDAParseObjectOrEmpty(const FString& JsonStr)
 	return MakeShared<FJsonObject>();
 }
 
+TSharedRef<FJsonObject> AIDAParseToolSchema(const FString& JsonStr)
+{
+	TSharedRef<FJsonObject> Schema = AIDAParseObjectOrEmpty(JsonStr);
+	if (!Schema->HasField(TEXT("type")))
+	{
+		Schema->SetStringField(TEXT("type"), TEXT("object"));
+	}
+	if (!Schema->HasField(TEXT("properties")))
+	{
+		Schema->SetObjectField(TEXT("properties"), MakeShared<FJsonObject>());
+	}
+	return Schema;
+}
+
 void FAIDASSEBuffer::Feed(const void* Ptr, int64 Len, const TFunctionRef<void(const FString&)>& OnLine)
 {
 	if (Ptr && Len > 0)
