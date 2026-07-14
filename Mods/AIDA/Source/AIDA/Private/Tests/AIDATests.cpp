@@ -11,6 +11,7 @@
 #include "Adapters/SSEStream.h"
 #include "Tools/AIDAToolRegistry.h"
 #include "Factory/AIDAFactoryAggregator.h"
+#include "Tools/AIDAFactoryTools.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -765,6 +766,107 @@ bool FAIDAFactoryPowerTest::RunTest(const FString&)
 		AIDA_TEST_NEAR("circuit 2 draw", Reports[1].ConsumedMW, 70.0);
 		TestTrue(TEXT("circuit 2 overloaded (70 > 50)"), Reports[1].IsOverloaded());
 	}
+	return true;
+}
+
+static TSharedPtr<FJsonObject> AIDAParseTestJson(const FString& Json)
+{
+	TSharedPtr<FJsonObject> Obj;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	FJsonSerializer::Deserialize(Reader, Obj);
+	return Obj;
+}
+
+/** A small synthetic aggregate: one cluster exporting IronPlate, an IronOre deficit, one healthy circuit. */
+static FAIDAFactoryAggregates AIDAMakeTestAggregates()
+{
+	FAIDAFactoryAggregates Agg;
+	FAIDACluster C;
+	C.Id = 0;
+	C.Centroid = FVector(1000.0, 2000.0, 0.0); // -> 10 m, 20 m
+	C.Efficiency = 0.75f;
+	C.MachineIds = { 1, 2 };
+	C.BuildingCensus.Add(TEXT("Smelter"), 1);
+	C.BuildingCensus.Add(TEXT("Constructor"), 1);
+	C.NetInputs = { { TEXT("IronOre"), 30.0 } };
+	C.NetOutputs = { { TEXT("IronPlate"), 20.0 } };
+	Agg.Clusters.Add(C);
+
+	Agg.Balance.Add({ TEXT("IronOre"), 0.0, 30.0 });   // deficit 30
+	Agg.Balance.Add({ TEXT("IronPlate"), 20.0, 0.0 }); // surplus 20
+
+	FAIDAPowerReport P;
+	P.CircuitId = 1; P.ProducedMW = 90.0; P.CapacityMW = 100.0; P.ConsumedMW = 90.0;
+	Agg.Power.Add(P);
+	return Agg;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryToolsOverviewTest, "AIDA.FactoryTools.Overview",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryToolsOverviewTest::RunTest(const FString&)
+{
+	const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDAFactoryTools::BuildOverviewJson(AIDAMakeTestAggregates()));
+	if (!TestNotNull(TEXT("overview parses as JSON"), Root.Get())) { return false; }
+
+	TestEqual(TEXT("cluster count"), Root->GetIntegerField(TEXT("clusters")), 1);
+	TestEqual(TEXT("machine count"), Root->GetIntegerField(TEXT("machines")), 2);
+
+	const TArray<TSharedPtr<FJsonValue>>& List = Root->GetArrayField(TEXT("clusterList"));
+	TestEqual(TEXT("one cluster listed"), List.Num(), 1);
+	if (List.Num() == 1)
+	{
+		const TSharedPtr<FJsonObject> C = List[0]->AsObject();
+		TestEqual(TEXT("cluster id"), C->GetIntegerField(TEXT("id")), 0);
+		TestEqual(TEXT("primary output"), C->GetStringField(TEXT("primaryOutput")), FString(TEXT("IronPlate")));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>& Deficits = Root->GetArrayField(TEXT("topDeficits"));
+	TestEqual(TEXT("one deficit"), Deficits.Num(), 1);
+	if (Deficits.Num() == 1)
+	{
+		TestEqual(TEXT("deficit item"), Deficits[0]->AsObject()->GetStringField(TEXT("item")), FString(TEXT("IronOre")));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>& Power = Root->GetArrayField(TEXT("power"));
+	TestEqual(TEXT("one circuit"), Power.Num(), 1);
+	if (Power.Num() == 1)
+	{
+		TestFalse(TEXT("circuit not overloaded"), Power[0]->AsObject()->GetBoolField(TEXT("overloaded")));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryToolsBalanceClusterTest, "AIDA.FactoryTools.BalanceAndCluster",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryToolsBalanceClusterTest::RunTest(const FString&)
+{
+	const FAIDAFactoryAggregates Agg = AIDAMakeTestAggregates();
+
+	// Filter to a known item (case-insensitive).
+	const TSharedPtr<FJsonObject> Filtered = AIDAParseTestJson(AIDAFactoryTools::BuildItemBalanceJson(Agg, TEXT("ironore")));
+	if (TestNotNull(TEXT("filtered balance parses"), Filtered.Get()))
+	{
+		TestEqual(TEXT("item echoed"), Filtered->GetStringField(TEXT("item")), FString(TEXT("IronOre")));
+		TestTrue(TEXT("flagged as deficit"), Filtered->GetBoolField(TEXT("deficit")));
+	}
+
+	// Unknown item -> error object.
+	const TSharedPtr<FJsonObject> Missing = AIDAParseTestJson(AIDAFactoryTools::BuildItemBalanceJson(Agg, TEXT("Nonexistium")));
+	TestTrue(TEXT("unknown item yields an error"), Missing.IsValid() && Missing->HasField(TEXT("error")));
+
+	// Valid cluster.
+	const TSharedPtr<FJsonObject> Cluster = AIDAParseTestJson(AIDAFactoryTools::BuildClusterJson(Agg, 0));
+	if (TestNotNull(TEXT("cluster parses"), Cluster.Get()))
+	{
+		TestEqual(TEXT("cluster id"), Cluster->GetIntegerField(TEXT("id")), 0);
+		TestEqual(TEXT("machine count"), Cluster->GetIntegerField(TEXT("machines")), 2);
+		const TSharedPtr<FJsonObject> Census = Cluster->GetObjectField(TEXT("census"));
+		TestEqual(TEXT("census Smelter"), Census->GetIntegerField(TEXT("Smelter")), 1);
+	}
+
+	// Unknown cluster -> error object.
+	const TSharedPtr<FJsonObject> BadCluster = AIDAParseTestJson(AIDAFactoryTools::BuildClusterJson(Agg, 99));
+	TestTrue(TEXT("unknown cluster yields an error"), BadCluster.IsValid() && BadCluster->HasField(TEXT("error")));
 	return true;
 }
 

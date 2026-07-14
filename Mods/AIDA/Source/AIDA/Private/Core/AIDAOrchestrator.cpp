@@ -3,6 +3,8 @@
 #include "AIDA.h"
 #include "Core/AIDAConfigLoader.h"
 #include "Adapters/LLMClient.h"
+#include "Factory/AIDAFactoryAggregator.h"
+#include "Tools/AIDAFactoryTools.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
@@ -81,6 +83,11 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(ToolPingCommand);
 		ToolPingCommand = nullptr;
+	}
+	if (IndexCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(IndexCommand);
+		IndexCommand = nullptr;
 	}
 	LLMClient.Reset();
 	Session.Reset();
@@ -297,6 +304,45 @@ void UAIDAOrchestrator::RegisterTools()
 		}
 	});
 
+	// Slice 2 factory-sight tools (docs/ARCHITECTURE.md §4). Each aggregates a TTL-cached snapshot and
+	// returns bounded JSON. Handlers capture `this`; the registry is a member, so it never outlives us.
+	Tools.Register({
+		TEXT("get_factory_overview"),
+		TEXT("Summarize the whole factory: machine clusters (id, size, location, main output), the biggest item deficits, and power per circuit. Call this first for the big picture."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildOverviewJson(SnapshotAggregates()));
+		}
+	});
+
+	Tools.Register({
+		TEXT("get_item_balance"),
+		TEXT("Net production vs consumption per item across the factory, deficits first. Pass 'item' to focus on one item; omit it for the whole balance."),
+		TEXT(R"({"type":"object","properties":{"item":{"type":"string","description":"Optional item name to filter to (e.g. \"Iron Plate\")."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Item;
+			Args->TryGetStringField(TEXT("item"), Item);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildItemBalanceJson(SnapshotAggregates(), Item));
+		}
+	});
+
+	Tools.Register({
+		TEXT("inspect_cluster"),
+		TEXT("Drill into one machine cluster by id (from get_factory_overview): its building census, net inputs/outputs, efficiency, and machine ids."),
+		TEXT(R"({"type":"object","properties":{"id":{"type":"integer","description":"Cluster id from get_factory_overview."}},"required":["id"]})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			int32 Id = 0;
+			Args->TryGetNumberField(TEXT("id"), Id);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildClusterJson(SnapshotAggregates(), Id));
+		}
+	});
+
 	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
 }
 
@@ -425,6 +471,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Run the tool loop against the echo tool and log the result (verifies Phase 2 Slice 0). Usage: AIDA.ToolPing [prompt...]"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::ToolPing),
 		ECVF_Default);
+
+	IndexCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Index"),
+		TEXT("Extract + aggregate the factory and log the overview JSON (checks Phase 2 extraction without the LLM). Run on server/host. Usage: AIDA.Index"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Index),
+		ECVF_Default);
 }
 
 void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
@@ -460,6 +512,27 @@ void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
 		{
 			UE_LOG(LogAIDA, Error, TEXT("AIDA.ToolPing failed (HTTP %d): %s"), Status, *Message);
 		});
+}
+
+FAIDAFactoryAggregates UAIDAOrchestrator::SnapshotAggregates()
+{
+	UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+	const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+	return FAIDAFactoryAggregator::Aggregate(Snapshot);
+}
+
+void UAIDAOrchestrator::Index(const TArray<FString>& /*Args*/)
+{
+	// Extraction reads the authoritative buildable subsystem — server/host only.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Index runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	const FString Overview = AIDAFactoryTools::BuildOverviewJson(SnapshotAggregates());
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Index overview: %s"), *Overview);
 }
 
 void UAIDAOrchestrator::Say(const TArray<FString>& Args)

@@ -7,6 +7,7 @@
 #include "Core/AIDARateLimiter.h"
 #include "Core/AIDAPermissionService.h"
 #include "Tools/AIDAToolRegistry.h"
+#include "Factory/AIDAFactoryIndex.h" // TTL-cached factory extractor + FAIDAFactoryAggregates
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
 #include "AIDAOrchestrator.generated.h"
@@ -109,6 +110,12 @@ private:
 	 */
 	void ToolPing(const TArray<FString>& Args);
 
+	/** `AIDA.Index` — dump the aggregated factory overview to the log (extraction check, no LLM). */
+	void Index(const TArray<FString>& Args);
+
+	/** Extract (TTL-cached) + aggregate the current factory. Server/authoritative worlds only. */
+	FAIDAFactoryAggregates SnapshotAggregates();
+
 	/** Max model<->tool round-trips before the loop gives up (guards against a tool-call cycle). */
 	static constexpr int32 MaxToolRoundTrips = 5;
 
@@ -121,7 +128,9 @@ private:
 	FAIDARateLimiter RateLimiter;
 	FAIDAPermissionService Permissions;
 	FAIDAToolRegistry Tools;
+	FAIDAFactoryIndex FactoryIndex;
 	IConsoleCommand* PingCommand = nullptr;
 	IConsoleCommand* SayCommand = nullptr;
 	IConsoleCommand* ToolPingCommand = nullptr;
+	IConsoleCommand* IndexCommand = nullptr;
 };
