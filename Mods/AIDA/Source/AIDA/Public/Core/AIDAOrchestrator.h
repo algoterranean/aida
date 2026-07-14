@@ -52,7 +52,15 @@ public:
 private:
 	void LoadConfig();
 
-	/** Spawn + cache the replicated chat relay via SML's SubsystemActorManager (server only). */
+	/**
+	 * Register the relay subsystem CLASS with SML's SubsystemActorManager. Must run on EVERY world
+	 * (client included): the manager only records a replicated subsystem actor when it arrives if its
+	 * class was pre-registered, so without this a client's GetSubsystemActor<AAIDAChatRelay>() (and
+	 * thus the ChatWidget binding) returns null forever. Idempotent; spawns nothing on clients.
+	 */
+	void RegisterRelayClass();
+
+	/** Register the class, then (server) spawn + cache the relay and hand it to the session manager. */
 	void RegisterRelay();
 	AAIDAChatRelay* GetRelay();
 

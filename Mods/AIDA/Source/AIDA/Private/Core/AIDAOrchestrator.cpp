@@ -6,6 +6,7 @@
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -29,10 +30,13 @@ void UAIDAOrchestrator::OnWorldBeginPlay(UWorld& InWorld)
 {
 	Super::OnWorldBeginPlay(InWorld);
 
-	// The orchestrator is the only network-egress authority. Clients hold no config and no key.
+	// The orchestrator is the only network-egress authority. Clients hold no config and no key —
+	// but they MUST still register the relay subsystem class, or SML never records the replicated
+	// relay actor on the client and the ChatWidget can never bind to it (client sees no stream).
 	if (InWorld.GetNetMode() == NM_Client)
 	{
-		UE_LOG(LogAIDA, Verbose, TEXT("Orchestrator idle on client world."));
+		RegisterRelayClass();
+		UE_LOG(LogAIDA, Verbose, TEXT("Orchestrator idle on client world (relay class registered for replication)."));
 		return;
 	}
 
@@ -63,19 +67,42 @@ void UAIDAOrchestrator::Deinitialize()
 	Super::Deinitialize();
 }
 
-void UAIDAOrchestrator::RegisterRelay()
+void UAIDAOrchestrator::RegisterRelayClass()
 {
 	UWorld* World = GetWorld();
 	if (!World)
 	{
+		UE_LOG(LogAIDA, Warning, TEXT("[diag] RegisterRelayClass: no world."));
 		return;
 	}
-	if (USubsystemActorManager* Mgr = World->GetSubsystem<USubsystemActorManager>())
+
+	USubsystemActorManager* Mgr = World->GetSubsystem<USubsystemActorManager>();
+	if (!Mgr)
 	{
-		// SpawnOnServer_Replicate: spawns immediately on the server and replicates to clients.
-		Mgr->RegisterSubsystemActor(AAIDAChatRelay::StaticClass());
+		UE_LOG(LogAIDA, Warning, TEXT("[diag] RegisterRelayClass: NO SubsystemActorManager for world (netmode=%d)."), static_cast<int32>(World->GetNetMode()));
+		return;
 	}
-	GetRelay(); // cache + hand it to the session manager
+
+	// SpawnOnServer_Replicate: spawns immediately on the server, only registers the class on
+	// clients (so the manager records the replicated actor when it lands — see header note).
+	Mgr->RegisterSubsystemActor(AAIDAChatRelay::StaticClass());
+
+	// Diagnostics: did the manager end up holding a findable actor, and does one actually exist in the world?
+	const bool bFoundInMgr = Mgr->GetSubsystemActor<AAIDAChatRelay>() != nullptr;
+	int32 ActorsInWorld = 0;
+	for (TActorIterator<AAIDAChatRelay> It(World); It; ++It)
+	{
+		++ActorsInWorld;
+	}
+	UE_LOG(LogAIDA, Log, TEXT("[diag] RegisterRelayClass: netmode=%d mgrLookup=%s actorsInWorld=%d"),
+		static_cast<int32>(World->GetNetMode()), bFoundInMgr ? TEXT("FOUND") : TEXT("null"), ActorsInWorld);
+}
+
+void UAIDAOrchestrator::RegisterRelay()
+{
+	RegisterRelayClass();
+	AAIDAChatRelay* R = GetRelay(); // cache + hand it to the session manager (server: spawned above)
+	UE_LOG(LogAIDA, Log, TEXT("Relay registered (server spawn %s)."), R ? TEXT("OK") : TEXT("PENDING"));
 }
 
 AAIDAChatRelay* UAIDAOrchestrator::GetRelay()

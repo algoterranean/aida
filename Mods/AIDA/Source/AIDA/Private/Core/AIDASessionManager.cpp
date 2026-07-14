@@ -1,5 +1,6 @@
 #include "Core/AIDASessionManager.h"
 
+#include "AIDA.h"
 #include "Net/AIDAChatRelay.h"
 
 FAIDASessionManager::FAIDASessionManager(int32 InMaxMessages)
@@ -66,6 +67,10 @@ FGuid FAIDASessionManager::PostPlayerMessage(const FString& Author, const FStrin
 		R->ServerBeginMessage(Header);
 		R->ServerPushDelta(Header.Id, Text);
 		R->ServerEndMessage(Header.Id, HashBody(Text));
+	}
+	else
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[session] PostPlayerMessage but no relay bound — not fanned out to clients."));
 	}
 	return Header.Id;
 }
