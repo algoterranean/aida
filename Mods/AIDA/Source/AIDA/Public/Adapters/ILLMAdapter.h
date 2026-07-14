@@ -17,6 +17,6 @@ public:
 	virtual ~ILLMAdapter() = default;
 
 	virtual void Complete(const FAIDACompletionRequest& Request, FAIDAOnChunk OnChunk,
-		FAIDAOnComplete OnComplete, FAIDAOnError OnError) = 0;
+		FAIDAOnCompleteResult OnComplete, FAIDAOnError OnError) = 0;
 	virtual FString GetName() const = 0;
 };

@@ -10,6 +10,21 @@
 #include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
 #include "Interfaces/IPluginManager.h"
+#include "Dom/JsonObject.h"
+
+namespace
+{
+	/** Map a tool's declared tier onto the permission tier the orchestrator gates it with. */
+	EAIDATier ToPermissionTier(EAIDAToolTier Tier)
+	{
+		switch (Tier)
+		{
+		case EAIDAToolTier::Chat: return EAIDATier::Chat;
+		case EAIDAToolTier::Act:  return EAIDATier::Act;
+		default:                  return EAIDATier::Query;
+		}
+	}
+}
 
 bool UAIDAOrchestrator::ShouldCreateSubsystem(UObject* Outer) const
 {
@@ -45,6 +60,7 @@ void UAIDAOrchestrator::OnWorldBeginPlay(UWorld& InWorld)
 
 	Session = MakeUnique<FAIDASessionManager>();
 	RegisterRelay();
+	RegisterTools();
 
 	RegisterConsoleCommands();
 }
@@ -60,6 +76,11 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(SayCommand);
 		SayCommand = nullptr;
+	}
+	if (ToolPingCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(ToolPingCommand);
+		ToolPingCommand = nullptr;
 	}
 	LLMClient.Reset();
 	Session.Reset();
@@ -259,6 +280,114 @@ void UAIDAOrchestrator::StartAIDAReply()
 		});
 }
 
+void UAIDAOrchestrator::RegisterTools()
+{
+	// Slice 0 verifier: a trivial echo tool. Proves the model->tool->model round-trip end to end
+	// before any factory-inspection tools land (docs/PHASE2.md Slice 0).
+	Tools.Register({
+		TEXT("echo"),
+		TEXT("Echo the 'text' argument back verbatim. Use this to verify that tool calling works."),
+		TEXT(R"({"type":"object","properties":{"text":{"type":"string","description":"The text to echo back."}},"required":["text"]})"),
+		EAIDAToolTier::Query,
+		[](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Text;
+			Args->TryGetStringField(TEXT("text"), Text);
+			return FAIDAToolResult::Ok(FString::Printf(TEXT("echo: %s"), *Text));
+		}
+	});
+
+	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
+}
+
+void UAIDAOrchestrator::BuildToolDefs(TArray<FAIDAToolDef>& OutDefs) const
+{
+	TArray<const FAIDAToolSpec*> Specs;
+	Tools.GetSpecs(Specs);
+	OutDefs.Reset(Specs.Num());
+	for (const FAIDAToolSpec* Spec : Specs)
+	{
+		OutDefs.Add({ Spec->Name, Spec->Description, Spec->ParametersJsonSchema });
+	}
+}
+
+void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages, FAIDARequester Requester,
+	int32 RoundsLeft, FAIDAOnChunk OnDelta, TFunction<void(const FString&)> OnDone, FAIDAOnError OnError)
+{
+	if (!LLMClient.IsValid() || !LLMClient->IsReady())
+	{
+		if (OnError) { OnError(0, TEXT("LLM client not ready")); }
+		return;
+	}
+
+	TArray<FAIDAToolDef> ToolDefs;
+	BuildToolDefs(ToolDefs);
+
+	TWeakObjectPtr<UAIDAOrchestrator> Weak(this);
+	LLMClient->CompleteChat(*Messages, ToolDefs, OnDelta,
+		[Weak, Messages, Requester, RoundsLeft, OnDelta, OnDone, OnError](const FAIDACompletionResult& Result)
+		{
+			UAIDAOrchestrator* O = Weak.Get();
+			if (!O)
+			{
+				return;
+			}
+
+			if (!Result.HasToolCalls() || RoundsLeft <= 0)
+			{
+				if (Result.HasToolCalls())
+				{
+					UE_LOG(LogAIDA, Warning, TEXT("[tools] round-trip cap reached with %d unhandled tool call(s); returning text."), Result.ToolCalls.Num());
+				}
+				if (OnDone) { OnDone(Result.Text); }
+				return;
+			}
+
+			// Echo the model's assistant turn (text + its tool_use calls) back into the history.
+			FAIDAChatMessage Assistant;
+			Assistant.Role = TEXT("assistant");
+			Assistant.Content = Result.Text;
+			Assistant.ToolCalls = Result.ToolCalls;
+			Messages->Add(Assistant);
+
+			// Dispatch each call (permission-gated by the tool's declared tier), collecting one
+			// tool_result per call into a single follow-up user turn.
+			FAIDAChatMessage ToolTurn;
+			ToolTurn.Role = TEXT("user");
+
+			FAIDAToolContext Ctx;
+			Ctx.Author = Requester.Author;
+			Ctx.PlayerId = Requester.PlayerId;
+
+			for (const FAIDAToolCall& Call : Result.ToolCalls)
+			{
+				FAIDAToolResultPart Part;
+				Part.ToolCallId = Call.Id;
+
+				const FAIDAToolSpec* Spec = O->Tools.Find(Call.Name);
+				if (Spec && !O->Permissions.IsAllowed(ToPermissionTier(Spec->Tier), Requester.PlayerId))
+				{
+					Part.bIsError = true;
+					Part.Content = FString::Printf(TEXT("Permission denied: you may not use the '%s' tool."), *Call.Name);
+				}
+				else
+				{
+					const FAIDAToolResult R = O->Tools.Dispatch(Call.Name, Call.ArgsJson, Ctx);
+					Part.bIsError = R.bIsError;
+					Part.Content = R.Content;
+				}
+
+				UE_LOG(LogAIDA, Log, TEXT("[tools] %s(%s) -> %s%s"),
+					*Call.Name, *Call.ArgsJson, Part.bIsError ? TEXT("ERROR: ") : TEXT(""), *Part.Content);
+				ToolTurn.ToolResults.Add(MoveTemp(Part));
+			}
+			Messages->Add(MoveTemp(ToolTurn));
+
+			O->RunToolLoop(Messages, Requester, RoundsLeft - 1, OnDelta, OnDone, OnError);
+		},
+		OnError);
+}
+
 bool UAIDAOrchestrator::GetMessageBody(const FGuid& Id, FAIDATranscriptEntry& OutEntry) const
 {
 	return Session.IsValid() && Session->GetMessageBody(Id, OutEntry);
@@ -290,6 +419,47 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Inject a chat request through the full relay path (run on server/host). Usage: AIDA.Say [text...]"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Say),
 		ECVF_Default);
+
+	ToolPingCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.ToolPing"),
+		TEXT("Run the tool loop against the echo tool and log the result (verifies Phase 2 Slice 0). Usage: AIDA.ToolPing [prompt...]"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::ToolPing),
+		ECVF_Default);
+}
+
+void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
+{
+	if (!LLMClient.IsValid() || !LLMClient->IsReady())
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.ToolPing: LLM client not ready (config not loaded, or provider not implemented)."));
+		return;
+	}
+
+	const FString Prompt = Args.Num() > 0
+		? FString::Join(Args, TEXT(" "))
+		: TEXT("Call the echo tool with text \"pong\", then tell me exactly what it returned.");
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.ToolPing -> \"%s\""), *Prompt);
+
+	const TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages = MakeShared<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe>();
+	Messages->Add({ TEXT("user"), Prompt });
+
+	FAIDARequester Requester;
+	Requester.Author = TEXT("DebugPlayer");
+	Requester.PlayerId = TEXT("debug");
+
+	RunToolLoop(Messages, Requester, MaxToolRoundTrips,
+		[](const FString& Delta)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("AIDA delta: %s"), *Delta);
+		},
+		[](const FString& Text)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("AIDA.ToolPing reply (complete): %s"), *Text);
+		},
+		[](int32 Status, const FString& Message)
+		{
+			UE_LOG(LogAIDA, Error, TEXT("AIDA.ToolPing failed (HTTP %d): %s"), Status, *Message);
+		});
 }
 
 void UAIDAOrchestrator::Say(const TArray<FString>& Args)

@@ -3,6 +3,24 @@
 #include "Async/Async.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpResponse.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+
+TSharedRef<FJsonObject> AIDAParseObjectOrEmpty(const FString& JsonStr)
+{
+	const FString Trimmed = JsonStr.TrimStartAndEnd();
+	if (!Trimmed.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Parsed;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Trimmed);
+		if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid())
+		{
+			return Parsed.ToSharedRef();
+		}
+	}
+	return MakeShared<FJsonObject>();
+}
 
 void FAIDASSEBuffer::Feed(const void* Ptr, int64 Len, const TFunctionRef<void(const FString&)>& OnLine)
 {
@@ -60,8 +78,8 @@ namespace
 }
 
 void AIDADriveSSEStream(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& HttpRequest,
-	FAIDASSEDeltaExtractor Extract, FAIDAOnChunk OnChunk,
-	FAIDAOnComplete OnComplete, FAIDAOnError OnError)
+	FAIDASSEEventHandler Handle, FAIDAOnChunk OnChunk,
+	FAIDAOnCompleteResult OnComplete, FAIDAOnError OnError)
 {
 	// Shared across the worker-thread stream delegate and the game-thread completion callback.
 	// Only the worker thread mutates it, and completion happens-after the final Serialize, so the
@@ -69,13 +87,13 @@ void AIDADriveSSEStream(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Htt
 	struct FState
 	{
 		FAIDASSEBuffer Framing;
-		FString Assembled;      // concatenation of all deltas — the OnComplete payload
-		TArray<uint8> RawBody;  // full body kept verbatim for error reporting (errors aren't SSE)
+		FAIDAStreamAccumulator Acc; // assembled text + tool calls + stop reason — the OnComplete payload
+		TArray<uint8> RawBody;      // full body kept verbatim for error reporting (errors aren't SSE)
 	};
 	const TSharedRef<FState, ESPMode::ThreadSafe> State = MakeShared<FState, ESPMode::ThreadSafe>();
 
 	HttpRequest->SetResponseBodyReceiveStreamDelegateV2(FHttpRequestStreamDelegateV2::CreateLambda(
-		[State, Extract = MoveTemp(Extract), OnChunk](void* Ptr, int64& InOutLength)
+		[State, Handle = MoveTemp(Handle), OnChunk](void* Ptr, int64& InOutLength)
 		{
 			// WORKER THREAD — never touch game-thread/UObject state here.
 			if (Ptr && InOutLength > 0)
@@ -83,7 +101,7 @@ void AIDADriveSSEStream(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Htt
 				State->RawBody.Append(static_cast<const uint8*>(Ptr), static_cast<int32>(InOutLength));
 			}
 
-			State->Framing.Feed(Ptr, InOutLength, [&State, &Extract, &OnChunk](const FString& Line)
+			State->Framing.Feed(Ptr, InOutLength, [&State, &Handle, &OnChunk](const FString& Line)
 			{
 				if (!Line.StartsWith(TEXT("data:")))
 				{
@@ -96,12 +114,12 @@ void AIDADriveSSEStream(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Htt
 					return; // OpenAI's terminator; Anthropic signals done via message_stop (no text)
 				}
 
-				const FString Delta = Extract(Data);
+				const FString Delta = Handle(Data, State->Acc);
 				if (Delta.IsEmpty())
 				{
 					return;
 				}
-				State->Assembled += Delta;
+				State->Acc.Text += Delta;
 				if (OnChunk)
 				{
 					AsyncTask(ENamedThreads::GameThread, [OnChunk, Delta]() { OnChunk(Delta); });
@@ -134,7 +152,25 @@ void AIDADriveSSEStream(const TSharedRef<IHttpRequest, ESPMode::ThreadSafe>& Htt
 				return;
 			}
 
+			// Flush any tool calls still accumulating (a truncated stream, or a provider that finalizes
+			// only at end). Handlers normally finalize their own; this is a belt-and-suspenders backstop.
+			// Emit in ascending block/tool index so the order is deterministic.
+			FAIDACompletionResult Result;
+			Result.Text = State->Acc.Text;
+			Result.StopReason = State->Acc.StopReason;
+			Result.ToolCalls = State->Acc.ToolCalls;
+			if (State->Acc.PendingByIndex.Num() > 0)
+			{
+				TArray<int32> Indices;
+				State->Acc.PendingByIndex.GetKeys(Indices);
+				Indices.Sort();
+				for (int32 Index : Indices)
+				{
+					Result.ToolCalls.Add(State->Acc.PendingByIndex[Index]);
+				}
+			}
+
 			AsyncTask(ENamedThreads::GameThread,
-				[OnComplete, Full = State->Assembled]() { if (OnComplete) { OnComplete(Full); } });
+				[OnComplete, Result = MoveTemp(Result)]() { if (OnComplete) { OnComplete(Result); } });
 		});
 }

@@ -26,9 +26,16 @@ public:
 
 	/**
 	 * Full multi-turn completion: the caller supplies the assembled message history (already
-	 * privacy-filtered). Same streaming/callback contract as Complete().
+	 * privacy-filtered). Text-only terminal callback. Same streaming/callback contract as Complete().
 	 */
 	void CompleteChat(const TArray<FAIDAChatMessage>& Messages, FAIDAOnChunk OnChunk, FAIDAOnComplete OnComplete, FAIDAOnError OnError);
+
+	/**
+	 * Tool-aware multi-turn completion: exposes the structured result (text + tool calls + stop
+	 * reason) so the orchestrator's tool loop can dispatch tool calls and continue. Tools may be empty.
+	 */
+	void CompleteChat(const TArray<FAIDAChatMessage>& Messages, const TArray<FAIDAToolDef>& Tools,
+		FAIDAOnChunk OnChunk, FAIDAOnCompleteResult OnComplete, FAIDAOnError OnError);
 
 private:
 	TSharedPtr<ILLMAdapter> Adapter;

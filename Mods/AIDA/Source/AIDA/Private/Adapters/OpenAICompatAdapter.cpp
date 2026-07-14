@@ -12,37 +12,43 @@
 
 namespace
 {
-	/** OpenAI SSE: each chunk is `choices[0].delta.content` (absent on role-only / finish frames). */
-	FString ExtractOpenAIDelta(const FString& DataJson)
+	/** Append one message to the OpenAI `messages` array (a tool-result turn expands to N `tool` msgs). */
+	void AppendOpenAIMessage(const FAIDAChatMessage& Msg, TArray<TSharedPtr<FJsonValue>>& OutMessages)
 	{
-		TSharedPtr<FJsonObject> Json;
-		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(DataJson);
-		if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
+		if (Msg.ToolResults.Num() > 0)
 		{
-			return FString();
+			// OpenAI represents each tool result as its own `role:"tool"` message keyed by tool_call_id.
+			for (const FAIDAToolResultPart& Part : Msg.ToolResults)
+			{
+				const TSharedRef<FJsonObject> M = MakeShared<FJsonObject>();
+				M->SetStringField(TEXT("role"), TEXT("tool"));
+				M->SetStringField(TEXT("tool_call_id"), Part.ToolCallId);
+				M->SetStringField(TEXT("content"), Part.Content);
+				OutMessages.Add(MakeShared<FJsonValueObject>(M));
+			}
+			return;
 		}
 
-		const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
-		if (!Json->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
+		const TSharedRef<FJsonObject> M = MakeShared<FJsonObject>();
+		M->SetStringField(TEXT("role"), Msg.Role);
+		M->SetStringField(TEXT("content"), Msg.Content);
+		if (Msg.ToolCalls.Num() > 0)
 		{
-			return FString();
+			TArray<TSharedPtr<FJsonValue>> Calls;
+			for (const FAIDAToolCall& Call : Msg.ToolCalls)
+			{
+				const TSharedRef<FJsonObject> C = MakeShared<FJsonObject>();
+				C->SetStringField(TEXT("id"), Call.Id);
+				C->SetStringField(TEXT("type"), TEXT("function"));
+				const TSharedRef<FJsonObject> Fn = MakeShared<FJsonObject>();
+				Fn->SetStringField(TEXT("name"), Call.Name);
+				Fn->SetStringField(TEXT("arguments"), Call.ArgsJson);
+				C->SetObjectField(TEXT("function"), Fn);
+				Calls.Add(MakeShared<FJsonValueObject>(C));
+			}
+			M->SetArrayField(TEXT("tool_calls"), Calls);
 		}
-
-		const TSharedPtr<FJsonObject> Choice = (*Choices)[0]->AsObject();
-		if (!Choice.IsValid())
-		{
-			return FString();
-		}
-
-		const TSharedPtr<FJsonObject>* Delta = nullptr;
-		if (!Choice->TryGetObjectField(TEXT("delta"), Delta) || !Delta)
-		{
-			return FString();
-		}
-
-		FString Content;
-		(*Delta)->TryGetStringField(TEXT("content"), Content);
-		return Content;
+		OutMessages.Add(MakeShared<FJsonValueObject>(M));
 	}
 }
 
@@ -62,6 +68,26 @@ FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Req
 		Root->SetBoolField(TEXT("stream"), true);
 	}
 
+	if (Request.Tools.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> Tools;
+		for (const FAIDAToolDef& Def : Request.Tools)
+		{
+			const TSharedRef<FJsonObject> T = MakeShared<FJsonObject>();
+			T->SetStringField(TEXT("type"), TEXT("function"));
+			const TSharedRef<FJsonObject> Fn = MakeShared<FJsonObject>();
+			Fn->SetStringField(TEXT("name"), Def.Name);
+			if (!Def.Description.IsEmpty())
+			{
+				Fn->SetStringField(TEXT("description"), Def.Description);
+			}
+			Fn->SetObjectField(TEXT("parameters"), AIDAParseObjectOrEmpty(Def.InputSchemaJson));
+			T->SetObjectField(TEXT("function"), Fn);
+			Tools.Add(MakeShared<FJsonValueObject>(T));
+		}
+		Root->SetArrayField(TEXT("tools"), Tools);
+	}
+
 	// OpenAI carries the system prompt as the first message (unlike Anthropic's top-level "system").
 	TArray<TSharedPtr<FJsonValue>> Messages;
 	if (!Request.System.IsEmpty())
@@ -73,10 +99,7 @@ FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Req
 	}
 	for (const FAIDAChatMessage& Msg : Request.Messages)
 	{
-		const TSharedRef<FJsonObject> M = MakeShared<FJsonObject>();
-		M->SetStringField(TEXT("role"), Msg.Role);
-		M->SetStringField(TEXT("content"), Msg.Content);
-		Messages.Add(MakeShared<FJsonValueObject>(M));
+		AppendOpenAIMessage(Msg, Messages);
 	}
 	Root->SetArrayField(TEXT("messages"), Messages);
 
@@ -86,8 +109,95 @@ FString FOpenAICompatAdapter::BuildRequestBody(const FAIDACompletionRequest& Req
 	return Body;
 }
 
+FString FOpenAICompatAdapter::HandleStreamEvent(const FString& DataJson, FAIDAStreamAccumulator& Acc)
+{
+	TSharedPtr<FJsonObject> Json;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(DataJson);
+	if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid())
+	{
+		return FString();
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
+	if (!Json->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
+	{
+		return FString();
+	}
+	const TSharedPtr<FJsonObject> Choice = (*Choices)[0]->AsObject();
+	if (!Choice.IsValid())
+	{
+		return FString();
+	}
+
+	// A non-empty finish_reason ends the turn — finalize any tool calls accumulated so far.
+	FString Finish;
+	if (Choice->TryGetStringField(TEXT("finish_reason"), Finish) && !Finish.IsEmpty())
+	{
+		Acc.StopReason = Finish;
+		if (Acc.PendingByIndex.Num() > 0)
+		{
+			TArray<int32> Indices;
+			Acc.PendingByIndex.GetKeys(Indices);
+			Indices.Sort();
+			for (int32 Index : Indices)
+			{
+				Acc.ToolCalls.Add(Acc.PendingByIndex[Index]);
+			}
+			Acc.PendingByIndex.Reset();
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* Delta = nullptr;
+	if (!Choice->TryGetObjectField(TEXT("delta"), Delta) || !Delta)
+	{
+		return FString();
+	}
+
+	// Streamed tool calls: the first fragment for an index carries id + function.name; later fragments
+	// append function.arguments. Accumulate by index until a finish_reason flushes them.
+	const TArray<TSharedPtr<FJsonValue>>* ToolCalls = nullptr;
+	if ((*Delta)->TryGetArrayField(TEXT("tool_calls"), ToolCalls) && ToolCalls)
+	{
+		for (const TSharedPtr<FJsonValue>& Value : *ToolCalls)
+		{
+			const TSharedPtr<FJsonObject> TC = Value->AsObject();
+			if (!TC.IsValid())
+			{
+				continue;
+			}
+			int32 Index = 0;
+			TC->TryGetNumberField(TEXT("index"), Index);
+			FAIDAToolCall& Pending = Acc.PendingByIndex.FindOrAdd(Index);
+
+			FString Id;
+			if (TC->TryGetStringField(TEXT("id"), Id) && !Id.IsEmpty())
+			{
+				Pending.Id = Id;
+			}
+			const TSharedPtr<FJsonObject>* Fn = nullptr;
+			if (TC->TryGetObjectField(TEXT("function"), Fn) && Fn)
+			{
+				FString Name;
+				if ((*Fn)->TryGetStringField(TEXT("name"), Name) && !Name.IsEmpty())
+				{
+					Pending.Name = Name;
+				}
+				FString ArgsFragment;
+				if ((*Fn)->TryGetStringField(TEXT("arguments"), ArgsFragment))
+				{
+					Pending.ArgsJson += ArgsFragment;
+				}
+			}
+		}
+	}
+
+	FString Content;
+	(*Delta)->TryGetStringField(TEXT("content"), Content);
+	return Content;
+}
+
 void FOpenAICompatAdapter::Complete(const FAIDACompletionRequest& Request, FAIDAOnChunk OnChunk,
-	FAIDAOnComplete OnComplete, FAIDAOnError OnError)
+	FAIDAOnCompleteResult OnComplete, FAIDAOnError OnError)
 {
 	FString Url = BaseUrl;
 	Url.RemoveFromEnd(TEXT("/"));
@@ -103,7 +213,7 @@ void FOpenAICompatAdapter::Complete(const FAIDACompletionRequest& Request, FAIDA
 	}
 	HttpRequest->SetContentAsString(BuildRequestBody(Request, /*bStream=*/true));
 
-	AIDADriveSSEStream(HttpRequest, FAIDASSEDeltaExtractor(&ExtractOpenAIDelta),
+	AIDADriveSSEStream(HttpRequest, FAIDASSEEventHandler(&FOpenAICompatAdapter::HandleStreamEvent),
 		MoveTemp(OnChunk), MoveTemp(OnComplete), MoveTemp(OnError));
 
 	HttpRequest->ProcessRequest();
