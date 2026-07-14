@@ -10,6 +10,7 @@
 #include "Adapters/OpenAICompatAdapter.h"
 #include "Adapters/SSEStream.h"
 #include "Tools/AIDAToolRegistry.h"
+#include "Factory/AIDAFactoryAggregator.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -593,5 +594,180 @@ bool FAIDAOpenAIToolStreamTest::RunTest(const FString&)
 	TestEqual(TEXT("stop reason"), Acc.StopReason, TEXT("tool_calls"));
 	return true;
 }
+
+// ----------------------------------------------------------------------------------------------------
+// Phase 2 Slice 1 — factory aggregation math (docs/PHASE2.md). Pure logic on synthetic entities.
+// ----------------------------------------------------------------------------------------------------
+
+static FAIDAMachine AIDAMakeTestMachine(int32 Id, const FVector& Loc, const FString& Cls = TEXT("Machine"))
+{
+	FAIDAMachine M;
+	M.Id = Id;
+	M.Location = Loc;
+	M.BuildingClass = Cls;
+	return M;
+}
+
+#define AIDA_TEST_NEAR(What, A, B) TestTrue(TEXT(What), FMath::IsNearlyEqual((double)(A), (double)(B), 1e-6))
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryClusteringTest, "AIDA.Factory.Clustering",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryClusteringTest::RunTest(const FString&)
+{
+	// Two tight pairs, ~20 km apart: with the 50 m epsilon this must be exactly two clusters.
+	TArray<FAIDAMachine> Machines;
+	Machines.Add(AIDAMakeTestMachine(1, FVector(0, 0, 0)));
+	Machines.Add(AIDAMakeTestMachine(2, FVector(500, 0, 0)));
+	Machines.Add(AIDAMakeTestMachine(3, FVector(20000, 0, 0)));
+	Machines.Add(AIDAMakeTestMachine(4, FVector(20400, 0, 0)));
+
+	const TArray<int32> Labels = FAIDAFactoryAggregator::ClusterMachines(Machines, FAIDAAggregatorConfig());
+	TestEqual(TEXT("label per machine"), Labels.Num(), 4);
+	TestEqual(TEXT("pair A shares a cluster"), Labels[0], Labels[1]);
+	TestEqual(TEXT("pair B shares a cluster"), Labels[2], Labels[3]);
+	TestNotEqual(TEXT("the pairs are different clusters"), Labels[0], Labels[2]);
+	TestEqual(TEXT("exactly two clusters"), TSet<int32>(Labels).Num(), 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryBalanceTest, "AIDA.Factory.BalanceSheet",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryBalanceTest::RunTest(const FString&)
+{
+	FAIDAMachine Smelter = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Smelter"));
+	Smelter.Inputs = { { TEXT("IronOre"), 30.0 } };
+	Smelter.Outputs = { { TEXT("IronIngot"), 30.0 } };
+	FAIDAMachine Ctor = AIDAMakeTestMachine(2, FVector(100, 0, 0), TEXT("Constructor"));
+	Ctor.Inputs = { { TEXT("IronIngot"), 30.0 } };
+	Ctor.Outputs = { { TEXT("IronPlate"), 20.0 } };
+
+	const TArray<FAIDAItemBalance> Balance = FAIDAFactoryAggregator::BuildBalanceSheet({ Smelter, Ctor });
+	// Sorted by item key: IronIngot, IronOre, IronPlate.
+	TestEqual(TEXT("three items"), Balance.Num(), 3);
+	if (Balance.Num() == 3)
+	{
+		TestEqual(TEXT("[0] item"), Balance[0].Item, FString(TEXT("IronIngot")));
+		AIDA_TEST_NEAR("IronIngot balances to net 0", Balance[0].Net(), 0.0);
+		TestFalse(TEXT("IronIngot not in deficit"), Balance[0].IsDeficit());
+
+		TestEqual(TEXT("[1] item"), Balance[1].Item, FString(TEXT("IronOre")));
+		AIDA_TEST_NEAR("IronOre consumed 30", Balance[1].Consumed, 30.0);
+		AIDA_TEST_NEAR("IronOre produced 0", Balance[1].Produced, 0.0);
+		TestTrue(TEXT("IronOre is a deficit (raw input)"), Balance[1].IsDeficit());
+
+		TestEqual(TEXT("[2] item"), Balance[2].Item, FString(TEXT("IronPlate")));
+		AIDA_TEST_NEAR("IronPlate net +20", Balance[2].Net(), 20.0);
+		TestFalse(TEXT("IronPlate not in deficit"), Balance[2].IsDeficit());
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryClusterNetFlowsTest, "AIDA.Factory.ClusterNetFlows",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryClusterNetFlowsTest::RunTest(const FString&)
+{
+	// One cluster: internal IronIngot cancels; IronOre is a net import, IronPlate a net export.
+	FAIDAMachine Smelter = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Smelter"));
+	Smelter.Inputs = { { TEXT("IronOre"), 30.0 } };
+	Smelter.Outputs = { { TEXT("IronIngot"), 30.0 } };
+	Smelter.Productivity = 1.0f;
+	FAIDAMachine Ctor = AIDAMakeTestMachine(2, FVector(100, 0, 0), TEXT("Constructor"));
+	Ctor.Inputs = { { TEXT("IronIngot"), 30.0 } };
+	Ctor.Outputs = { { TEXT("IronPlate"), 20.0 } };
+	Ctor.Productivity = 0.5f;
+
+	const TArray<FAIDAMachine> Machines = { Smelter, Ctor };
+	const TArray<FAIDACluster> Clusters = FAIDAFactoryAggregator::BuildClusters(Machines, { 0, 0 }, FAIDAAggregatorConfig());
+
+	TestEqual(TEXT("single cluster"), Clusters.Num(), 1);
+	if (Clusters.Num() == 1)
+	{
+		const FAIDACluster& C = Clusters[0];
+		TestEqual(TEXT("two machines"), C.MachineIds.Num(), 2);
+		TestEqual(TEXT("census Smelter"), C.BuildingCensus.FindRef(TEXT("Smelter")), 1);
+		TestEqual(TEXT("census Constructor"), C.BuildingCensus.FindRef(TEXT("Constructor")), 1);
+		AIDA_TEST_NEAR("efficiency = mean productivity", C.Efficiency, 0.75);
+
+		TestEqual(TEXT("one net import"), C.NetInputs.Num(), 1);
+		if (C.NetInputs.Num() == 1)
+		{
+			TestEqual(TEXT("imports IronOre"), C.NetInputs[0].Item, FString(TEXT("IronOre")));
+			AIDA_TEST_NEAR("imports 30/min", C.NetInputs[0].PerMinute, 30.0);
+		}
+		TestEqual(TEXT("one net export"), C.NetOutputs.Num(), 1);
+		if (C.NetOutputs.Num() == 1)
+		{
+			TestEqual(TEXT("exports IronPlate"), C.NetOutputs[0].Item, FString(TEXT("IronPlate")));
+			AIDA_TEST_NEAR("exports 20/min", C.NetOutputs[0].PerMinute, 20.0);
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryLogisticsTest, "AIDA.Factory.Logistics",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryLogisticsTest::RunTest(const FString&)
+{
+	// Machines 1 & 3 form cluster 0; machine 2 is the distant cluster 1.
+	TArray<FAIDAMachine> Machines;
+	Machines.Add(AIDAMakeTestMachine(1, FVector(0, 0, 0)));
+	Machines.Add(AIDAMakeTestMachine(3, FVector(300, 0, 0)));
+	Machines.Add(AIDAMakeTestMachine(2, FVector(20000, 0, 0)));
+
+	const TArray<int32> Labels = FAIDAFactoryAggregator::ClusterMachines(Machines, FAIDAAggregatorConfig());
+	TMap<int32, int32> IdToCluster;
+	for (int32 i = 0; i < Machines.Num(); ++i) { IdToCluster.Add(Machines[i].Id, Labels[i]); }
+
+	TArray<FAIDAConveyorEdge> Edges;
+	Edges.Add({ 1, 3, TEXT("IronRod"), 30.0 });     // intra-cluster -> dropped
+	Edges.Add({ 1, 2, TEXT("IronPlate"), 60.0 });   // cross-cluster
+	Edges.Add({ 3, 2, TEXT("IronPlate"), 20.0 });   // cross-cluster, same item -> accumulates
+	Edges.Add({ 2, 99, TEXT("Screw"), 10.0 });      // dangling (unknown machine) -> dropped
+
+	const TArray<FAIDALogisticsFlow> Flows = FAIDAFactoryAggregator::BuildLogistics(Edges, IdToCluster);
+	TestEqual(TEXT("one aggregated inter-cluster flow"), Flows.Num(), 1);
+	if (Flows.Num() == 1)
+	{
+		TestEqual(TEXT("from cluster 0"), Flows[0].FromCluster, 0);
+		TestEqual(TEXT("to cluster 1"), Flows[0].ToCluster, 1);
+		TestEqual(TEXT("item IronPlate"), Flows[0].Item, FString(TEXT("IronPlate")));
+		AIDA_TEST_NEAR("60 + 20 = 80/min", Flows[0].PerMinute, 80.0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryPowerTest, "AIDA.Factory.Power",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryPowerTest::RunTest(const FString&)
+{
+	TArray<FAIDAMachine> Machines;
+	FAIDAMachine A = AIDAMakeTestMachine(1, FVector::ZeroVector); A.CircuitId = 1; A.PowerMW = 60.0;
+	FAIDAMachine B = AIDAMakeTestMachine(2, FVector::ZeroVector); B.CircuitId = 1; B.PowerMW = 30.0;
+	FAIDAMachine Gen = AIDAMakeTestMachine(3, FVector::ZeroVector); Gen.CircuitId = 1; Gen.PowerMW = -50.0; // generator: not a draw
+	FAIDAMachine C = AIDAMakeTestMachine(4, FVector::ZeroVector); C.CircuitId = 2; C.PowerMW = 70.0;
+	Machines = { A, B, Gen, C };
+
+	TArray<FAIDAPowerCircuitStats> Circuits;
+	Circuits.Add({ 1, /*Produced*/ 90.0, /*Capacity*/ 100.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
+	Circuits.Add({ 2, /*Produced*/ 20.0, /*Capacity*/ 50.0,  /*Battery*/ 0.0, /*Drain*/ -1.0 });
+
+	const TArray<FAIDAPowerReport> Reports = FAIDAFactoryAggregator::BuildPowerReport(Machines, Circuits);
+	TestEqual(TEXT("two circuits, sorted by id"), Reports.Num(), 2);
+	if (Reports.Num() == 2)
+	{
+		TestEqual(TEXT("[0] circuit 1"), Reports[0].CircuitId, 1);
+		AIDA_TEST_NEAR("circuit 1 draw excludes generator", Reports[0].ConsumedMW, 90.0);
+		AIDA_TEST_NEAR("circuit 1 capacity", Reports[0].CapacityMW, 100.0);
+		AIDA_TEST_NEAR("circuit 1 headroom", Reports[0].Headroom(), 10.0);
+		TestFalse(TEXT("circuit 1 not overloaded"), Reports[0].IsOverloaded());
+
+		TestEqual(TEXT("[1] circuit 2"), Reports[1].CircuitId, 2);
+		AIDA_TEST_NEAR("circuit 2 draw", Reports[1].ConsumedMW, 70.0);
+		TestTrue(TEXT("circuit 2 overloaded (70 > 50)"), Reports[1].IsOverloaded());
+	}
+	return true;
+}
+
+#undef AIDA_TEST_NEAR
 
 #endif // WITH_AUTOMATION_TESTS
