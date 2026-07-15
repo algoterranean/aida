@@ -18,6 +18,7 @@
 #include "FGCentralStorageSubsystem.h"
 #include "FGFactoryConnectionComponent.h"
 #include "FGPipeConnectionComponent.h"
+#include "Hologram/FGConveyorBeltHologram.h"
 #include "Hologram/FGSplineHologram.h"
 #include "FGClearanceInterface.h"
 #include "FGConstructDisqualifier.h"
@@ -1288,9 +1289,12 @@ namespace
 		return Best;
 	}
 
-	/** Synthetic build-gun hit AT a connector, so a spline hologram's TrySnapToActor finds the port. */
-	FHitResult MakePortHit(AActor* Actor, const FVector& ConnectorLoc)
+	/** Synthetic build-gun hit AT a connector, shaped like a player aiming into the port face along
+	 *  its outward normal, so a spline hologram's TrySnapToActor finds the port. */
+	FHitResult MakePortHit(AActor* Actor, const FVector& ConnectorLoc, const FVector& ConnectorNormal)
 	{
+		const FVector Normal = FVector(ConnectorNormal.X, ConnectorNormal.Y, 0.0).GetSafeNormal(
+			UE_SMALL_NUMBER, FVector::XAxisVector);
 		FHitResult Hit(ForceInit);
 		Hit.bBlockingHit = true;
 		Hit.HitObjectHandle = FActorInstanceHandle(Actor);
@@ -1300,9 +1304,47 @@ namespace
 		}
 		Hit.Location = ConnectorLoc;
 		Hit.ImpactPoint = ConnectorLoc;
-		Hit.Normal = FVector::UpVector;
-		Hit.ImpactNormal = FVector::UpVector;
+		Hit.Normal = Normal;
+		Hit.ImpactNormal = Normal;
+		Hit.TraceStart = ConnectorLoc + Normal * 300.0 + FVector(0.0, 0.0, 150.0);
+		Hit.TraceEnd = ConnectorLoc - Normal * 100.0;
+		Hit.Distance = (Hit.TraceStart - ConnectorLoc).Size();
 		return Hit;
+	}
+
+	/**
+	 * Did the spline hologram actually snap its current end to the expected actor's port? Pipeline
+	 * holograms answer via IsConnectionSnapped; CONVEYOR holograms don't override it (the base
+	 * returns false even when snapped — live-verify: every belt run "failed" its start snap), so
+	 * belts are asked through their own GetAnyConnectedBuildables. Logs the full state on failure.
+	 */
+	bool VerifyRunSnap(AFGSplineHologram* Spline, AActor* Expected, bool bLastConnection, const FVector& PortLoc)
+	{
+		bool bSnapped = false;
+		if (AFGConveyorBeltHologram* Belt = Cast<AFGConveyorBeltHologram>(Spline))
+		{
+			TArray<AFGBuildable*> Connected = Belt->GetAnyConnectedBuildables();
+			bSnapped = Connected.Contains(Cast<AFGBuildable>(Expected));
+			if (!bSnapped)
+			{
+				FString Names;
+				for (AFGBuildable* B : Connected) { Names += GetNameSafe(B) + TEXT(" "); }
+				UE_LOG(LogAIDA, Warning, TEXT("[actions][dbg] belt snap check failed: want=%s got=[%s] step=%d holoLoc=%s port=%s"),
+					*GetNameSafe(Expected), *Names, static_cast<int32>(Belt->GetCurrentBuildStep()),
+					*Belt->GetActorLocation().ToCompactString(), *PortLoc.ToCompactString());
+			}
+		}
+		else
+		{
+			bSnapped = Spline->IsConnectionSnapped(bLastConnection);
+			if (!bSnapped)
+			{
+				UE_LOG(LogAIDA, Warning, TEXT("[actions][dbg] pipe snap check failed: want=%s step=%d holoLoc=%s port=%s"),
+					*GetNameSafe(Expected), static_cast<int32>(Spline->GetCurrentBuildStep()),
+					*Spline->GetActorLocation().ToCompactString(), *PortLoc.ToCompactString());
+			}
+		}
+		return bSnapped;
 	}
 }
 
@@ -1418,7 +1460,7 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 	if (!Inventory) { OutError = TEXT("no player inventory available to validate against"); return false; }
 
 	// Pick the endpoint ports on the LIVE actors (belts: from = output, to = input; pipes any↔any).
-	FVector FromLoc, ToLoc;
+	FVector FromLoc, ToLoc, FromNormal, ToNormal;
 	if (!bPipe)
 	{
 		UFGFactoryConnectionComponent* FromConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
@@ -1427,6 +1469,8 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 		if (!ToConn) { OutError = FString::Printf(TEXT("no free input port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
 		FromLoc = FromConn->GetConnectorLocation();
 		ToLoc = ToConn->GetConnectorLocation();
+		FromNormal = FromConn->GetConnectorNormal();
+		ToNormal = ToConn->GetConnectorNormal();
 	}
 	else
 	{
@@ -1436,6 +1480,8 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 		if (!ToConn) { OutError = FString::Printf(TEXT("no free pipe port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
 		FromLoc = FromConn->GetConnectorLocation();
 		ToLoc = ToConn->GetConnectorLocation();
+		FromNormal = FromConn->GetConnectorNormal();
+		ToNormal = ToConn->GetConnectorNormal();
 	}
 
 	// Drive the spline hologram through the build gun's own two-step flow: place + snap the start,
@@ -1454,8 +1500,8 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 	}
 
 	Hologram->ResetConstructDisqualifiers();
-	Hologram->UpdateHologramPlacement(MakePortHit(FromActor, FromLoc));
-	if (Spline && !Spline->IsConnectionSnapped(false))
+	Hologram->UpdateHologramPlacement(MakePortHit(FromActor, FromLoc, FromNormal));
+	if (!VerifyRunSnap(Spline, FromActor, /*bLastConnection*/ false, FromLoc))
 	{
 		OutError = FString::Printf(TEXT("run start did not snap to %s's port"), *GetNameSafe(FromActor));
 		Hologram->Destroy();
@@ -1464,8 +1510,8 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 	Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false); // start placed; expect "more steps"
 
 	Hologram->ResetConstructDisqualifiers();
-	Hologram->UpdateHologramPlacement(MakePortHit(ToActor, ToLoc));
-	if (Spline && !Spline->IsConnectionSnapped(true))
+	Hologram->UpdateHologramPlacement(MakePortHit(ToActor, ToLoc, ToNormal));
+	if (!VerifyRunSnap(Spline, ToActor, /*bLastConnection*/ true, ToLoc))
 	{
 		OutError = FString::Printf(TEXT("run end did not snap to %s's port"), *GetNameSafe(ToActor));
 		Hologram->Destroy();
