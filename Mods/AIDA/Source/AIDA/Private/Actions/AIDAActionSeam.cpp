@@ -1085,6 +1085,26 @@ AActor* FAIDAActionSeam::SpawnGhostHologram(UObject* WorldContext, const FString
 	Hit.ImpactNormal = FVector::UpVector;
 	Hologram->UpdateHologramPlacement(Hit);
 	Hologram->ResetConstructDisqualifiers(); // ghost is display-only; keep the valid-placement look
+
+	// Display-only: kill ticking and collision on the hologram, its children, and every component.
+	// Factory-building holograms run real per-tick work meant for one build-gun frame at a time —
+	// left idling they hung the game (live-verify: assembler ghosts froze the session).
+	const auto Quiesce = [](AActor* Actor)
+	{
+		Actor->SetActorEnableCollision(false);
+		Actor->SetActorTickEnabled(false);
+		Actor->ForEachComponent<UActorComponent>(false, [](UActorComponent* Component)
+		{
+			Component->SetComponentTickEnabled(false);
+		});
+	};
+	Quiesce(Hologram);
+	TArray<AActor*> Attached;
+	Hologram->GetAttachedActors(Attached, /*bResetArray*/ true, /*bRecursivelyIncludeAttachedActors*/ true);
+	for (AActor* Child : Attached)
+	{
+		Quiesce(Child);
+	}
 	return Hologram;
 }
 
