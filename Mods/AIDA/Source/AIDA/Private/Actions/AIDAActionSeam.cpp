@@ -121,8 +121,26 @@ namespace
 			&& !Disqualifier->IsChildOf(UFGCDInitializing::StaticClass());
 	}
 
+	/**
+	 * Any live player inventory, for ValidatePlacementAndCost: its CheckCanAfford hard-asserts on a
+	 * null inventory in Shipping (live-verify crash, FGHologram.cpp:2187). WHOSE inventory doesn't
+	 * matter — the Unaffordable disqualifier is filtered; affordability is judged vs central storage.
+	 */
+	UFGInventoryComponent* FindValidationInventory(UWorld* World)
+	{
+		if (!World) { return nullptr; }
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			AFGCharacterPlayer* Character = PC ? Cast<AFGCharacterPlayer>(PC->GetPawn()) : nullptr;
+			if (Character && Character->GetInventory()) { return Character->GetInventory(); }
+		}
+		return nullptr;
+	}
+
 	/** Position + validate the hologram at one placement; true when no blocking disqualifier remains. */
-	bool PlaceAndValidate(AFGHologram* Hologram, const FTransform& Placement, TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr)
+	bool PlaceAndValidate(AFGHologram* Hologram, const FTransform& Placement, UFGInventoryComponent* Inventory,
+		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr)
 	{
 		const FVector Target = Placement.GetLocation();
 
@@ -138,9 +156,10 @@ namespace
 		Hologram->SetHologramLocationAndRotation(Hit);
 		Hologram->PostHologramPlacement(Hit);
 
-		// Public validation entry (CheckValidPlacement/CheckClearance are protected). Null inventory:
-		// affordability is judged against central storage by the callers, so UFGCDUnaffordable is filtered.
-		Hologram->ValidatePlacementAndCost(nullptr);
+		// Public validation entry (CheckValidPlacement/CheckClearance are protected). The inventory is
+		// only consumed by CheckCanAfford — which hard-asserts on null — and its Unaffordable verdict
+		// is filtered below; affordability is judged against central storage by the callers.
+		Hologram->ValidatePlacementAndCost(Inventory);
 
 		TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
 		Hologram->GetConstructDisqualifiers(Disqualifiers);
@@ -228,6 +247,13 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 		return false;
 	}
 
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory)
+	{
+		Out.Error = TEXT("no player inventory available to validate against (is anyone connected?)");
+		return false;
+	}
+
 	// ONE hologram walked across every placement, destroyed before this function returns —
 	// validation writes nothing to the world.
 	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, Placements[0].GetLocation());
@@ -240,7 +266,7 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 	for (int32 Index = 0; Index < Placements.Num(); ++Index)
 	{
 		TSubclassOf<UFGConstructDisqualifier> Blocking;
-		if (!PlaceAndValidate(Hologram, Placements[Index], &Blocking))
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking))
 		{
 			FAIDAPlacementFailure Failure;
 			Failure.Index = Index;
@@ -456,6 +482,13 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		return OutSkipped;
 	}
 
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory)
+	{
+		OutSkipped = Placements.Num() - Cursor; // nobody connected to validate against — terminate
+		return OutSkipped;
+	}
+
 	const int32 End = FMath::Min(Cursor + BatchSize, Placements.Num());
 	for (int32 Index = Cursor; Index < End; ++Index)
 	{
@@ -464,7 +497,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		if (!Hologram) { ++OutSkipped; continue; }
 
 		// Re-validate: the world may have changed since the dry-run (players build/walk around).
-		if (!PlaceAndValidate(Hologram, Placements[Index]))
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory))
 		{
 			Hologram->Destroy();
 			++OutSkipped;
@@ -752,11 +785,14 @@ bool FAIDAActionSeam::UndoRebuildEntity(UObject* WorldContext, const FAIDAEntity
 	UClass* RecipeClass = RecipePath.IsEmpty() ? nullptr : FSoftClassPath(RecipePath).TryLoadClass<UFGRecipe>();
 	if (!RecipeClass) { return false; }
 
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory) { return false; }
+
 	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, Entity.Pos);
 	if (!Hologram) { return false; }
 
 	const FTransform Placement(FRotator(0.0, static_cast<double>(Entity.YawDeg), 0.0), Entity.Pos);
-	if (!PlaceAndValidate(Hologram, Placement))
+	if (!PlaceAndValidate(Hologram, Placement, Inventory))
 	{
 		Hologram->Destroy(); // something occupies the spot now — a reported partial-undo, not fatal
 		return false;
