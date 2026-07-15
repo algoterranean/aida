@@ -898,7 +898,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY? in metres}}. OMIT origin to build at the requesting player's position — never ask the player for coordinates."),
+		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}}. OMIT origin to build at the requesting player's position — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult

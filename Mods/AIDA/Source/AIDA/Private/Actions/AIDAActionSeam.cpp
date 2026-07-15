@@ -162,12 +162,32 @@ namespace
 	{
 		const FVector Target = Placement.GetLocation();
 
-		// Synthetic upward-normal hit at the target — the same shape the build gun feeds per frame.
+		// The hologram wants a REAL hit — a zeroed FHitResult reads as "aiming at the sky" and
+		// disqualifies every placement with InvalidAimLocation (live-verify). Trace straight down at
+		// the target's X/Y (starting just above it, so a roof over the player doesn't win) and feed
+		// the actual ground/floor hit; that also grounds Z, and slopes behave like the build gun.
 		FHitResult Hit(ForceInit);
-		Hit.Location = Target;
-		Hit.ImpactPoint = Target;
-		Hit.Normal = FVector::UpVector;
-		Hit.ImpactNormal = FVector::UpVector;
+		bool bHaveHit = false;
+		if (UWorld* World = Hologram->GetWorld())
+		{
+			const FVector Start = Target + FVector(0.0, 0.0, 300.0);   // ~3 m above the intent
+			const FVector End = Target - FVector(0.0, 0.0, 10000.0);   // down to 100 m below
+			FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAPlacementTrace), /*bTraceComplex*/ false);
+			Params.AddIgnoredActor(Hologram);
+			bHaveHit = World->LineTraceSingleByObjectType(Hit, Start, End,
+				FCollisionObjectQueryParams(ECC_WorldStatic), Params);
+		}
+		if (!bHaveHit)
+		{
+			// Nothing below (void/water): fall back to the synthetic hit; the hologram's own
+			// validation then reports the placement, one index at a time, instead of crashing out.
+			Hit = FHitResult(ForceInit);
+			Hit.bBlockingHit = true;
+			Hit.Location = Target;
+			Hit.ImpactPoint = Target;
+			Hit.Normal = FVector::UpVector;
+			Hit.ImpactNormal = FVector::UpVector;
+		}
 
 		Hologram->SetScrollRotateValue(FMath::RoundToInt32(Placement.Rotator().Yaw));
 		Hologram->PreHologramPlacement(Hit);
