@@ -44,6 +44,24 @@ namespace
 		return Name.IsEmpty() ? GetNameSafe(ItemClass.Get()) : Name;
 	}
 
+	/**
+	 * Canonicalize a display name for matching: lowercase, alphanumerics only. Game names carry
+	 * Unicode spaces (FText number formatting puts a no-break space in "Foundation (2 m)") that
+	 * render identically to ASCII but fail Equals/Contains against what a model or player types —
+	 * live-verify: the model echoed a suggestion character-perfectly and still missed. This also
+	 * forgives "(2m)" vs "(2 m)" and stray punctuation.
+	 */
+	FString NormalizeName(const FString& Name)
+	{
+		FString Out;
+		Out.Reserve(Name.Len());
+		for (const TCHAR C : Name)
+		{
+			if (FChar::IsAlnum(C)) { Out.AppendChar(FChar::ToLower(C)); }
+		}
+		return Out;
+	}
+
 	/** One unlocked build-gun recipe: canonical name + classes (the resolve walk's working set). */
 	struct FBuildRecipeEntry
 	{
@@ -201,15 +219,17 @@ bool FAIDAActionSeam::ResolveBuildRecipe(UObject* WorldContext, const FString& D
 		return false;
 	}
 
-	const FString Wanted = DisplayName.TrimStartAndEnd();
+	const FString Wanted = NormalizeName(DisplayName);
+	if (Wanted.IsEmpty()) { return false; }
 
-	// Exact (case-insensitive) match wins; otherwise a UNIQUE substring match; otherwise suggestions.
+	// Exact (normalized) match wins; otherwise a UNIQUE substring match; otherwise suggestions.
 	const FBuildRecipeEntry* Exact = nullptr;
 	TArray<const FBuildRecipeEntry*> Partial;
 	for (const FBuildRecipeEntry& Entry : Entries)
 	{
-		if (Entry.Name.Equals(Wanted, ESearchCase::IgnoreCase)) { Exact = &Entry; break; }
-		if (Entry.Name.Contains(Wanted, ESearchCase::IgnoreCase)) { Partial.Add(&Entry); }
+		const FString Candidate = NormalizeName(Entry.Name);
+		if (Candidate == Wanted) { Exact = &Entry; break; }
+		if (Candidate.Contains(Wanted)) { Partial.Add(&Entry); }
 	}
 	const FBuildRecipeEntry* Chosen = Exact ? Exact : (Partial.Num() == 1 ? Partial[0] : nullptr);
 	if (!Chosen)
@@ -319,9 +339,10 @@ bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDA
 	const double RadiusCm = Selector.RadiusM * AIDAMetersToCm;
 	const double RadiusSq = RadiusCm * RadiusCm;
 
-	const auto MatchesName = [&Selector](const FString& Name)
+	const FString WantedName = NormalizeName(Selector.Buildable);
+	const auto MatchesName = [&WantedName](const FString& Name)
 	{
-		return Selector.Buildable.IsEmpty() || Name.Contains(Selector.Buildable, ESearchCase::IgnoreCase);
+		return WantedName.IsEmpty() || NormalizeName(Name).Contains(WantedName);
 	};
 
 	// Full-actor buildables — live walk, never a cached FactoryIndex snapshot.
@@ -556,9 +577,10 @@ bool FAIDAActionSeam::ResolveDismantleHandles(UObject* WorldContext, const FAIDA
 	const FVector CenterCm = Selector.CenterM * AIDAMetersToCm;
 	const double RadiusSq = FMath::Square(Selector.RadiusM * AIDAMetersToCm);
 
-	const auto MatchesName = [&Selector](const FString& Name)
+	const FString WantedName = NormalizeName(Selector.Buildable);
+	const auto MatchesName = [&WantedName](const FString& Name)
 	{
-		return Selector.Buildable.IsEmpty() || Name.Contains(Selector.Buildable, ESearchCase::IgnoreCase);
+		return WantedName.IsEmpty() || NormalizeName(Name).Contains(WantedName);
 	};
 
 	if (AFGBuildableSubsystem* Subsystem = AFGBuildableSubsystem::Get(World))
