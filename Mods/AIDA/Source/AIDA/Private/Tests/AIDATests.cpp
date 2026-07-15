@@ -1653,6 +1653,16 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		}
 	}
 
+	// RefundJson codec: items round-trip with their descriptor class paths.
+	{
+		TArray<FAIDACostItem> Items;
+		Items.Add({ TEXT("Concrete"), 300, TEXT("/Game/Resource/Parts/Cement/Desc_Cement.Desc_Cement_C") });
+		const FString Json = AIDAActionSpec::CostItemsToJson(Items);
+		TestTrue(TEXT("refund json has item"), Json.Contains(TEXT("\"Concrete\"")));
+		TestTrue(TEXT("refund json has amount"), Json.Contains(TEXT("300")));
+		TestTrue(TEXT("refund json has class"), Json.Contains(TEXT("Desc_Cement_C")));
+	}
+
 	// Summaries read like the doc examples.
 	FAIDABuildSpec Spec;
 	Spec.Buildable = TEXT("Foundation 8m x 2m");

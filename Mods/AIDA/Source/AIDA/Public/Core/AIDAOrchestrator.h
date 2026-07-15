@@ -11,7 +11,7 @@
 #include "Map/AIDAMapService.h"       // TTL-cached resource-node scan
 #include "Recipes/AIDARecipeService.h" // TTL-cached static recipe + building catalog
 #include "Memory/AIDAMemory.h"          // Phase 3 persistence facade (in-save + sidecar)
-#include "Actions/AIDAProposalStore.h"  // Phase 4 proposal pipeline (in-memory store + state machine)
+#include "Actions/AIDAActionEngine.h"   // Phase 4 proposal pipeline (store + approve/execute coordinator)
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
 #include "AIDAOrchestrator.generated.h"
@@ -141,6 +141,17 @@ private:
 	 */
 	void Propose(const TArray<FString>& Args);
 
+	/**
+	 * `AIDA.Approve <proposalId>` / `AIDA.Reject <proposalId>` — stand-in for the Slice 3
+	 * ProposalUI: approve (kicking off the time-sliced executor) or reject a pending proposal
+	 * from the server/host console.
+	 */
+	void ApproveCmd(const TArray<FString>& Args);
+	void RejectCmd(const TArray<FString>& Args);
+
+	/** Start the 10 Hz executor timer if it isn't running (docs/PHASE4.md §3 time-slicer). */
+	void StartActionTimer();
+
 	/** Build a snapshot from the current aggregates and append it to the sidecar ring buffer. Server-only. */
 	void TakeSnapshot(const FString& Label);
 
@@ -163,7 +174,7 @@ private:
 	FAIDAMapService MapService;
 	FAIDARecipeCatalog RecipeCatalog;
 	FAIDAMemory Memory;
-	FAIDAProposalStore Proposals;
+	FAIDAActionEngine Actions;
 	IConsoleCommand* PingCommand = nullptr;
 	IConsoleCommand* SayCommand = nullptr;
 	IConsoleCommand* ToolPingCommand = nullptr;
@@ -173,9 +184,16 @@ private:
 	IConsoleCommand* MemoryCommand = nullptr;
 	IConsoleCommand* SnapshotCommand = nullptr;
 	IConsoleCommand* ProposeCommand = nullptr;
+	IConsoleCommand* ApproveCommand = nullptr;
+	IConsoleCommand* RejectCommand = nullptr;
 
 	//~ Periodic history snapshots (Phase 3). Defaults; config wiring lands in Slice 3.
 	UFUNCTION()
 	void OnSnapshotTimer();
 	FTimerHandle SnapshotTimer;
+
+	//~ Phase 4 executor time-slicer: 10 Hz, running only while a proposal executes.
+	UFUNCTION()
+	void OnActionTimer();
+	FTimerHandle ActionTimer;
 };

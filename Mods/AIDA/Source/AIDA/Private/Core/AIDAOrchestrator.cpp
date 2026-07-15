@@ -178,6 +178,16 @@ void UAIDAOrchestrator::Deinitialize()
 		IConsoleManager::Get().UnregisterConsoleObject(ProposeCommand);
 		ProposeCommand = nullptr;
 	}
+	if (ApproveCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(ApproveCommand);
+		ApproveCommand = nullptr;
+	}
+	if (RejectCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(RejectCommand);
+		RejectCommand = nullptr;
+	}
 	LLMClient.Reset();
 	Session.Reset();
 
@@ -691,7 +701,7 @@ void UAIDAOrchestrator::RegisterTools()
 void UAIDAOrchestrator::SweepProposals()
 {
 	const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
-	for (const FGuid& Id : Proposals.SweepExpired(Now, Config.Actions.TtlSeconds))
+	for (const FGuid& Id : Actions.Store().SweepExpired(Now, Config.Actions.TtlSeconds))
 	{
 		UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s expired unapproved."), *Id.ToString(EGuidFormats::DigitsWithHyphens));
 	}
@@ -735,7 +745,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			const TArray<FTransform> Placements = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
 
 			FAIDADryRunResult DryRun;
-			if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Spec.YawDeg, Placements, DryRun))
+			if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Placements, DryRun))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
 			}
@@ -755,6 +765,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 
 			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid(); // minted here so the report below carries the real id
 			Proposal.SpecJson = AIDAToCompactJson(SpecObj->ToSharedRef());
 			Proposal.RequesterId = Ctx.PlayerId;
 			Proposal.RequesterName = Ctx.Author;
@@ -764,7 +775,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.Summary = AIDAActionSpec::SummarizeBuild(Spec);
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
-			if (!Proposals.Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
@@ -810,6 +821,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 
 			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid(); // minted here so the report below carries the real id
 			Proposal.bDismantle = true;
 			Proposal.SpecJson = AIDAToCompactJson(SelectorObj->ToSharedRef());
 			Proposal.RequesterId = Ctx.PlayerId;
@@ -819,7 +831,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.Summary = AIDAActionSpec::SummarizeDismantle(Selector);
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
-			if (!Proposals.Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
@@ -846,7 +858,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			FGuid::Parse(IdText, Filter); // invalid text leaves the filter unset => list all
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
-			return FAIDAToolResult::Ok(AIDAActionSpec::BuildStatusJson(Proposals.All(), Filter, Now, Config.Actions.TtlSeconds));
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildStatusJson(Actions.Store().All(), Filter, Now, Config.Actions.TtlSeconds));
 		}
 	});
 }
@@ -1013,6 +1025,78 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Drive propose_build directly with a spec JSON (checks the Phase 4 dry-run without the LLM). Run on server/host. Usage: AIDA.Propose {\"version\":1,\"buildable\":\"Foundation\",...}"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Propose),
 		ECVF_Default);
+
+	ApproveCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Approve"),
+		TEXT("Approve a pending proposal and run the time-sliced executor (Slice 3's ProposalUI stand-in). Run on server/host. Usage: AIDA.Approve <proposalId>"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::ApproveCmd),
+		ECVF_Default);
+
+	RejectCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Reject"),
+		TEXT("Reject a pending proposal. Run on server/host. Usage: AIDA.Reject <proposalId>"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::RejectCmd),
+		ECVF_Default);
+}
+
+void UAIDAOrchestrator::ApproveCmd(const TArray<FString>& Args)
+{
+	FGuid Id;
+	if (Args.Num() < 1 || !FGuid::Parse(Args[0], Id))
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Approve: pass a proposal id (from AIDA.Propose / get_proposal_status)."));
+		return;
+	}
+
+	// Console = host-side diagnostic; the RCO path adds the act-tier + approvalPolicy gates (Slice 3).
+	FString Message;
+	if (Actions.Approve(this, Config.Actions, Id, TEXT("console"), Message))
+	{
+		StartActionTimer();
+	}
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Approve: %s"), *Message);
+}
+
+void UAIDAOrchestrator::RejectCmd(const TArray<FString>& Args)
+{
+	FGuid Id;
+	if (Args.Num() < 1 || !FGuid::Parse(Args[0], Id))
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Reject: pass a proposal id."));
+		return;
+	}
+	FString Message;
+	Actions.Reject(Id, TEXT("console"), Message);
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Reject: %s"), *Message);
+}
+
+void UAIDAOrchestrator::StartActionTimer()
+{
+	UWorld* World = GetWorld();
+	if (!World || ActionTimer.IsValid())
+	{
+		return;
+	}
+	// 10 Hz while executing; OnActionTimer clears the handle when the engine runs dry.
+	World->GetTimerManager().SetTimer(ActionTimer, this, &UAIDAOrchestrator::OnActionTimer, 0.1f, /*bLoop=*/true);
+}
+
+void UAIDAOrchestrator::OnActionTimer()
+{
+	if (Actions.Tick(this, Config.Actions, Memory))
+	{
+		return; // more batches to go
+	}
+
+	// Execution finished (or died): stop slicing and drop the read caches so the next factory
+	// query sees the new world immediately instead of a stale TTL snapshot.
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ActionTimer);
+	}
+	ActionTimer.Invalidate();
+	FactoryIndex.Invalidate();
+	MapService.Invalidate(); // dismantles can free resource nodes (extractor occupancy)
 }
 
 void UAIDAOrchestrator::Propose(const TArray<FString>& Args)

@@ -48,6 +48,9 @@ namespace AIDAActionSpec
 	/** get_proposal_status: one entry per proposal (all of them if Filter is invalid/unset). */
 	FString BuildStatusJson(const TArray<FAIDAProposal>& Proposals, const FGuid& Filter, int64 NowUtc, int32 TtlSeconds);
 
+	/** Cost/refund items as a compact JSON array (the journal's RefundJson). */
+	FString CostItemsToJson(const TArray<FAIDACostItem>& Items);
+
 	/** Encode a journal entity handle (docs/PHASE4.md §2d) as one compact self-describing JSON string. */
 	FString EncodeEntityId(const FAIDAEntityId& Entity);
 

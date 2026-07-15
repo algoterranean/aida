@@ -5,6 +5,8 @@
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 
 namespace
 {
@@ -263,6 +265,22 @@ FString AIDAActionSpec::BuildStatusJson(const TArray<FAIDAProposal>& Proposals, 
 	Root->SetNumberField(TEXT("count"), List.Num());
 	Root->SetArrayField(TEXT("proposals"), List);
 	return AIDAToCompactJson(Root);
+}
+
+FString AIDAActionSpec::CostItemsToJson(const TArray<FAIDACostItem>& Items)
+{
+	TArray<TSharedPtr<FJsonValue>> List;
+	for (const FAIDACostItem& Item : Items)
+	{
+		const TSharedRef<FJsonObject> O = CostToJson(Item);
+		if (!Item.ClassPath.IsEmpty()) { O->SetStringField(TEXT("class"), Item.ClassPath); }
+		List.Add(MakeShared<FJsonValueObject>(O));
+	}
+	FString Out;
+	const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
+	FJsonSerializer::Serialize(List, Writer);
+	return Out;
 }
 
 FString AIDAActionSpec::EncodeEntityId(const FAIDAEntityId& Entity)

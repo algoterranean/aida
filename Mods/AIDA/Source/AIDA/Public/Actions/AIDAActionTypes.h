@@ -55,11 +55,13 @@ struct FAIDADismantleSpec
 	int32 MaxCount = 20;
 };
 
-/** One line of a cost/refund tally. */
+/** One line of a cost/refund tally. ClassPath (the item descriptor) is what deduction/refund acts
+ *  on; Item is the display name the model and players see. */
 struct FAIDACostItem
 {
 	FString Item;
 	int32 Amount = 0;
+	FString ClassPath;
 };
 
 /** One placement the dry-run rejected — bounded to a handful in the error report. */
@@ -112,6 +114,17 @@ struct FAIDADismantleResolution
 {
 	int32 Count = 0;
 	TArray<FAIDACostItem> Refund;
+};
+
+/**
+ * One dismantle target resolved at approval time (docs/PHASE4.md §3): a live weak actor ptr for
+ * full buildables, or an encoded "lw" entity id (class + transform) for lightweight instances,
+ * re-resolved per batch. EncodedId doubles as the journal entry for undo.
+ */
+struct FAIDADismantleHandle
+{
+	TWeakObjectPtr<AActor> Actor;
+	FString EncodedId;
 };
 
 /**
