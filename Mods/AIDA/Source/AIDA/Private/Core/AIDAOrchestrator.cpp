@@ -8,6 +8,7 @@
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
 #include "Tools/AIDANotesTools.h"
+#include "Tools/AIDASnapshotTools.h"
 #include "Tools/AIDAToolJson.h"
 #include "Memory/AIDAMemoryStore.h"
 #include "Net/AIDAChatRelay.h"
@@ -24,6 +25,10 @@
 
 namespace
 {
+	// Phase 3 snapshot defaults (config wiring lands in Slice 3).
+	constexpr int32 kSnapshotKeepMax = 200;
+	constexpr float kSnapshotIntervalSeconds = 30.f * 60.f;
+
 	/** Map a tool's declared tier onto the permission tier the orchestrator gates it with. */
 	EAIDATier ToPermissionTier(EAIDAToolTier Tier)
 	{
@@ -81,7 +86,11 @@ namespace
 		"- get_notes(keyword?, region?, near?): recall the player's saved notes. Check these when the "
 		"player asks what they wanted to do, or refers to something they told you earlier. To list ALL "
 		"notes (e.g. 'what were my notes?'), call get_notes with NO arguments — do not invent a keyword, "
-		"and never use the player's name as a filter (notes match on content, not author).\n\n"
+		"and never use the player's name as a filter (notes match on content, not author).\n"
+		"- take_snapshot(label?): capture the factory's production + power now for later comparison.\n"
+		"- compare_to(timestamp?, item?): how the factory changed vs an earlier snapshot (per-item + power "
+		"deltas). Use for 'how has my X changed', 'what changed since...'. Omit timestamp for the latest "
+		"snapshot.\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -190,6 +199,14 @@ void UAIDAOrchestrator::RegisterRelayClass()
 	{
 		Mgr->RegisterSubsystemActor(AAIDAMemoryStore::StaticClass());
 		Memory.Init(this);
+
+		// Periodic history snapshots into the sidecar ring buffer (Phase 3). A looping world timer; the
+		// first snapshot lands one interval in (an on-demand take_snapshot can seed one sooner).
+		if (!SnapshotTimer.IsValid())
+		{
+			World->GetTimerManager().SetTimer(SnapshotTimer, this, &UAIDAOrchestrator::OnSnapshotTimer,
+				kSnapshotIntervalSeconds, /*bLoop=*/true);
+		}
 	}
 
 	// Diagnostics: did the manager end up holding a findable actor, and does one actually exist in the world?
@@ -605,6 +622,50 @@ void UAIDAOrchestrator::RegisterTools()
 		}
 	});
 
+	// Phase 3 history tools (docs/PHASE3.md) — timestamped factory snapshots + a diff over time.
+	Tools.Register({
+		TEXT("take_snapshot"),
+		TEXT("Capture a timestamped snapshot of the factory's current production balance + power now, so it can be compared later. Snapshots are also taken automatically every 30 minutes. Optional 'label'."),
+		TEXT(R"({"type":"object","properties":{"label":{"type":"string","description":"Optional short label (e.g. \"before boss\")."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Label;
+			Args->TryGetStringField(TEXT("label"), Label);
+			TakeSnapshot(Label);
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetBoolField(TEXT("taken"), true);
+			Root->SetNumberField(TEXT("totalSnapshots"), Memory.LoadSnapshots().Num());
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+		}
+	});
+
+	Tools.Register({
+		TEXT("compare_to"),
+		TEXT("Compare the factory now to an earlier snapshot: per-item production/consumption changes and power delta. Omit 'timestamp' to compare to the most recent snapshot; pass a Unix timestamp to compare further back. Optional 'item' focuses on one item."),
+		TEXT(R"({"type":"object","properties":{"timestamp":{"type":"integer","description":"Optional Unix time to compare back to; defaults to the latest snapshot."},"item":{"type":"string","description":"Optional item name to focus on."}},"required":[]})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			double TimestampD = 0.0;
+			const bool bHasTs = Args->TryGetNumberField(TEXT("timestamp"), TimestampD);
+			FString Item;
+			Args->TryGetStringField(TEXT("item"), Item);
+
+			const TArray<FAIDASnapshot> Snaps = Memory.LoadSnapshots();
+			const FAIDASnapshot* Baseline = AIDASnapshotTools::PickBaseline(Snaps, static_cast<int64>(TimestampD), bHasTs);
+			if (!Baseline)
+			{
+				return FAIDAToolResult::Error(TEXT("No snapshots yet to compare against. Use take_snapshot first, or wait for the automatic one."));
+			}
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			const FAIDASnapshot Current = AIDASnapshotTools::MakeSnapshot(SnapshotAggregates(), Now, TEXT("now"));
+			return FAIDAToolResult::Ok(AIDASnapshotTools::BuildCompareJson(*Baseline, Current, Item, Now));
+		}
+	});
+
 	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
 }
 
@@ -758,6 +819,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Log the memory session id + note/marker/journal counts + sidecar snapshot count (checks Phase 3 persistence). Run on server/host. Usage: AIDA.Memory"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::MemoryStatus),
 		ECVF_Default);
+
+	SnapshotCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Snapshot"),
+		TEXT("Take a factory history snapshot now (checks Phase 3 snapshots without the LLM). Run on server/host. Usage: AIDA.Snapshot [label...]"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Snapshot),
+		ECVF_Default);
 }
 
 void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
@@ -867,6 +934,33 @@ void UAIDAOrchestrator::MemoryStatus(const TArray<FString>& /*Args*/)
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Memory: session=%s notes=%d markers=%d journal=%d snapshots=%d"),
 		*Memory.GetSessionId().ToString(EGuidFormats::DigitsWithHyphens),
 		MemStore->Notes.Num(), MemStore->Markers.Num(), MemStore->Journal.Num(), Memory.LoadSnapshots().Num());
+}
+
+void UAIDAOrchestrator::TakeSnapshot(const FString& Label)
+{
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client) { return; }
+	Memory.Init(this); // ensure the sidecar is bound (no-op once ready)
+
+	const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+	const FAIDASnapshot Snap = AIDASnapshotTools::MakeSnapshot(SnapshotAggregates(), Now, Label);
+	Memory.AppendSnapshot(Snap, kSnapshotKeepMax);
+	UE_LOG(LogAIDA, Log, TEXT("[memory] snapshot taken (label='%s', %d items); %d total."),
+		*Label, Snap.ItemBalance.Num(), Memory.LoadSnapshots().Num());
+}
+
+void UAIDAOrchestrator::OnSnapshotTimer()
+{
+	TakeSnapshot(TEXT("auto"));
+}
+
+void UAIDAOrchestrator::Snapshot(const TArray<FString>& Args)
+{
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Snapshot runs only on the server/host (this is a client)."));
+		return;
+	}
+	TakeSnapshot(Args.Num() > 0 ? FString::Join(Args, TEXT(" ")) : TEXT("manual"));
 }
 
 void UAIDAOrchestrator::Say(const TArray<FString>& Args)

@@ -16,6 +16,7 @@
 #include "Tools/AIDARecipeTools.h"
 #include "Memory/AIDASidecarStore.h"
 #include "Tools/AIDANotesTools.h"
+#include "Tools/AIDASnapshotTools.h"
 #include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -1158,6 +1159,51 @@ bool FAIDARecipeToolsBuildingTest::RunTest(const FString&)
 		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildBuildingJson(Buildings, FString()));
 		TestEqual(TEXT("all buildings"), Root->GetIntegerField(TEXT("matches")), 3);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASnapshotCompareTest, "AIDA.Snapshot.Compare",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASnapshotCompareTest::RunTest(const FString&)
+{
+	// MakeSnapshot flattens aggregates: per-item net + summed power.
+	FAIDAFactoryAggregates Agg;
+	Agg.Balance.Add({ TEXT("Iron Plate"), 120.0, 210.0 }); // net -90
+	Agg.Balance.Add({ TEXT("Screw"), 100.0, 60.0 });       // net  40
+	Agg.Power.Add({ /*CircuitId*/ 0, /*Produced*/ 5700.0, /*Capacity*/ 5700.0, /*Consumed*/ 2861.0 });
+	const FAIDASnapshot Base = AIDASnapshotTools::MakeSnapshot(Agg, 1000, TEXT("before"));
+	TestEqual(TEXT("snapshot items"), Base.ItemBalance.Num(), 2);
+	TestEqual(TEXT("snapshot power consumed"), Base.PowerConsumedMW, 2861.0);
+
+	// Current state: iron improved to net 0 (+90), screw unchanged, power up 100.
+	FAIDAFactoryAggregates Now;
+	Now.Balance.Add({ TEXT("Iron Plate"), 210.0, 210.0 }); // net 0
+	Now.Balance.Add({ TEXT("Screw"), 100.0, 60.0 });       // net 40 (unchanged)
+	Now.Power.Add({ 0, 5700.0, 5700.0, 2961.0 });
+	const FAIDASnapshot Cur = AIDASnapshotTools::MakeSnapshot(Now, 2000, TEXT("now"));
+
+	const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDASnapshotTools::BuildCompareJson(Base, Cur, FString(), 2000));
+	if (!TestNotNull(TEXT("compare json parses"), Root.Get())) { return false; }
+	// Only iron changed (screw delta 0 is dropped).
+	TestEqual(TEXT("one changed item"), Root->GetIntegerField(TEXT("changedItems")), 1);
+	const TArray<TSharedPtr<FJsonValue>>& Items = Root->GetArrayField(TEXT("items"));
+	if (!TestEqual(TEXT("one item listed"), Items.Num(), 1)) { return false; }
+	const TSharedPtr<FJsonObject> Iron = Items[0]->AsObject();
+	TestEqual(TEXT("iron item"), Iron->GetStringField(TEXT("item")), FString(TEXT("Iron Plate")));
+	TestEqual(TEXT("iron was -90"), Iron->GetNumberField(TEXT("was")), -90.0);
+	TestEqual(TEXT("iron now 0"), Iron->GetNumberField(TEXT("now")), 0.0);
+	TestEqual(TEXT("iron delta +90"), Iron->GetNumberField(TEXT("delta")), 90.0);
+	TestEqual(TEXT("power consumed delta"), Root->GetObjectField(TEXT("power"))->GetNumberField(TEXT("consumedDeltaMW")), 100.0);
+
+	// PickBaseline: no timestamp -> most recent; with timestamp -> newest at/or-before.
+	TArray<FAIDASnapshot> Snaps;
+	{ FAIDASnapshot S; S.TakenUtc = 100; Snaps.Add(S); }
+	{ FAIDASnapshot S; S.TakenUtc = 200; Snaps.Add(S); }
+	{ FAIDASnapshot S; S.TakenUtc = 300; Snaps.Add(S); }
+	TestEqual(TEXT("no ts -> latest"), AIDASnapshotTools::PickBaseline(Snaps, 0, false)->TakenUtc, (int64)300);
+	TestEqual(TEXT("ts=250 -> 200"), AIDASnapshotTools::PickBaseline(Snaps, 250, true)->TakenUtc, (int64)200);
+	TestEqual(TEXT("ts before all -> earliest"), AIDASnapshotTools::PickBaseline(Snaps, 50, true)->TakenUtc, (int64)100);
+	TestNull(TEXT("empty -> null"), AIDASnapshotTools::PickBaseline(TArray<FAIDASnapshot>(), 0, false));
 	return true;
 }
 

@@ -125,6 +125,12 @@ private:
 	/** `AIDA.Memory` — dump the memory session id + note/marker/journal + sidecar snapshot counts. */
 	void MemoryStatus(const TArray<FString>& Args);
 
+	/** `AIDA.Snapshot` — take a factory history snapshot now (Phase 3 check, no LLM). */
+	void Snapshot(const TArray<FString>& Args);
+
+	/** Build a snapshot from the current aggregates and append it to the sidecar ring buffer. Server-only. */
+	void TakeSnapshot(const FString& Label);
+
 	/** Extract (TTL-cached) + aggregate the current factory. Server/authoritative worlds only. */
 	FAIDAFactoryAggregates SnapshotAggregates();
 
@@ -151,4 +157,10 @@ private:
 	IConsoleCommand* NodesCommand = nullptr;
 	IConsoleCommand* RecipesCommand = nullptr;
 	IConsoleCommand* MemoryCommand = nullptr;
+	IConsoleCommand* SnapshotCommand = nullptr;
+
+	//~ Periodic history snapshots (Phase 3). Defaults; config wiring lands in Slice 3.
+	UFUNCTION()
+	void OnSnapshotTimer();
+	FTimerHandle SnapshotTimer;
 };
