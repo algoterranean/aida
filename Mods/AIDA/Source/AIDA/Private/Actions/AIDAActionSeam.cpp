@@ -166,13 +166,46 @@ namespace
 		return nullptr;
 	}
 
+	/**
+	 * If the hit landed on a lightweight instance (foundations/walls — the hit actor is the
+	 * AbstractInstanceManager, which hologram snapping/floor checks can't use), stand up a
+	 * temporary buildable and retarget the hit at it, exactly like the build gun does. Returns the
+	 * temp actor — the CALLER destroys it, and must keep it alive until after Construct() if it
+	 * constructs (the hologram caches the snapped floor).
+	 */
+	AFGBuildable* ResolveInstanceHit(FHitResult& InOutHit)
+	{
+		AAbstractInstanceManager* Manager = Cast<AAbstractInstanceManager>(InOutHit.GetActor());
+		if (!Manager) { return nullptr; }
+
+		FInstanceHandle Handle;
+		FLightweightBuildableInstanceRef InstanceRef;
+		if (!Manager->ResolveHit(InOutHit, Handle) ||
+			!AFGLightweightBuildableSubsystem::ResolveLightweightInstance(Handle, InstanceRef))
+		{
+			return nullptr;
+		}
+		AFGBuildable* TempBuildable = InstanceRef.SpawnTemporaryBuildable();
+		if (TempBuildable)
+		{
+			InOutHit.HitObjectHandle = FActorInstanceHandle(TempBuildable);
+			if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(TempBuildable->GetRootComponent()))
+			{
+				InOutHit.Component = Root;
+			}
+		}
+		return TempBuildable;
+	}
+
 	/** Position + validate the hologram at one placement; true when no blocking disqualifier remains.
 	 *  InOutTemplateHit carries the last REAL hit across a grid: tiles hanging over a drop (no ground
 	 *  within trace range) borrow it — floating foundations are legal, and the hologram only needs a
-	 *  believable hit actor. bVerboseLog dumps the full trace/hologram/disqualifier state. */
+	 *  believable hit actor. OutTempFloor receives the temporary buildable when the tile sits on a
+	 *  lightweight instance (machines must see a real floor to snap to); the caller destroys it —
+	 *  AFTER Construct() when constructing. bVerboseLog dumps the full state. */
 	bool PlaceAndValidate(AFGHologram* Hologram, const FTransform& Placement, UFGInventoryComponent* Inventory,
 		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr, bool bVerboseLog = false,
-		FHitResult* InOutTemplateHit = nullptr)
+		FHitResult* InOutTemplateHit = nullptr, AFGBuildable** OutTempFloor = nullptr)
 	{
 		const FVector Target = Placement.GetLocation();
 
@@ -213,8 +246,14 @@ namespace
 		}
 		else if (bHaveHit && InOutTemplateHit)
 		{
-			*InOutTemplateHit = Hit;
+			*InOutTemplateHit = Hit; // stored UNRESOLVED — each tile stands up its own temp floor
 		}
+		// Tiles on lightweight instances need a real floor actor for snap/floor validation
+		// (machines on AIDA-built foundations failed as "invalid floor" without this). The temp
+		// lives through validation; ownership passes to the caller when requested, else it's
+		// destroyed before returning.
+		AFGBuildable* TempFloor = bHaveHit ? ResolveInstanceHit(Hit) : nullptr;
+		if (OutTempFloor) { *OutTempFloor = TempFloor; }
 		if (bHaveHit)
 		{
 			// Keep the genuine hit actor (validity) but aim the hit at the placement's EXACT position:
@@ -277,15 +316,21 @@ namespace
 			}
 		}
 
+		bool bValid = true;
 		for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
 		{
 			if (IsBlockingDisqualifier(Disqualifier))
 			{
 				if (OutBlocking) { *OutBlocking = Disqualifier; }
-				return false;
+				bValid = false;
+				break;
 			}
 		}
-		return true;
+		if (!OutTempFloor && TempFloor)
+		{
+			TempFloor->Destroy(); // nobody claimed it — validation is done with it
+		}
+		return bValid;
 	}
 
 	AFGHologram* SpawnValidationHologram(UWorld* World, UClass* RecipeClass, const FVector& At)
@@ -425,27 +470,9 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 	// which hologram snapping can't snap to (live-verify: "snap" moved the origin ~1 cm). Resolve
 	// the instance and stand up a temporary buildable actor, exactly like the build gun does, so
 	// TrySnapToActor sees a real foundation.
-	AFGBuildable* TempBuildable = nullptr;
 	bool bAimedAtStructure = Cast<AFGBuildable>(Hit.GetActor()) != nullptr;
-	if (AAbstractInstanceManager* Manager = Cast<AAbstractInstanceManager>(Hit.GetActor()))
-	{
-		FInstanceHandle Handle;
-		FLightweightBuildableInstanceRef InstanceRef;
-		if (Manager->ResolveHit(Hit, Handle) &&
-			AFGLightweightBuildableSubsystem::ResolveLightweightInstance(Handle, InstanceRef))
-		{
-			TempBuildable = InstanceRef.SpawnTemporaryBuildable();
-			if (TempBuildable)
-			{
-				bAimedAtStructure = true;
-				Hit.HitObjectHandle = FActorInstanceHandle(TempBuildable);
-				if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(TempBuildable->GetRootComponent()))
-				{
-					Hit.Component = Root;
-				}
-			}
-		}
-	}
+	AFGBuildable* TempBuildable = ResolveInstanceHit(Hit);
+	bAimedAtStructure |= TempBuildable != nullptr;
 
 	// Probe hologram at the REAL aim hit: UpdateHologramPlacement runs the game's snapping
 	// (TrySnapToActor against the aimed structure, world-grid alignment), and where the hologram
@@ -819,9 +846,13 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		if (!Hologram) { ++OutSkipped; continue; }
 
 		// Re-validate: the world may have changed since the dry-run (players build/walk around).
-		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, nullptr, false, &TemplateHit))
+		// The temp floor (lightweight-instance tiles) must outlive Construct — the hologram caches
+		// the snapped floor it validated against.
+		AFGBuildable* TempFloor = nullptr;
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, nullptr, false, &TemplateHit, &TempFloor))
 		{
 			Hologram->Destroy();
+			if (TempFloor) { TempFloor->Destroy(); }
 			++OutSkipped;
 			continue;
 		}
@@ -829,6 +860,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		TArray<AActor*> Children;
 		AActor* Built = Hologram->Construct(Children, FNetConstructionID());
 		Hologram->Destroy();
+		if (TempFloor) { TempFloor->Destroy(); }
 		if (!Built) { ++OutSkipped; continue; }
 
 		// Capture the undo handle (docs/PHASE4.md §2d). Lightweight-bound buildables are destroyed
