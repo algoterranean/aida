@@ -205,8 +205,8 @@ bool FAIDASessionAssemblyTest::RunTest(const FString&)
 	// No relay set — the session still owns the authoritative transcript (fan-out is a no-op).
 	FAIDASessionManager Session(200);
 
-	const FGuid PlayerId = Session.PostPlayerMessage(TEXT("Alice"), TEXT("hello"));
-	const FGuid AidaId = Session.BeginAIDAMessage(TEXT("AIDA"));
+	const FGuid PlayerId = Session.PostPlayerMessage(TEXT("Alice"), TEXT("hello"), AIDADefaultConversationId());
+	const FGuid AidaId = Session.BeginAIDAMessage(TEXT("AIDA"), AIDADefaultConversationId());
 	Session.AppendDelta(AidaId, TEXT("Hi "));
 	Session.AppendDelta(AidaId, TEXT("there"));
 	Session.CompleteMessage(AidaId);
@@ -228,9 +228,9 @@ bool FAIDASessionRingBufferTest::RunTest(const FString&)
 {
 	FAIDASessionManager Session(2); // keep only the two most recent messages
 
-	const FGuid First = Session.PostPlayerMessage(TEXT("A"), TEXT("1"));
-	Session.PostPlayerMessage(TEXT("B"), TEXT("2"));
-	Session.PostPlayerMessage(TEXT("C"), TEXT("3"));
+	const FGuid First = Session.PostPlayerMessage(TEXT("A"), TEXT("1"), AIDADefaultConversationId());
+	Session.PostPlayerMessage(TEXT("B"), TEXT("2"), AIDADefaultConversationId());
+	Session.PostPlayerMessage(TEXT("C"), TEXT("3"), AIDADefaultConversationId());
 
 	TestEqual(TEXT("bounded to max"), Session.Num(), 2);
 

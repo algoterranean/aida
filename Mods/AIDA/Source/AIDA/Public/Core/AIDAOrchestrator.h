@@ -44,8 +44,8 @@ public:
 	bool IsConfigLoaded() const { return bConfigLoaded; }
 
 	//~ Server API — called from the per-player RCO (authority only). See Net/AIDARemoteCallObject.
-	/** Handle an inbound player chat line: record it, then stream an AIDA reply out to all clients. */
-	void HandleChatRequest(const FAIDARequester& Requester, const FString& Text);
+	/** Handle an inbound player chat line for a conversation: record it, then stream an AIDA reply out. */
+	void HandleChatRequest(const FAIDARequester& Requester, const FString& Text, const FGuid& ConversationId);
 
 	/** Authoritative full body for one message (recovery). False if it aged out of the transcript. */
 	bool GetMessageBody(const FGuid& Id, FAIDATranscriptEntry& OutEntry) const;
@@ -69,8 +69,8 @@ private:
 	void RegisterRelay();
 	AAIDAChatRelay* GetRelay();
 
-	/** Kick off the streaming LLM reply (through the tool loop) for an accepted request. */
-	void StartAIDAReply(const FAIDARequester& Requester);
+	/** Kick off the streaming LLM reply (through the tool loop) for an accepted request in a conversation. */
+	void StartAIDAReply(const FAIDARequester& Requester, const FGuid& ConversationId);
 
 	/** Register the built-in tools exposed to the model (Phase 2 Slice 0: an echo verifier). */
 	void RegisterTools();
@@ -87,8 +87,8 @@ private:
 	void RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages, FAIDARequester Requester,
 		int32 RoundsLeft, FAIDAOnChunk OnDelta, TFunction<void(const FString&)> OnDone, FAIDAOnError OnError);
 
-	/** Assemble the privacy-filtered chat context (recent transcript) sent to the LLM. */
-	void BuildChatContext(TArray<FAIDAChatMessage>& OutMessages) const;
+	/** Assemble the privacy-filtered chat context (one conversation's recent transcript) sent to the LLM. */
+	void BuildChatContext(const FGuid& ConversationId, TArray<FAIDAChatMessage>& OutMessages) const;
 
 	/** Resolves the config path: server admin override first, then the mod's shipped example. */
 	FString ResolveConfigPath(FString& OutSource) const;

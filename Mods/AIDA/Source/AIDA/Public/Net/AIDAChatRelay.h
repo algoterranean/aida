@@ -56,7 +56,7 @@ public:
 
 	/** Client→server: submit a chat line via the local player's RCO (the ChatWidget's send path). */
 	UFUNCTION(BlueprintCallable, Category = "AIDA")
-	void SubmitChat(const FString& Text);
+	void SubmitChat(const FString& Text, const FGuid& ConversationId);
 
 	/** Client→server: request the recent transcript (call on widget construct / late join). */
 	UFUNCTION(BlueprintCallable, Category = "AIDA")

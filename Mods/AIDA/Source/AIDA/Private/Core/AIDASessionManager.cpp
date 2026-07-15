@@ -53,10 +53,11 @@ FAIDATranscriptEntry* FAIDASessionManager::Find(const FGuid& Id)
 	return nullptr;
 }
 
-FGuid FAIDASessionManager::PostPlayerMessage(const FString& Author, const FString& Text)
+FGuid FAIDASessionManager::PostPlayerMessage(const FString& Author, const FString& Text, const FGuid& ConversationId)
 {
 	FAIDAMessageHeader Header;
 	Header.Id = FGuid::NewGuid();
+	Header.ConversationId = ConversationId;
 	Header.Author = Author;
 	Header.Kind = EAIDAMsgKind::Player;
 
@@ -75,10 +76,11 @@ FGuid FAIDASessionManager::PostPlayerMessage(const FString& Author, const FStrin
 	return Header.Id;
 }
 
-FGuid FAIDASessionManager::PostSystemMessage(const FString& Text)
+FGuid FAIDASessionManager::PostSystemMessage(const FString& Text, const FGuid& ConversationId)
 {
 	FAIDAMessageHeader Header;
 	Header.Id = FGuid::NewGuid();
+	Header.ConversationId = ConversationId;
 	Header.Author = TEXT("AIDA");
 	Header.Kind = EAIDAMsgKind::System;
 
@@ -93,10 +95,11 @@ FGuid FAIDASessionManager::PostSystemMessage(const FString& Text)
 	return Header.Id;
 }
 
-FGuid FAIDASessionManager::BeginAIDAMessage(const FString& Author)
+FGuid FAIDASessionManager::BeginAIDAMessage(const FString& Author, const FGuid& ConversationId)
 {
 	FAIDAMessageHeader Header;
 	Header.Id = FGuid::NewGuid();
+	Header.ConversationId = ConversationId;
 	Header.Author = Author;
 	Header.Kind = EAIDAMsgKind::AIDA;
 

@@ -24,9 +24,9 @@ public:
 
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
-	/** Client→server: submit a chat line. The only path player text takes into the orchestrator. */
+	/** Client→server: submit a chat line to a conversation. The only path player text takes in. */
 	UFUNCTION(Server, Reliable, WithValidation)
-	void ServerSendChat(const FString& Text);
+	void ServerSendChat(const FString& Text, const FGuid& ConversationId);
 
 	/** Client→server: fetch the authoritative full body of one message after a gap/hash mismatch. */
 	UFUNCTION(Server, Reliable, WithValidation)

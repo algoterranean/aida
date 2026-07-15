@@ -240,7 +240,7 @@ void UAIDAChatWidget::SendChat(const FString& Text)
 {
 	if (AAIDAChatRelay* R = Relay.Get())
 	{
-		R->SubmitChat(Text);
+		R->SubmitChat(Text, CurrentConversationId);
 	}
 }
 

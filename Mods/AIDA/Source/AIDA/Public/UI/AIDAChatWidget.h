@@ -87,6 +87,9 @@ protected:
 	TObjectPtr<UScrollBox> TranscriptScroll;
 
 private:
+	/** The conversation/tab this widget is currently sending to (Phase C will switch this per tab). */
+	FGuid CurrentConversationId = AIDADefaultConversationId();
+
 	/** Rich-text transcript, constructed in C++ under TranscriptScroll to render AIDA's markdown. */
 	UPROPERTY(Transient)
 	TObjectPtr<URichTextBlock> TranscriptRich;

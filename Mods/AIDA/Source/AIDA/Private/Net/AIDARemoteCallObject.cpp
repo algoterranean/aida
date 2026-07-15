@@ -70,13 +70,13 @@ void UAIDARemoteCallObject::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 
 //~ ─────────────────────────── Client → server ───────────────────────────
 
-bool UAIDARemoteCallObject::ServerSendChat_Validate(const FString& Text)
+bool UAIDARemoteCallObject::ServerSendChat_Validate(const FString& Text, const FGuid& ConversationId)
 {
 	// Cheap structural validation only; policy (rate/permission) is enforced server-side below.
 	return Text.Len() <= kMaxChatChars;
 }
 
-void UAIDARemoteCallObject::ServerSendChat_Implementation(const FString& Text)
+void UAIDARemoteCallObject::ServerSendChat_Implementation(const FString& Text, const FGuid& ConversationId)
 {
 	UWorld* World = GetWorld();
 	if (!World)
@@ -104,7 +104,7 @@ void UAIDARemoteCallObject::ServerSendChat_Implementation(const FString& Text)
 		{
 			Requester.Author = TEXT("Player");
 		}
-		Orchestrator->HandleChatRequest(Requester, Text);
+		Orchestrator->HandleChatRequest(Requester, Text, ConversationId);
 	}
 	else
 	{

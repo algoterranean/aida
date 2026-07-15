@@ -184,7 +184,7 @@ AAIDAChatRelay* UAIDAOrchestrator::GetRelay()
 	return nullptr;
 }
 
-void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const FString& Text)
+void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const FString& Text, const FGuid& ConversationId)
 {
 	// Authority-only: this path fans out network RPCs and calls the LLM (server egress).
 	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
@@ -212,7 +212,7 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 	if (!Permissions.IsAllowed(EAIDATier::Chat, Requester.PlayerId))
 	{
 		UE_LOG(LogAIDA, Warning, TEXT("Chat DENIED (permission) for %s [%s]"), *Requester.Author, *Requester.PlayerId);
-		Session->PostSystemMessage(TEXT("You don't have permission to chat with AIDA on this server."));
+		Session->PostSystemMessage(TEXT("You don't have permission to chat with AIDA on this server."), ConversationId);
 		return;
 	}
 
@@ -222,16 +222,16 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 	if (!RateLimiter.TryConsume(Requester.PlayerId, Now, DenyReason))
 	{
 		UE_LOG(LogAIDA, Warning, TEXT("Chat THROTTLED for %s [%s]: %s"), *Requester.Author, *Requester.PlayerId, *DenyReason);
-		Session->PostSystemMessage(DenyReason);
+		Session->PostSystemMessage(DenyReason, ConversationId);
 		return;
 	}
 
-	Session->PostPlayerMessage(Requester.Author, Trimmed);
+	Session->PostPlayerMessage(Requester.Author, Trimmed, ConversationId);
 
-	StartAIDAReply(Requester);
+	StartAIDAReply(Requester, ConversationId);
 }
 
-void UAIDAOrchestrator::BuildChatContext(TArray<FAIDAChatMessage>& OutMessages) const
+void UAIDAOrchestrator::BuildChatContext(const FGuid& ConversationId, TArray<FAIDAChatMessage>& OutMessages) const
 {
 	OutMessages.Reset();
 	if (!Session.IsValid())
@@ -239,8 +239,15 @@ void UAIDAOrchestrator::BuildChatContext(TArray<FAIDAChatMessage>& OutMessages) 
 		return;
 	}
 
+	// Only this conversation's messages form the LLM context (each tab is an independent conversation).
+	TArray<FAIDATranscriptEntry> All;
+	Session->GetRecentTranscript(All);
 	TArray<FAIDATranscriptEntry> Transcript;
-	Session->GetRecentTranscript(Transcript);
+	Transcript.Reserve(All.Num());
+	for (const FAIDATranscriptEntry& E : All)
+	{
+		if (E.Header.ConversationId == ConversationId) { Transcript.Add(E); }
+	}
 
 	// Privacy: bound how much history leaves the server, and whether player names are included.
 	const int32 Depth = FMath::Max(1, Config.Privacy.SendChatHistoryDepth);
@@ -273,19 +280,19 @@ void UAIDAOrchestrator::BuildChatContext(TArray<FAIDAChatMessage>& OutMessages) 
 	}
 }
 
-void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester)
+void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FGuid& ConversationId)
 {
 	if (!LLMClient.IsValid() || !LLMClient->IsReady())
 	{
-		Session->PostSystemMessage(TEXT("AIDA is not configured (no LLM provider). Ask an admin to set up Configs/AIDA/config.jsonc."));
+		Session->PostSystemMessage(TEXT("AIDA is not configured (no LLM provider). Ask an admin to set up Configs/AIDA/config.jsonc."), ConversationId);
 		return;
 	}
 
 	// Build context BEFORE opening the AIDA message so the empty reply isn't included.
 	TArray<FAIDAChatMessage> Context;
-	BuildChatContext(Context);
+	BuildChatContext(ConversationId, Context);
 
-	const FGuid MsgId = Session->BeginAIDAMessage(TEXT("AIDA"));
+	const FGuid MsgId = Session->BeginAIDAMessage(TEXT("AIDA"), ConversationId);
 
 	// Route the visible chat through the tool loop so the model can inspect the factory before answering.
 	// Shared so the message history survives the async tool rounds.
@@ -635,7 +642,7 @@ void UAIDAOrchestrator::Say(const TArray<FString>& Args)
 	Requester.PlayerId = TEXT("debug");
 
 	const FString Text = Args.Num() > 0 ? FString::Join(Args, TEXT(" ")) : TEXT("Hello from AIDA.Say");
-	HandleChatRequest(Requester, Text);
+	HandleChatRequest(Requester, Text, AIDADefaultConversationId());
 }
 
 void UAIDAOrchestrator::Ping(const TArray<FString>& Args)

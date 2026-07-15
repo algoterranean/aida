@@ -21,11 +21,11 @@ public:
 	/** The relay used for network fan-out. Weak: the actor's lifetime is the world's, not ours. */
 	void SetRelay(AAIDAChatRelay* InRelay);
 
-	/** Post a complete player line: stores it and fans out Begin + body + End. Returns its id. */
-	FGuid PostPlayerMessage(const FString& Author, const FString& Text);
+	/** Post a complete player line to a conversation: stores it and fans out Begin + body + End. */
+	FGuid PostPlayerMessage(const FString& Author, const FString& Text, const FGuid& ConversationId);
 
-	/** Open a streaming AIDA reply (fans out Begin with an empty body). Returns its id. */
-	FGuid BeginAIDAMessage(const FString& Author);
+	/** Open a streaming AIDA reply in a conversation (fans out Begin with an empty body). */
+	FGuid BeginAIDAMessage(const FString& Author, const FGuid& ConversationId);
 
 	/** Append a streamed delta to an open message (accumulates authoritatively + fans out batched). */
 	void AppendDelta(const FGuid& Id, const FString& Delta);
@@ -33,8 +33,8 @@ public:
 	/** Close an open message: computes the full-text hash and fans out End. */
 	void CompleteMessage(const FGuid& Id);
 
-	/** Post a one-shot system notice (errors, rate-limit warnings) as its own message. */
-	FGuid PostSystemMessage(const FString& Text);
+	/** Post a one-shot system notice (errors, rate-limit warnings) to a conversation. */
+	FGuid PostSystemMessage(const FString& Text, const FGuid& ConversationId);
 
 	/** Authoritative full body for a message id. False if it has aged out of the ring buffer. */
 	bool GetMessageBody(const FGuid& Id, FAIDATranscriptEntry& OutEntry) const;

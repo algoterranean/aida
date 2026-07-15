@@ -304,7 +304,7 @@ void AAIDAChatRelay::RequestRecovery(const FGuid& Id)
 	}
 }
 
-void AAIDAChatRelay::SubmitChat(const FString& Text)
+void AAIDAChatRelay::SubmitChat(const FString& Text, const FGuid& ConversationId)
 {
 	if (Text.TrimStartAndEnd().IsEmpty())
 	{
@@ -312,7 +312,7 @@ void AAIDAChatRelay::SubmitChat(const FString& Text)
 	}
 	if (UAIDARemoteCallObject* RCO = GetLocalRCO())
 	{
-		RCO->ServerSendChat(Text);
+		RCO->ServerSendChat(Text, ConversationId);
 	}
 	else
 	{

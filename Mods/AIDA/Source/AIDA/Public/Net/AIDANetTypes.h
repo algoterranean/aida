@@ -8,6 +8,9 @@
 // structs that cross the wire to clients — they carry NOTHING provider-related (no key, no
 // prompt), only player-visible transcript text.
 
+/** The default conversation/tab id — used before multiple tabs exist, and by the AIDA.Say debug command. */
+FORCEINLINE FGuid AIDADefaultConversationId() { return FGuid(0x1DA00001, 0x1DA00002, 0x1DA00003, 0x1DA00004); }
+
 /** Author category for a transcript message. */
 UENUM(BlueprintType)
 enum class EAIDAMsgKind : uint8
@@ -27,6 +30,8 @@ struct FAIDAMessageHeader
 	GENERATED_BODY()
 
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FGuid Id;
+	/** Which conversation (tab) this message belongs to. Clients group the transcript by this into tabs. */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FGuid ConversationId;
 	/** Display author — player name or "AIDA". Never an account id / secret. */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString Author;
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") EAIDAMsgKind Kind = EAIDAMsgKind::Player;
