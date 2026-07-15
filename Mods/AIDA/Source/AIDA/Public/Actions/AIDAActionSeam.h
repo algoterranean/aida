@@ -112,6 +112,14 @@ public:
 		int32& OutRemoved, int32& OutMissing);
 
 	/**
+	 * CLIENT-side ghost hologram for the proposal preview: the recipe's own hologram (the game's
+	 * native ghost visuals) placed at one tile, never replicated, no validation. The caller owns
+	 * destroying it when the proposal resolves or moves. Null when the recipe can't load.
+	 */
+	static AActor* SpawnGhostHologram(UObject* WorldContext, const FString& RecipeClassPath,
+		const FVector& CenterCm, float YawDeg, AActor* Owner);
+
+	/**
 	 * Undo of a BUILD: remove one journaled entity (docs/PHASE4.md §2d). CachedActor is the
 	 * in-session fast path; otherwise re-resolves — "lw" by class+index (transform-verified;
 	 * transform scan when the index is unknown/recycled), "actor" by class + transform epsilon.

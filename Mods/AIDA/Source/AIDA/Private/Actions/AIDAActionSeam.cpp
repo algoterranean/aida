@@ -354,7 +354,7 @@ bool FAIDAActionSeam::ResolveBuildRecipe(UObject* WorldContext, const FString& D
 namespace
 {
 	/** The requesting player's build-gun-channel aim hit (150 m reach). Empty-id = the listen host. */
-	bool TraceAimHit(UWorld* World, const FString& PlayerId, FHitResult& OutHit)
+	bool TraceAimHit(UWorld* World, const FString& PlayerId, FHitResult& OutHit, FVector* OutViewLocation = nullptr)
 	{
 		if (!World || PlayerId == TEXT("debug")) { return false; }
 
@@ -383,6 +383,7 @@ namespace
 		FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAAimTrace), /*bTraceComplex*/ false);
 		if (APawn* Pawn = Requester->GetPawn()) { Params.AddIgnoredActor(Pawn); }
 
+		if (OutViewLocation) { *OutViewLocation = ViewLocation; }
 		if (!World->LineTraceSingleByChannel(OutHit, ViewLocation, ViewLocation + ViewRotation.Vector() * 15000.0, AIDABuildGunChannel, Params))
 		{
 			UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim trace MISSED (view=%s dir=%s)"),
@@ -413,7 +414,8 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 {
 	UWorld* World = ResolveWorld(WorldContext);
 	FHitResult Hit;
-	if (!TraceAimHit(World, PlayerId, Hit))
+	FVector ViewLocation = FVector::ZeroVector;
+	if (!TraceAimHit(World, PlayerId, Hit, &ViewLocation))
 	{
 		return false;
 	}
@@ -465,28 +467,59 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 		TempBuildable->Destroy();
 	}
 
-	// Anchor the grid around the snapped tile by where the player aimed WITHIN it: past an edge =
-	// grow outward on that side (skipping one cell when a structure was aimed at, so the grid
-	// extends it instead of stacking over it); centered when the aim is ambiguous on an axis.
+	// Anchor + growth (user-specified semantics): the grid grows OUT OF THE AIMED SURFACE, toward
+	// the player — a side face's normal says exactly which way "out" is; a top face (normal ~up)
+	// grows toward the player instead. Terrain aims just centre the grid on the aim (a stamp).
 	const double YawRad = FMath::DegreesToRadians(static_cast<double>(InOutYawDeg));
 	const FVector AxisX(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.0);
 	const FVector AxisY(-FMath::Sin(YawRad), FMath::Cos(YawRad), 0.0);
-	const FVector AimOffset = Hit.ImpactPoint - Snapped;
-	constexpr double EdgeThresholdCm = 100.0; // >1 m off the tile centre = pointing at that edge
+	const FVector CenterX = AxisX * (((CountX - 1) / 2) * StepXCm);
+	const FVector CenterY = AxisY * (((CountY - 1) / 2) * StepYCm);
 
-	const auto AnchorShift = [&](double AimComponent, int32 Count, double StepCm) -> double
+	if (!bAimedAtStructure)
 	{
-		if (AimComponent > EdgeThresholdCm)  { return bAimedAtStructure ? StepCm : 0.0; }
-		if (AimComponent < -EdgeThresholdCm) { return -((Count - 1) * StepCm) - (bAimedAtStructure ? StepCm : 0.0); }
-		return -((Count - 1) / 2) * StepCm;  // ambiguous: centre the grid on the aimed tile
-	};
-	OutOriginCm = Snapped
-		+ AxisX * AnchorShift(AimOffset | AxisX, CountX, StepXCm)
-		+ AxisY * AnchorShift(AimOffset | AxisY, CountY, StepYCm);
+		OutOriginCm = Snapped - CenterX - CenterY;
+	}
+	else
+	{
+		FVector GrowDir = Hit.ImpactNormal;
+		GrowDir.Z = 0.0;
+		if (GrowDir.SizeSquared() < 0.25) // top/bottom face: "coming toward me"
+		{
+			GrowDir = ViewLocation - Hit.ImpactPoint;
+			GrowDir.Z = 0.0;
+		}
+		if (!GrowDir.Normalize()) { GrowDir = AxisX; }
 
-	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s (anchored %s) yaw=%d structure=%d"),
+		// Pick the lattice axis closest to the growth direction.
+		const double DX = GrowDir | AxisX;
+		const double DY = GrowDir | AxisY;
+		const bool bAlongX = FMath::Abs(DX) >= FMath::Abs(DY);
+		const double Sign = (bAlongX ? DX : DY) >= 0.0 ? 1.0 : -1.0;
+		const FVector GrowthAxis = (bAlongX ? AxisX : AxisY) * Sign;
+		const int32 CountAlong = bAlongX ? CountX : CountY;
+		const double StepAlong = bAlongX ? StepXCm : StepYCm;
+
+		// First tile = the cell adjacent to the aimed face — unless the snap already stepped out of
+		// the structure (holograms aimed at a side face snap to the neighbouring cell themselves).
+		FVector Anchor = Snapped;
+		if (((Snapped - Hit.ImpactPoint) | GrowthAxis) < StepAlong * 0.25)
+		{
+			Anchor += GrowthAxis * StepAlong;
+		}
+
+		// Span the growth axis away from the face; centre the perpendicular axis on the anchor.
+		OutOriginCm = Anchor;
+		if (Sign < 0.0)
+		{
+			OutOriginCm += GrowthAxis * ((CountAlong - 1) * StepAlong); // +axis expansion must END at the anchor
+		}
+		OutOriginCm -= bAlongX ? CenterY : CenterX;
+	}
+
+	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s (anchored %s) yaw=%d structure=%d normal=%s"),
 		*Hit.ImpactPoint.ToCompactString(), *Snapped.ToCompactString(), *OutOriginCm.ToCompactString(),
-		InOutYawDeg, bAimedAtStructure ? 1 : 0);
+		InOutYawDeg, bAimedAtStructure ? 1 : 0, *Hit.ImpactNormal.ToCompactString());
 	return true;
 }
 
@@ -991,6 +1024,32 @@ int32 FAIDAActionSeam::DismantleHandleBatch(UObject* WorldContext, const TArray<
 		}
 	}
 	return End - Cursor;
+}
+
+AActor* FAIDAActionSeam::SpawnGhostHologram(UObject* WorldContext, const FString& RecipeClassPath,
+	const FVector& CenterCm, float YawDeg, AActor* Owner)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass) { return nullptr; }
+
+	AFGHologram* Hologram = AFGHologram::SpawnHologramFromRecipe(RecipeClass,
+		Owner ? Owner : World->GetWorldSettings(), CenterCm, /*hologramInstigator*/ nullptr,
+		[](AFGHologram* PreSpawn) { PreSpawn->SetReplicates(false); });
+	if (!Hologram) { return nullptr; }
+
+	Hologram->SetBuildModeOverride(Hologram->GetDefaultBuildGunMode());
+	Hologram->SetScrollRotateValue(FMath::RoundToInt32(YawDeg));
+
+	FHitResult Hit(ForceInit);
+	Hit.bBlockingHit = true;
+	Hit.Location = CenterCm;
+	Hit.ImpactPoint = CenterCm;
+	Hit.Normal = FVector::UpVector;
+	Hit.ImpactNormal = FVector::UpVector;
+	Hologram->UpdateHologramPlacement(Hit);
+	Hologram->ResetConstructDisqualifiers(); // ghost is display-only; keep the valid-placement look
+	return Hologram;
 }
 
 bool FAIDAActionSeam::UndoRemoveEntity(UObject* WorldContext, const FAIDAEntityId& Entity, AActor* CachedActor)

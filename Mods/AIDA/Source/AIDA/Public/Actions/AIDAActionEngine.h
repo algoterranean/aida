@@ -39,6 +39,14 @@ public:
 	bool Reject(const FGuid& Id, const FString& ApproverId, FString& OutMessage);
 
 	/**
+	 * Move (DeltaCm) and/or rotate (YawDeltaDeg, around the grid centroid) a PENDING build
+	 * proposal's placements, re-running the dry-run against the new spot — an invalid adjustment
+	 * reports and leaves the proposal unchanged. The republished view moves the client ghosts.
+	 */
+	bool AdjustPending(UObject* WorldContext, const FAIDAActionsConfig& Config, const FGuid& Id,
+		const FVector& DeltaCm, int32 YawDeltaDeg, FString& OutMessage);
+
+	/**
 	 * One executor tick: advance the executing proposal (or the undo queue) by batchPerTick items.
 	 * On completion, journals the action (in-save), pays out dismantle refunds, and caches built
 	 * actors for undo. Returns true while more work remains (keep the timer running).

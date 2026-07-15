@@ -1757,6 +1757,25 @@ bool FAIDAChatCommandsTest::RunTest(const FString&)
 	TestTrue(TEXT("approve bad id -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
 	TestFalse(TEXT("approve bad id has usage"), Error.IsEmpty());
 
+	// /aida nudge and /aida rotate (the ghost-adjust commands).
+	TestTrue(TEXT("nudge north"), AIDAChatCommands::TryParse(TEXT("/aida nudge north"), Cmd, Error));
+	TestTrue(TEXT("nudge kind"), Cmd.Kind == FAIDAChatCommand::EKind::Nudge);
+	TestTrue(TEXT("north = -Y"), Cmd.NudgeDir.Equals(FVector(0, -1, 0)));
+	TestEqual(TEXT("nudge default 8 m"), Cmd.NudgeDistM, 8.0);
+
+	TestTrue(TEXT("nudge east 2.5"), AIDAChatCommands::TryParse(TEXT("/aida nudge east 2.5"), Cmd, Error));
+	TestTrue(TEXT("east = +X"), Cmd.NudgeDir.Equals(FVector(1, 0, 0)));
+	TestEqual(TEXT("nudge dist parsed"), Cmd.NudgeDistM, 2.5);
+
+	TestTrue(TEXT("nudge nonsense intercepts"), AIDAChatCommands::TryParse(TEXT("/aida nudge sideways"), Cmd, Error));
+	TestTrue(TEXT("nudge nonsense -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
+
+	TestTrue(TEXT("rotate default"), AIDAChatCommands::TryParse(TEXT("/aida rotate"), Cmd, Error));
+	TestTrue(TEXT("rotate kind"), Cmd.Kind == FAIDAChatCommand::EKind::Rotate);
+	TestEqual(TEXT("rotate default 90"), Cmd.RotateDeg, 90);
+	TestTrue(TEXT("rotate -90"), AIDAChatCommands::TryParse(TEXT("/aida rotate -90"), Cmd, Error));
+	TestEqual(TEXT("rotate parsed"), Cmd.RotateDeg, -90);
+
 	// Malformed/unknown commands still short-circuit, carrying usage text.
 	TestTrue(TEXT("bad count intercepts"), AIDAChatCommands::TryParse(TEXT("/aida undo zero"), Cmd, Error));
 	TestTrue(TEXT("bad count -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);

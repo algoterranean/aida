@@ -29,6 +29,7 @@ public:
 	AAIDAProposalRelay();
 
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	//~ Server API (authority only) — driven by the orchestrator.
 	/** Insert or update one proposal's view; broadcasts the change locally too (listen host has no OnRep). */
@@ -64,4 +65,13 @@ private:
 
 	/** The local player's AIDA RCO, or null (e.g. on a dedicated server). */
 	class UAIDARemoteCallObject* GetLocalRCO() const;
+
+	/**
+	 * Local (never replicated) ghost holograms per pending build proposal, rebuilt whenever the
+	 * list changes — players see EXACTLY where a proposal will build, and nudges move it live.
+	 * Rendering-side only; a dedicated server spawns none.
+	 */
+	TMap<FGuid, TArray<TWeakObjectPtr<AActor>>> Ghosts;
+	void RefreshGhosts();
+	void ClearGhosts(const FGuid& Id);
 };

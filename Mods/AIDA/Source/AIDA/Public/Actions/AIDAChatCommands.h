@@ -14,12 +14,17 @@ struct FAIDAChatCommand
 		None,     // "/aida" with an unknown/missing subcommand — OutError carries usage text
 		Undo,     // "/aida undo [n]"
 		Approve,  // "/aida approve [proposalId]" — no id = the newest pending proposal
-		Reject    // "/aida reject [proposalId]"
+		Reject,   // "/aida reject [proposalId]"
+		Nudge,    // "/aida nudge <north|south|east|west|up|down> [metres]" — move the pending ghost
+		Rotate    // "/aida rotate [degrees]" — rotate the pending ghost (default 90)
 	};
 
 	EKind Kind = EKind::None;
-	int32 Count = 1;    // Undo: how many actions to reverse
-	FGuid ProposalId;   // Approve/Reject: explicit target (invalid = newest pending)
+	int32 Count = 1;                          // Undo: how many actions to reverse
+	FGuid ProposalId;                         // Approve/Reject: explicit target (invalid = newest pending)
+	FVector NudgeDir = FVector::ZeroVector;   // Nudge: world-axis unit direction
+	double NudgeDistM = 8.0;                  // Nudge: metres (default = one foundation tile)
+	int32 RotateDeg = 90;                     // Rotate: yaw delta
 };
 
 namespace AIDAChatCommands

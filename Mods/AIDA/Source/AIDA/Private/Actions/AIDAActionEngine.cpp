@@ -105,6 +105,66 @@ bool FAIDAActionEngine::Reject(const FGuid& Id, const FString& ApproverId, FStri
 	return true;
 }
 
+bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsConfig& Config, const FGuid& Id,
+	const FVector& DeltaCm, int32 YawDeltaDeg, FString& OutMessage)
+{
+	FAIDAProposal* Proposal = ProposalStore.Find(Id);
+	if (!Proposal || Proposal->State != EAIDAProposalState::Pending)
+	{
+		OutMessage = TEXT("no pending proposal to adjust");
+		return false;
+	}
+	if (Proposal->bDismantle)
+	{
+		OutMessage = TEXT("only build proposals can be nudged/rotated");
+		return false;
+	}
+
+	// Transform a copy; the original survives an invalid adjustment untouched.
+	TArray<FTransform> Adjusted = Proposal->Placements;
+	if (YawDeltaDeg != 0 && Adjusted.Num() > 0)
+	{
+		FVector Centroid = FVector::ZeroVector;
+		for (const FTransform& Placement : Adjusted) { Centroid += Placement.GetLocation(); }
+		Centroid /= Adjusted.Num();
+
+		const FRotator Delta(0.0, static_cast<double>(YawDeltaDeg), 0.0);
+		for (FTransform& Placement : Adjusted)
+		{
+			Placement.SetLocation(Centroid + Delta.RotateVector(Placement.GetLocation() - Centroid));
+			FRotator Rotation = Placement.Rotator();
+			Rotation.Yaw += YawDeltaDeg;
+			Placement.SetRotation(FQuat(Rotation));
+		}
+	}
+	if (!DeltaCm.IsNearlyZero())
+	{
+		for (FTransform& Placement : Adjusted)
+		{
+			Placement.SetLocation(Placement.GetLocation() + DeltaCm);
+		}
+	}
+
+	// The new spot must validate like the original did (all-or-nothing, same rules).
+	FAIDADryRunResult DryRun;
+	if (!FAIDAActionSeam::DryRunBuild(WorldContext, Proposal->RecipeClassPath, Adjusted, DryRun) || !DryRun.bOk)
+	{
+		OutMessage = FString::Printf(TEXT("adjustment blocked — %s; the proposal is unchanged"),
+			DryRun.Failures.Num() > 0
+				? *FString::Printf(TEXT("%d placement(s) invalid there"), DryRun.Failures.Num())
+				: (DryRun.Error.IsEmpty() ? TEXT("validation failed") : *DryRun.Error));
+		return false;
+	}
+
+	Proposal->Placements = MoveTemp(Adjusted);
+	OutMessage = YawDeltaDeg != 0
+		? FString::Printf(TEXT("rotated %d° — %s"), YawDeltaDeg, *Proposal->Summary)
+		: FString::Printf(TEXT("nudged %.1f m — %s"), DeltaCm.Size() / 100.0, *Proposal->Summary);
+	UE_LOG(LogAIDA, Log, TEXT("[actions] %s adjusted (delta=%s yaw+=%d)."),
+		*Id.ToString(EGuidFormats::DigitsWithHyphens), *DeltaCm.ToCompactString(), YawDeltaDeg);
+	return true;
+}
+
 bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory)
 {
 	// Undo shares the 10 Hz slicer and is mutually exclusive with proposal execution.

@@ -81,6 +81,12 @@ struct FAIDAProposalView
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString State;
 	/** Unix time the pending proposal expires (0 once resolved). */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") int64 ExpiresUtc = 0;
+
+	//~ Ghost-preview payload (build proposals while pending; empty otherwise). Clients spawn local
+	//~ holograms of the recipe at each tile so players see EXACTLY where the build will land.
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString RecipeClassPath;
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FVector> TileCenters; // world cm
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") float YawDeg = 0.f;
 };
 
 /**

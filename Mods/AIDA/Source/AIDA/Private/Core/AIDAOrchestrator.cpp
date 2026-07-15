@@ -109,7 +109,9 @@ namespace
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
 		"/aida undo (or /aida undo N) in this chat. Players decide proposals with the on-screen card or "
-		"/aida approve, /aida reject.\n"
+		"/aida approve, /aida reject — a pending proposal shows a live hologram ghost of the whole build, "
+		"and players can move it with /aida nudge <north|south|east|west|up|down> [metres] and "
+		"/aida rotate [degrees] before approving.\n"
 		"CRITICAL: a proposal exists ONLY when a propose_* call in THIS turn returned a proposalId. Never "
 		"announce a proposal, cost, or 'awaiting approval' without that tool result — if you did not call "
 		"the tool, or it returned an error, say exactly that instead. Never invent costs or ids.\n\n"
@@ -353,8 +355,9 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 			return;
 		}
 
-		// Approve/Reject a pending proposal from chat (the same double-gated path as the UI buttons).
-		if (Command.Kind == FAIDAChatCommand::EKind::Approve || Command.Kind == FAIDAChatCommand::EKind::Reject)
+		// Approve/Reject/Nudge/Rotate act on a pending proposal (newest when no id is given).
+		if (Command.Kind == FAIDAChatCommand::EKind::Approve || Command.Kind == FAIDAChatCommand::EKind::Reject ||
+			Command.Kind == FAIDAChatCommand::EKind::Nudge || Command.Kind == FAIDAChatCommand::EKind::Rotate)
 		{
 			FGuid Target = Command.ProposalId;
 			if (!Target.IsValid())
@@ -376,6 +379,26 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 				Session->PostSystemMessage(TEXT("No pending proposal to decide. (Real proposals always get an 'AIDA proposes …' system line — if AIDA claimed one without it, it was mistaken; ask it to propose again.)"), ConversationId);
 				return;
 			}
+
+			if (Command.Kind == FAIDAChatCommand::EKind::Nudge || Command.Kind == FAIDAChatCommand::EKind::Rotate)
+			{
+				// Moving a proposed build is act-tier, like proposing/approving one.
+				if (!Permissions.IsAllowed(EAIDATier::Act, Requester.PlayerId))
+				{
+					Session->PostSystemMessage(TEXT("You don't have act permission to adjust AIDA proposals."), ConversationId);
+					return;
+				}
+				const FVector DeltaCm = Command.Kind == FAIDAChatCommand::EKind::Nudge
+					? Command.NudgeDir * Command.NudgeDistM * 100.0 : FVector::ZeroVector;
+				const int32 YawDelta = Command.Kind == FAIDAChatCommand::EKind::Rotate ? Command.RotateDeg : 0;
+
+				FString Message;
+				Actions.AdjustPending(this, Config.Actions, Target, DeltaCm, YawDelta, Message);
+				PublishProposal(Target); // moves every client's ghost
+				Session->PostSystemMessage(Message, ConversationId);
+				return;
+			}
+
 			HandleProposalDecision(Requester, Target, Command.Kind == FAIDAChatCommand::EKind::Approve);
 			return;
 		}
@@ -881,6 +904,19 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 	View.State = AIDAActionSpec::StateToString(Proposal->State);
 	View.ExpiresUtc = Proposal->State == EAIDAProposalState::Pending
 		? Proposal->ProposedUtc + Config.Actions.TtlSeconds : 0;
+
+	// Ghost-preview payload: pending build proposals ship their tiles so clients hologram them.
+	if (Proposal->State == EAIDAProposalState::Pending && !Proposal->bDismantle)
+	{
+		View.RecipeClassPath = Proposal->RecipeClassPath;
+		View.TileCenters.Reserve(Proposal->Placements.Num());
+		for (const FTransform& Placement : Proposal->Placements)
+		{
+			View.TileCenters.Add(Placement.GetLocation());
+		}
+		View.YawDeg = Proposal->Placements.Num() > 0
+			? static_cast<float>(Proposal->Placements[0].Rotator().Yaw) : 0.f;
+	}
 	R->ServerUpsertProposal(View);
 }
 
