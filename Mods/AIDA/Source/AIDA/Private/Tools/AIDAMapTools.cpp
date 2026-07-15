@@ -87,3 +87,29 @@ FString AIDAMapTools::BuildResourceNodesJson(const TArray<FAIDAResourceNode>& No
 
 	return AIDAToCompactJson(Root);
 }
+
+const FAIDAResourceNode* AIDAMapTools::FindNearestUntapped(const TArray<FAIDAResourceNode>& Nodes, const FString& ResourceFilter,
+	const FString& PurityFilter, const FVector& From, bool bHasFrom)
+{
+	const FAIDAResourceNode* Best = nullptr;
+	double BestDistSq = TNumericLimits<double>::Max();
+
+	for (const FAIDAResourceNode& N : Nodes)
+	{
+		if (N.bOccupied) { continue; }
+		if (!ResourceFilter.IsEmpty() && !N.Resource.Contains(ResourceFilter, ESearchCase::IgnoreCase)) { continue; }
+		if (!PurityFilter.IsEmpty() && !N.Purity.Equals(PurityFilter, ESearchCase::IgnoreCase)) { continue; }
+
+		if (!bHasFrom)
+		{
+			return &N; // no origin → first match (deterministic given the scan order)
+		}
+		const double DistSq = FVector::DistSquared(From, N.Location);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			Best = &N;
+		}
+	}
+	return Best;
+}

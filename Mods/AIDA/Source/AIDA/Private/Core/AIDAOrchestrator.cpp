@@ -7,10 +7,14 @@
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
+#include "Tools/AIDAToolJson.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerState.h"
+#include "GameFramework/Pawn.h"
 #include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -29,6 +33,28 @@ namespace
 		}
 	}
 
+	/** Resolve a requesting player's pawn location by their net-id string (as set in the RCO). */
+	bool AIDAResolvePlayerLocation(UWorld* World, const FString& PlayerId, FVector& OutLocation)
+	{
+		if (!World || PlayerId.IsEmpty() || PlayerId == TEXT("debug")) { return false; }
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			APlayerState* PS = PC ? PC->PlayerState : nullptr;
+			if (!PS) { continue; }
+			const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
+			if (NetId.IsValid() && NetId->ToString() == PlayerId)
+			{
+				if (const APawn* Pawn = PC->GetPawn())
+				{
+					OutLocation = Pawn->GetActorLocation();
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	/** AIDA's persona + tool guidance. Prepended to every chat completion so the model uses the tools. */
 	const TCHAR* GAIDASystemPrompt = TEXT(
 		"You are AIDA, an assistant embedded inside the factory-building game Satisfactory. You help the "
@@ -44,7 +70,10 @@ namespace
 		"- lookup_recipe(item?): static recipe reference — inputs/outputs (amount + per-minute), craft time, "
 		"and which building makes it. Use for 'how is X made / what does X need', not live factory data.\n"
 		"- lookup_building(name?): static building reference — a production building's power draw (and, for "
-		"generators, power output).\n\n"
+		"generators, power output).\n"
+		"- tag_node(resource, purity?, label?): drop a labeled marker on the map at the nearest untapped "
+		"node of a resource to the player. This WRITES a shared map marker — only use it when the player "
+		"asks you to mark/tag/find-and-mark a node.\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -421,6 +450,48 @@ void UAIDAOrchestrator::RegisterTools()
 		}
 	});
 
+	// Slice 3b tag_node (Act tier — it writes a persistent, replicated map marker). Places a labeled
+	// map stamp on the nearest untapped node of a resource to the requesting player.
+	Tools.Register({
+		TEXT("tag_node"),
+		TEXT("Place a labeled marker on the map at the nearest untapped resource node of a given resource to the player (a saved, shared map stamp). Pass 'resource' (required), optional 'purity' (Impure/Normal/Pure), and an optional 'label'."),
+		TEXT(R"({"type":"object","properties":{"resource":{"type":"string","description":"Resource to tag (e.g. \"Caterium Ore\")."},"purity":{"type":"string","description":"Optional purity: Impure, Normal, or Pure."},"label":{"type":"string","description":"Optional marker label; defaults to the resource name."}},"required":["resource"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			FString Resource, Purity, Label;
+			Args->TryGetStringField(TEXT("resource"), Resource);
+			Args->TryGetStringField(TEXT("purity"), Purity);
+			Args->TryGetStringField(TEXT("label"), Label);
+			if (Resource.IsEmpty()) { return FAIDAToolResult::Error(TEXT("tag_node needs a 'resource'.")); }
+
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const TArray<FAIDAResourceNode>& Nodes = MapService.GetNodes(World, Now);
+			const FAIDAResourceNode* Node = AIDAMapTools::FindNearestUntapped(Nodes, Resource, Purity, Ctx.Location, Ctx.bHasLocation);
+			if (!Node)
+			{
+				return FAIDAToolResult::Error(FString::Printf(TEXT("No untapped %s%s node found."),
+					Purity.IsEmpty() ? TEXT("") : *(Purity + TEXT(" ")), *Resource));
+			}
+
+			const FString MarkerLabel = !Label.IsEmpty() ? Label
+				: (Purity.IsEmpty() ? Node->Resource : FString::Printf(TEXT("%s (%s)"), *Node->Resource, *Node->Purity));
+			if (!FAIDAMapService::PlaceMapMarker(World, Node->Location, MarkerLabel))
+			{
+				return FAIDAToolResult::Error(TEXT("Could not place the marker (map unavailable or marker limit reached)."));
+			}
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetBoolField(TEXT("tagged"), true);
+			Root->SetStringField(TEXT("label"), MarkerLabel);
+			Root->SetStringField(TEXT("resource"), Node->Resource);
+			Root->SetStringField(TEXT("purity"), Node->Purity);
+			if (!Node->Region.IsEmpty()) { Root->SetStringField(TEXT("region"), Node->Region); }
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+		}
+	});
+
 	// Slice 3b static-reference tools (docs/PHASE2.md). Chat tier — pure game data, no live state read.
 	Tools.Register({
 		TEXT("lookup_recipe"),
@@ -513,6 +584,7 @@ void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode
 			FAIDAToolContext Ctx;
 			Ctx.Author = Requester.Author;
 			Ctx.PlayerId = Requester.PlayerId;
+			Ctx.bHasLocation = AIDAResolvePlayerLocation(O->GetWorld(), Requester.PlayerId, Ctx.Location);
 
 			for (const FAIDAToolCall& Call : Result.ToolCalls)
 			{

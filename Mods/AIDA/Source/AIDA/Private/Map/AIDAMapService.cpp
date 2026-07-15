@@ -7,6 +7,8 @@
 #include "EngineUtils.h"
 #include "FGMapArea.h"
 #include "FGMapAreaTexture.h"
+#include "FGMapManager.h"
+#include "FGMapMarker.h"
 #include "FGMinimapCaptureActor.h"
 #include "FGWorldGridSubsystem.h"
 #include "Resources/FGResourceNode.h"
@@ -47,6 +49,35 @@ FString FAIDAMapService::RegionNameForLocation(UObject* WorldContext, const FVec
 		}
 	}
 	return FString();
+}
+
+bool FAIDAMapService::PlaceMapMarker(UObject* WorldContext, const FVector& WorldLocation, const FString& Label)
+{
+	UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
+	AFGMapManager* MapManager = World ? AFGMapManager::Get(World) : nullptr;
+	if (!MapManager)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[map] no map manager for marker placement."));
+		return false;
+	}
+	if (!MapManager->CanAddNewMapMarker())
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[map] map-marker limit reached; not placing '%s'."), *Label);
+		return false;
+	}
+
+	FMapMarker Marker;
+	Marker.Location = WorldLocation;
+	Marker.Name = Label;
+	Marker.MapMarkerType = ERepresentationType::RT_MapMarker;
+	Marker.Color = FLinearColor(1.0f, 0.65f, 0.0f, 1.0f); // AIDA amber
+	Marker.Scale = 1.0f;
+	Marker.CompassViewDistance = ECompassViewDistance::CVD_Always;
+
+	FMapMarker Created;
+	const bool bOk = MapManager->AddNewMapMarker(Marker, Created);
+	UE_LOG(LogAIDA, Log, TEXT("[map] tag_node marker '%s' at %s -> %s"), *Label, *WorldLocation.ToCompactString(), bOk ? TEXT("ok") : TEXT("rejected"));
+	return bOk;
 }
 
 void FAIDAMapService::ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResourceNode>& OutNodes)

@@ -30,6 +30,13 @@ public:
 	 */
 	static FString RegionNameForLocation(UObject* WorldContext, const FVector& WorldLocation);
 
+	/**
+	 * Place a persistent, labeled map marker (a saved, replicated map stamp) at WorldLocation via the
+	 * map manager. Server-authoritative — call on the host. Returns false if the manager is missing or
+	 * the marker cap is reached. Backs tag_node.
+	 */
+	static bool PlaceMapMarker(UObject* WorldContext, const FVector& WorldLocation, const FString& Label);
+
 private:
 	TArray<FAIDAResourceNode> Cached;
 	double LastExtractSeconds = 0.0;

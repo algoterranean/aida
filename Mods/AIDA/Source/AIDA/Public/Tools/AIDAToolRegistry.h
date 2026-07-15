@@ -22,6 +22,11 @@ struct FAIDAToolContext
 {
 	FString Author;    // display name of the requesting player (or "AIDA"/debug)
 	FString PlayerId;  // stable id; permission checks happen upstream in the orchestrator
+
+	// The requesting player's world location, when resolvable (e.g. for "nearest node" tools). Handlers
+	// must treat bHasLocation=false as "unknown" and fall back to a deterministic choice.
+	FVector Location = FVector::ZeroVector;
+	bool bHasLocation = false;
 };
 
 /** Outcome of a tool call. Content is the JSON (or text) the model receives as a tool_result. */

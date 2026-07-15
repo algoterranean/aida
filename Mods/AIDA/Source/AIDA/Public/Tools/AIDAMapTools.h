@@ -17,4 +17,12 @@ namespace AIDAMapTools
 	 * free-node list with grid coordinates.
 	 */
 	FString BuildResourceNodesJson(const TArray<FAIDAResourceNode>& Nodes, const FString& ResourceFilter, bool bUntappedOnly);
+
+	/**
+	 * tag_node target resolution: the untapped node whose resource matches ResourceFilter (and, if
+	 * PurityFilter is non-empty, its purity) — the nearest to From when bHasFrom, else the first match.
+	 * Returns nullptr when nothing matches. Pure, so it unit-tests on synthetic nodes.
+	 */
+	const FAIDAResourceNode* FindNearestUntapped(const TArray<FAIDAResourceNode>& Nodes, const FString& ResourceFilter,
+		const FString& PurityFilter, const FVector& From, bool bHasFrom);
 }

@@ -1011,6 +1011,49 @@ bool FAIDAMapToolsNodesTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAMapToolsNearestTest, "AIDA.MapTools.FindNearestUntapped",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAMapToolsNearestTest::RunTest(const FString&)
+{
+	TArray<FAIDAResourceNode> Nodes;
+	auto MakeAt = [](const FString& Res, const FString& Pur, bool bOcc, const FVector& Loc)
+	{
+		FAIDAResourceNode N; N.Resource = Res; N.Purity = Pur; N.bOccupied = bOcc; N.Location = Loc; return N;
+	};
+	Nodes.Add(MakeAt(TEXT("Iron Ore"), TEXT("Pure"),   true,  FVector(100, 0, 0))); // occupied — skipped
+	Nodes.Add(MakeAt(TEXT("Iron Ore"), TEXT("Normal"), false, FVector(1000, 0, 0)));
+	Nodes.Add(MakeAt(TEXT("Iron Ore"), TEXT("Pure"),   false, FVector(500, 0, 0)));
+	Nodes.Add(MakeAt(TEXT("Copper Ore"), TEXT("Impure"), false, FVector(50, 0, 0)));
+
+	// Nearest untapped iron to the origin is the Pure one at 500 (the occupied 100 is skipped).
+	{
+		const FAIDAResourceNode* N = AIDAMapTools::FindNearestUntapped(Nodes, TEXT("iron"), FString(), FVector::ZeroVector, true);
+		if (!TestNotNull(TEXT("found a node"), N)) { return false; }
+		TestEqual(TEXT("nearest untapped iron"), N->Location.X, 500.0);
+	}
+
+	// Purity filter forces the Normal node even though the Pure one is closer.
+	{
+		const FAIDAResourceNode* N = AIDAMapTools::FindNearestUntapped(Nodes, TEXT("iron"), TEXT("Normal"), FVector::ZeroVector, true);
+		if (!TestNotNull(TEXT("found normal iron"), N)) { return false; }
+		TestEqual(TEXT("normal iron picked"), N->Location.X, 1000.0);
+	}
+
+	// No origin → first matching untapped node in scan order (the Normal at 1000).
+	{
+		const FAIDAResourceNode* N = AIDAMapTools::FindNearestUntapped(Nodes, TEXT("iron"), FString(), FVector::ZeroVector, false);
+		if (!TestNotNull(TEXT("found without origin"), N)) { return false; }
+		TestEqual(TEXT("first untapped iron"), N->Location.X, 1000.0);
+	}
+
+	// No untapped match → nullptr.
+	{
+		const FAIDAResourceNode* N = AIDAMapTools::FindNearestUntapped(Nodes, TEXT("Bauxite"), FString(), FVector::ZeroVector, true);
+		TestNull(TEXT("no bauxite"), N);
+	}
+	return true;
+}
+
 // A small synthetic catalog for the static-reference serializers (no game headers required).
 static TArray<FAIDARecipeInfo> AIDAMakeTestRecipes()
 {
