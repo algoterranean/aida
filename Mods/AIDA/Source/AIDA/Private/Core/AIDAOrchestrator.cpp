@@ -79,7 +79,9 @@ namespace
 		"- add_note(text, tags?): save a persistent note for the player (survives sessions), tagged with "
 		"their location/region. Use when they ask you to remember/note something.\n"
 		"- get_notes(keyword?, region?, near?): recall the player's saved notes. Check these when the "
-		"player asks what they wanted to do, or refers to something they told you earlier.\n\n"
+		"player asks what they wanted to do, or refers to something they told you earlier. To list ALL "
+		"notes (e.g. 'what were my notes?'), call get_notes with NO arguments — do not invent a keyword, "
+		"and never use the player's name as a filter (notes match on content, not author).\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -583,7 +585,7 @@ void UAIDAOrchestrator::RegisterTools()
 
 	Tools.Register({
 		TEXT("get_notes"),
-		TEXT("Recall the player's saved notes. Filter with 'keyword' (matches text or a tag) and/or 'region'; set 'near' true to sort by distance to the player. Omit all for the most recent notes."),
+		TEXT("Recall the player's saved notes. To list everything (e.g. 'what were my notes?'), call with NO arguments. 'keyword' filters note CONTENT (text or a tag) — never pass the player's name or 'author' as a keyword. 'region' filters by map area; 'near' sorts by distance to the player."),
 		TEXT(R"({"type":"object","properties":{"keyword":{"type":"string","description":"Case-insensitive text/tag filter."},"region":{"type":"string","description":"Map-area name filter."},"near":{"type":"boolean","description":"Sort by distance to the player instead of most-recent."}}})"),
 		EAIDAToolTier::Query,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
