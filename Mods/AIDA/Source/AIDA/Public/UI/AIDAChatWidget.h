@@ -68,6 +68,8 @@ class UAIDAChatWidget : public UUserWidget
 public:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
+	/** Up/Down recall the current conversation's input history while the input box has focus. */
+	virtual FReply NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
 	/** Send a chat line to the server (bind your text box's submit to this). */
 	UFUNCTION(BlueprintCallable, Category = "AIDA")
@@ -148,6 +150,16 @@ private:
 	void HandleSendClicked();
 	UFUNCTION()
 	void HandleInputCommitted(const FText& Text, ETextCommit::Type CommitMethod);
+
+	//~ Per-conversation input history (Up = older, Down = newer, past-newest = empty line).
+	TMap<FGuid, TArray<FString>> InputHistory;
+	int32 HistoryCursor = INDEX_NONE; // into the CURRENT conversation's history; INDEX_NONE = live line
+
+	/** Append a sent line to the current conversation's history (deduping repeats) and reset recall. */
+	void RecordInputHistory(const FString& Text);
+
+	/** Refocus the input box now AND next tick — Slate steals focus after commits/button clicks. */
+	void RefocusInput();
 
 	//~ Per-conversation transcript state (one per tab). Each conversation is independent.
 	struct FRenderedMessage

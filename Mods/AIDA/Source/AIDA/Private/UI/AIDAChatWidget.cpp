@@ -510,6 +510,7 @@ UAIDAChatWidget::FConversationView& UAIDAChatWidget::EnsureConversation(const FG
 void UAIDAChatWidget::SwitchToConversation(const FGuid& ConvId)
 {
 	CurrentConversationId = ConvId;
+	HistoryCursor = INDEX_NONE; // each tab recalls its own history from its newest line
 	EnsureConversation(ConvId);
 	RebuildTabBar();
 	RenderActiveConversation();
@@ -538,7 +539,9 @@ void UAIDAChatWidget::HandleSendClicked()
 		return;
 	}
 	SendChat(Text);
+	RecordInputHistory(Text);
 	InputBox->SetText(FText::GetEmpty());
+	RefocusInput();
 }
 
 void UAIDAChatWidget::HandleInputCommitted(const FText& Text, ETextCommit::Type CommitMethod)
@@ -547,6 +550,54 @@ void UAIDAChatWidget::HandleInputCommitted(const FText& Text, ETextCommit::Type 
 	{
 		HandleSendClicked();
 	}
+}
+
+void UAIDAChatWidget::RecordInputHistory(const FString& Text)
+{
+	TArray<FString>& History = InputHistory.FindOrAdd(CurrentConversationId);
+	if (History.Num() == 0 || History.Last() != Text)
+	{
+		History.Add(Text);
+	}
+	HistoryCursor = INDEX_NONE;
+}
+
+void UAIDAChatWidget::RefocusInput()
+{
+	// Committing (Enter) and button clicks both pull Slate focus off the box — the chat window is a
+	// conversation, so the caret must stay put. Refocus now AND next tick (Slate finishes routing
+	// the commit after this handler returns and would steal it right back).
+	FocusInput();
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]() { FocusInput(); }));
+	}
+}
+
+FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+	// Up/Down = shell-style recall of this conversation's sent lines, only while typing in the box.
+	if (InputBox && InputBox->HasKeyboardFocus())
+	{
+		const FKey Key = InKeyEvent.GetKey();
+		if (Key == EKeys::Up || Key == EKeys::Down)
+		{
+			if (const TArray<FString>* History = InputHistory.Find(CurrentConversationId); History && History->Num() > 0)
+			{
+				if (Key == EKeys::Up)
+				{
+					HistoryCursor = (HistoryCursor == INDEX_NONE) ? History->Num() - 1 : FMath::Max(0, HistoryCursor - 1);
+				}
+				else if (HistoryCursor != INDEX_NONE && ++HistoryCursor >= History->Num())
+				{
+					HistoryCursor = INDEX_NONE; // stepped past the newest entry -> back to a blank line
+				}
+				InputBox->SetText(HistoryCursor == INDEX_NONE ? FText::GetEmpty() : FText::FromString((*History)[HistoryCursor]));
+			}
+			return FReply::Handled();
+		}
+	}
+	return Super::NativeOnPreviewKeyDown(InGeometry, InKeyEvent);
 }
 
 void UAIDAChatWidget::RenderActiveConversation()
