@@ -32,6 +32,13 @@ namespace
 {
 	constexpr int32 MaxSuggestions = 5;
 
+	/**
+	 * The game's build-gun trace channel. The exported extern (TC_BuildGun, FactoryGame.h) has no
+	 * definition in the linkable header stubs, but the channel is pinned in the game's
+	 * DefaultEngine.ini: ECC_GameTraceChannel5 = "BuildGun".
+	 */
+	constexpr ECollisionChannel AIDABuildGunChannel = ECC_GameTraceChannel5;
+
 	UWorld* ResolveWorld(UObject* WorldContext)
 	{
 		return GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
@@ -164,8 +171,10 @@ namespace
 
 		// The hologram wants a REAL hit — a zeroed FHitResult reads as "aiming at the sky" and
 		// disqualifies every placement with InvalidAimLocation (live-verify). Trace straight down at
-		// the target's X/Y (starting just above it, so a roof over the player doesn't win) and feed
-		// the actual ground/floor hit; that also grounds Z, and slopes behave like the build gun.
+		// the target's X/Y on the game's OWN build-gun channel (a WorldStatic object trace missed the
+		// terrain — live-verify round 2) and feed the actual ground/floor hit; that grounds Z, and
+		// slopes behave like the build gun. Pawns are ignored so a player standing on a tile doesn't
+		// become its "ground".
 		FHitResult Hit(ForceInit);
 		bool bHaveHit = false;
 		if (UWorld* World = Hologram->GetWorld())
@@ -174,8 +183,11 @@ namespace
 			const FVector End = Target - FVector(0.0, 0.0, 10000.0);   // down to 100 m below
 			FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAPlacementTrace), /*bTraceComplex*/ false);
 			Params.AddIgnoredActor(Hologram);
-			bHaveHit = World->LineTraceSingleByObjectType(Hit, Start, End,
-				FCollisionObjectQueryParams(ECC_WorldStatic), Params);
+			for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+			{
+				if (APawn* Pawn = It->Get() ? It->Get()->GetPawn() : nullptr) { Params.AddIgnoredActor(Pawn); }
+			}
+			bHaveHit = World->LineTraceSingleByChannel(Hit, Start, End, AIDABuildGunChannel, Params);
 		}
 		if (!bHaveHit)
 		{
@@ -265,6 +277,46 @@ bool FAIDAActionSeam::ResolveBuildRecipe(UObject* WorldContext, const FString& D
 	Out.RecipeClassPath = Chosen->Recipe->GetPathName();
 	Out.DisplayName = Chosen->Name;
 	ResolveFootprint(Chosen->Descriptor, Out.FootprintXM, Out.FootprintYM);
+	return true;
+}
+
+bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& PlayerId, FVector& OutPointCm)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World || PlayerId == TEXT("debug")) { return false; }
+
+	// Same identity convention as the orchestrator's location resolver: the listen-server host's
+	// net id resolves to null → an empty id string matches the empty-id controller.
+	APlayerController* Requester = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		APlayerState* PS = PC ? PC->PlayerState : nullptr;
+		if (!PS) { continue; }
+		const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
+		const FString Id = NetId.IsValid() ? NetId->ToString() : FString();
+		if (Id == PlayerId)
+		{
+			Requester = PC;
+			break;
+		}
+	}
+	if (!Requester) { return false; }
+
+	FVector ViewLocation;
+	FRotator ViewRotation;
+	Requester->GetPlayerViewPoint(ViewLocation, ViewRotation);
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAAimTrace), /*bTraceComplex*/ false);
+	if (APawn* Pawn = Requester->GetPawn()) { Params.AddIgnoredActor(Pawn); }
+
+	// The build gun's own channel and roughly its reach (150 m) — "there" means what they can see.
+	FHitResult Hit;
+	if (!World->LineTraceSingleByChannel(Hit, ViewLocation, ViewLocation + ViewRotation.Vector() * 15000.0, AIDABuildGunChannel, Params))
+	{
+		return false;
+	}
+	OutPointCm = Hit.ImpactPoint;
 	return true;
 }
 

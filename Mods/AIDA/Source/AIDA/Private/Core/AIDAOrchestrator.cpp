@@ -100,8 +100,8 @@ namespace
 		"World-modifying proposal tools (only registered when the server enables them):\n"
 		"- propose_build(spec): propose placing buildables on a snapped grid. NOTHING is built until a "
 		"player with act permission approves the proposal. Only call it when the player explicitly asks "
-		"you to build/place something. Omit the spec's 'origin' to build at the player's position ('here', "
-		"'at my position', or no location given) — you never need to ask for coordinates. On success, "
+		"you to build/place something. Omit the spec's 'origin' to build where the player is aiming ('here', "
+		"'there', 'at my position', or no location given) — you never need to ask for coordinates. On success, "
 		"relay the returned summary + cost and say it awaits approval; on a tool error (invalid placement, "
 		"cost, cap), revise the spec or explain the reason. Never claim something was built until "
 		"get_proposal_status says executed.\n"
@@ -898,7 +898,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}}. OMIT origin to build at the requesting player's position — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps."),
+		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}}. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -914,15 +914,24 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
-			// No origin = "at the requesting player" — the same location plumbing tag_node uses.
+			// No origin = "where the requesting player is aiming" (build-gun trace), falling back to
+			// their position — players mean "build it THERE", and it keeps the grid off their feet.
 			if (!Spec.bHasOrigin)
 			{
-				if (!Ctx.bHasLocation)
+				FVector AimCm;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				{
+					Spec.OriginM = AimCm / 100.0; // world cm -> spec metres
+				}
+				else if (Ctx.bHasLocation)
+				{
+					Spec.OriginM = Ctx.Location / 100.0;
+				}
+				else
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-						TEXT("couldn't resolve the requesting player's position — pass an explicit 'origin' {x,y in metres}"), {}));
+						TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'origin' {x,y in metres}"), {}));
 				}
-				Spec.OriginM = Ctx.Location / 100.0; // world cm -> spec metres
 				Spec.bHasOrigin = true;
 
 				// Write the resolved origin back into the stored/journaled spec — the record (and any
@@ -1013,15 +1022,24 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
-			// No center = "around the requesting player", mirroring propose_build's origin default.
+			// No center = "around where the requesting player is aiming", falling back to their
+			// position — mirroring propose_build's origin default.
 			if (!Selector.bHasCenter)
 			{
-				if (!Ctx.bHasLocation)
+				FVector AimCm;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				{
+					Selector.CenterM = AimCm / 100.0; // world cm -> spec metres
+				}
+				else if (Ctx.bHasLocation)
+				{
+					Selector.CenterM = Ctx.Location / 100.0;
+				}
+				else
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-						TEXT("couldn't resolve the requesting player's position — pass an explicit 'center' {x,y in metres}"), {}));
+						TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'center' {x,y in metres}"), {}));
 				}
-				Selector.CenterM = Ctx.Location / 100.0; // world cm -> spec metres
 				Selector.bHasCenter = true;
 
 				// The engine RE-PARSES this stored selector at approval to re-resolve targets — it has
