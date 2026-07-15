@@ -55,6 +55,13 @@ public:
 
 	/** Recent transcript for a late-joining client. */
 	void GetRecentTranscript(TArray<FAIDATranscriptEntry>& OutEntries) const;
+
+	/**
+	 * Approve/reject a pending proposal on behalf of a player (docs/PHASE4.md §4b). Enforces BOTH
+	 * gates server-side — the act tier and the actions.approvalPolicy — before touching the engine;
+	 * denials post a System chat line and log the player id. The UI's buttons are cosmetic.
+	 */
+	void HandleProposalDecision(const FAIDARequester& Requester, const FGuid& ProposalId, bool bApprove);
 	//~ End server API
 
 private:
@@ -71,6 +78,13 @@ private:
 	/** Register the class, then (server) spawn + cache the relay and hand it to the session manager. */
 	void RegisterRelay();
 	AAIDAChatRelay* GetRelay();
+	class AAIDAProposalRelay* GetProposalRelay();
+
+	/** Push one proposal's current state to the replicated view (docs/PHASE4.md §4a). Server-only. */
+	void PublishProposal(const FGuid& ProposalId);
+
+	/** Post a System line to the shared default conversation (proposal announcements/outcomes). */
+	void AnnounceSystem(const FString& Text);
 
 	/** Kick off the streaming LLM reply (through the tool loop) for an accepted request in a conversation. */
 	void StartAIDAReply(const FAIDARequester& Requester, const FGuid& ConversationId);
@@ -167,6 +181,7 @@ private:
 	TSharedPtr<FLLMClient> LLMClient;
 	TUniquePtr<FAIDASessionManager> Session;
 	TWeakObjectPtr<AAIDAChatRelay> Relay;
+	TWeakObjectPtr<class AAIDAProposalRelay> ProposalRelay;
 	FAIDARateLimiter RateLimiter;
 	FAIDAPermissionService Permissions;
 	FAIDAToolRegistry Tools;

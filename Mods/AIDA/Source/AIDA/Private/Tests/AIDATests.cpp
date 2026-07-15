@@ -1550,9 +1550,20 @@ bool FAIDAActionsProposalStoreTest::RunTest(const FString&)
 	}
 	TestEqual(TEXT("C still pending"), Store.NumPending(), 1);
 
-	// Terminal classification + retirement.
+	// Terminal classification + ResolvedUtc stamping (drives the UI linger/retire window).
 	TestTrue(TEXT("Expired is terminal"), FAIDAProposalStore::IsTerminal(EAIDAProposalState::Expired));
 	TestFalse(TEXT("Executing is not terminal"), FAIDAProposalStore::IsTerminal(EAIDAProposalState::Executing));
+	if (Expired.Num() == 1)
+	{
+		TestEqual(TEXT("expiry stamps ResolvedUtc"), Store.Find(Expired[0])->ResolvedUtc, static_cast<int64>(T0 + 600));
+	}
+	FAIDAProposal D; D.Summary = TEXT("d");
+	TestTrue(TEXT("add D"), Store.Add(D, T0 + 700, 2, Error));
+	{
+		const FGuid DId = Store.All().FindByPredicate([](const FAIDAProposal& P) { return P.Summary == TEXT("d"); })->Id;
+		Store.Transition(DId, EAIDAProposalState::Rejected, T0 + 800);
+		TestEqual(TEXT("terminal transition stamps ResolvedUtc"), Store.Find(DId)->ResolvedUtc, static_cast<int64>(T0 + 800));
+	}
 	Store.Remove(Id);
 	TestTrue(TEXT("removed"), Store.Find(Id) == nullptr);
 	return true;

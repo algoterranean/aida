@@ -36,6 +36,17 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerRequestRecentTranscript();
 
+	/**
+	 * Client→server: approve/reject a pending proposal by id ONLY — never a spec; the server
+	 * executes what IT stored (docs/PHASE4.md §1). Both gates (act tier + approvalPolicy) are
+	 * enforced server-side in the orchestrator; the UI's buttons are cosmetic.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerApproveProposal(const FGuid& ProposalId);
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRejectProposal(const FGuid& ProposalId);
+
 	/** Server→owning client: authoritative body for a single message. */
 	UFUNCTION(Client, Reliable)
 	void ClientReceiveMessageBody(FAIDATranscriptEntry Entry);
@@ -45,6 +56,9 @@ public:
 	void ClientReceiveTranscript(const TArray<FAIDATranscriptEntry>& Entries);
 
 private:
+	/** The calling player's display name + stable id (shared by the chat and proposal RPCs). */
+	FAIDARequester ResolveRequester() const;
+
 	/** Required for the RCO's replication channel to open. */
 	UPROPERTY(Replicated)
 	int32 DummyReplicatedField = 0;

@@ -85,26 +85,7 @@ void UAIDARemoteCallObject::ServerSendChat_Implementation(const FString& Text, c
 	}
 	if (UAIDAOrchestrator* Orchestrator = World->GetSubsystem<UAIDAOrchestrator>())
 	{
-		FAIDARequester Requester;
-		if (const AFGPlayerController* PC = GetOwnerPlayerController())
-		{
-			if (const APlayerState* PS = PC->PlayerState)
-			{
-				Requester.Author = PS->GetPlayerName();
-				// NOTE: FUniqueNetIdRepl::IsValid() can be true while the resolved id pointer is null
-				// (e.g. the listen-server host), so dereferencing it with -> crashes. Check the shared
-				// pointer itself before calling ToString().
-				if (const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId())
-				{
-					Requester.PlayerId = NetId->ToString();
-				}
-			}
-		}
-		if (Requester.Author.IsEmpty())
-		{
-			Requester.Author = TEXT("Player");
-		}
-		Orchestrator->HandleChatRequest(Requester, Text, ConversationId);
+		Orchestrator->HandleChatRequest(ResolveRequester(), Text, ConversationId);
 	}
 	else
 	{
@@ -155,6 +136,57 @@ void UAIDARemoteCallObject::ServerRequestRecentTranscript_Implementation()
 			ClientReceiveTranscript(Entries);
 		}
 	}
+}
+
+bool UAIDARemoteCallObject::ServerApproveProposal_Validate(const FGuid& ProposalId)
+{
+	return ProposalId.IsValid();
+}
+
+void UAIDARemoteCallObject::ServerApproveProposal_Implementation(const FGuid& ProposalId)
+{
+	UWorld* World = GetWorld();
+	if (UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr)
+	{
+		Orchestrator->HandleProposalDecision(ResolveRequester(), ProposalId, /*bApprove*/ true);
+	}
+}
+
+bool UAIDARemoteCallObject::ServerRejectProposal_Validate(const FGuid& ProposalId)
+{
+	return ProposalId.IsValid();
+}
+
+void UAIDARemoteCallObject::ServerRejectProposal_Implementation(const FGuid& ProposalId)
+{
+	UWorld* World = GetWorld();
+	if (UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr)
+	{
+		Orchestrator->HandleProposalDecision(ResolveRequester(), ProposalId, /*bApprove*/ false);
+	}
+}
+
+FAIDARequester UAIDARemoteCallObject::ResolveRequester() const
+{
+	FAIDARequester Requester;
+	if (const AFGPlayerController* PC = GetOwnerPlayerController())
+	{
+		if (const APlayerState* PS = PC->PlayerState)
+		{
+			Requester.Author = PS->GetPlayerName();
+			// NOTE: FUniqueNetIdRepl::IsValid() can be true while the resolved id pointer is null
+			// (e.g. the listen-server host) — check the shared pointer before ToString().
+			if (const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId())
+			{
+				Requester.PlayerId = NetId->ToString();
+			}
+		}
+	}
+	if (Requester.Author.IsEmpty())
+	{
+		Requester.Author = TEXT("Player");
+	}
+	return Requester;
 }
 
 //~ ─────────────────────────── Server → client ───────────────────────────

@@ -2,7 +2,10 @@
 
 #include "AIDA.h"
 #include "Net/AIDAChatRelay.h"
+#include "Net/AIDAProposalRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
+#include "Components/VerticalBox.h"
+#include "Components/VerticalBoxSlot.h"
 #include "Components/Border.h"
 #include "Components/Button.h"
 #include "Components/CanvasPanel.h"
@@ -137,18 +140,28 @@ void UAIDAChatWidget::NativeConstruct()
 		}
 	}
 
+	// Proposal card (Phase 4): top of the unused right half, collapsed until a proposal is pending.
+	BuildProposalPanel(GameFont, FontSize);
+
 	// Create the default conversation tab and render it (more tabs appear as conversations arrive).
 	EnsureConversation(CurrentConversationId);
 	RenderActiveConversation();
 
-	// The relay is a replicated actor and may not have arrived on this client yet — retry until it has.
-	if (!TryBindRelay())
+	// The relays are replicated actors and may not have arrived on this client yet — retry until both have.
+	const bool bChatBound = TryBindRelay();
+	const bool bProposalsBound = TryBindProposalRelay();
+	if (!bChatBound || !bProposalsBound)
 	{
 		if (UWorld* World = GetWorld())
 		{
 			World->GetTimerManager().SetTimer(
 				BindRetryTimer,
-				FTimerDelegate::CreateWeakLambda(this, [this]() { if (TryBindRelay()) { GetWorld()->GetTimerManager().ClearTimer(BindRetryTimer); } }),
+				FTimerDelegate::CreateWeakLambda(this, [this]()
+				{
+					const bool bChat = TryBindRelay();
+					const bool bProposals = TryBindProposalRelay();
+					if (bChat && bProposals) { GetWorld()->GetTimerManager().ClearTimer(BindRetryTimer); }
+				}),
 				0.5f, /*bLoop=*/true);
 		}
 	}
@@ -208,6 +221,148 @@ void UAIDAChatWidget::UnbindRelay()
 		R->OnMsgEnd.RemoveDynamic(this, &UAIDAChatWidget::HandleMsgEnd);
 	}
 	Relay.Reset();
+
+	if (AAIDAProposalRelay* PR = ProposalRelay.Get())
+	{
+		PR->OnProposalsChanged.RemoveDynamic(this, &UAIDAChatWidget::HandleProposalsChanged);
+	}
+	ProposalRelay.Reset();
+}
+
+bool UAIDAChatWidget::TryBindProposalRelay()
+{
+	if (ProposalRelay.IsValid())
+	{
+		return true;
+	}
+	UWorld* World = GetWorld();
+	USubsystemActorManager* Mgr = World ? World->GetSubsystem<USubsystemActorManager>() : nullptr;
+	AAIDAProposalRelay* Found = Mgr ? Mgr->GetSubsystemActor<AAIDAProposalRelay>() : nullptr;
+	if (!Found)
+	{
+		return false;
+	}
+
+	ProposalRelay = Found;
+	Found->OnProposalsChanged.AddDynamic(this, &UAIDAChatWidget::HandleProposalsChanged);
+	HandleProposalsChanged(); // render whatever replicated before we bound (late join)
+	UE_LOG(LogAIDA, Verbose, TEXT("[widget] bound to proposal relay."));
+	return true;
+}
+
+void UAIDAChatWidget::BuildProposalPanel(UFont* GameFont, float FontSize)
+{
+	UPanelWidget* RootPanel = Cast<UPanelWidget>(GetRootWidget());
+	if (!RootPanel || !WidgetTree)
+	{
+		return;
+	}
+
+	// Dark card anchored to the top of the right half (the chat window occupies the left half).
+	ProposalPanel = WidgetTree->ConstructWidget<UBorder>();
+	ProposalPanel->SetBrushColor(FLinearColor(0.f, 0.f, 0.f, 0.55f));
+	ProposalPanel->SetPadding(FMargin(12.f));
+	ProposalPanel->SetVisibility(ESlateVisibility::Collapsed);
+	if (UCanvasPanelSlot* CardSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(ProposalPanel)))
+	{
+		// X stretches across the right half (margins 0); Y is a point anchor with a fixed card height.
+		CardSlot->SetAnchors(FAnchors(0.55f, 0.f, 0.98f, 0.f));
+		CardSlot->SetOffsets(FMargin(0.f, 20.f, 0.f, 170.f));
+	}
+
+	UVerticalBox* Column = WidgetTree->ConstructWidget<UVerticalBox>();
+	ProposalPanel->AddChild(Column);
+
+	const auto MakeText = [this, GameFont](const FString& Text, float Size, const FLinearColor& Color) -> UTextBlock*
+	{
+		UTextBlock* Block = WidgetTree->ConstructWidget<UTextBlock>();
+		Block->SetText(FText::FromString(Text));
+		FSlateFontInfo Font = GameFont ? FSlateFontInfo(GameFont, static_cast<int32>(Size)) : Block->GetFont();
+		Font.Size = Size;
+		Font.OutlineSettings.OutlineSize = 0;
+		Font.OutlineSettings.OutlineColor = FLinearColor::Transparent;
+		Block->SetFont(Font);
+		Block->SetColorAndOpacity(FSlateColor(Color));
+		Block->SetAutoWrapText(true);
+		return Block;
+	};
+
+	// Title, body, then the Approve / Reject row.
+	Column->AddChildToVerticalBox(MakeText(TEXT("AIDA proposal"), FontSize + 2.f, FLinearColor(1.0f, 0.85f, 0.4f, 1.0f)));
+
+	ProposalText = MakeText(FString(), FontSize, FLinearColor::White);
+	if (UVerticalBoxSlot* BodySlot = Column->AddChildToVerticalBox(ProposalText))
+	{
+		BodySlot->SetPadding(FMargin(0.f, 6.f, 0.f, 8.f));
+	}
+
+	UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>();
+	Column->AddChildToVerticalBox(Row);
+
+	ApproveButton = WidgetTree->ConstructWidget<UButton>();
+	ApproveButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleApproveClicked);
+	ApproveButton->SetBackgroundColor(FLinearColor(0.25f, 0.6f, 0.25f, 1.0f));
+	ApproveButton->AddChild(MakeText(TEXT("Approve"), FontSize, FLinearColor::White));
+	if (UHorizontalBoxSlot* ASlot = Row->AddChildToHorizontalBox(ApproveButton))
+	{
+		ASlot->SetPadding(FMargin(0.f, 0.f, 8.f, 0.f));
+	}
+
+	RejectButton = WidgetTree->ConstructWidget<UButton>();
+	RejectButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleRejectClicked);
+	RejectButton->SetBackgroundColor(FLinearColor(0.6f, 0.25f, 0.25f, 1.0f));
+	RejectButton->AddChild(MakeText(TEXT("Reject"), FontSize, FLinearColor::White));
+	Row->AddChildToHorizontalBox(RejectButton);
+}
+
+void UAIDAChatWidget::HandleProposalsChanged()
+{
+	if (!ProposalPanel || !ProposalText)
+	{
+		return;
+	}
+
+	// v1 shows one card: the oldest still-pending proposal. Outcomes land as System chat lines,
+	// so a resolved proposal simply collapses the card (docs/PHASE4.md §4c).
+	const AAIDAProposalRelay* R = ProposalRelay.Get();
+	TArray<FAIDAProposalView> Views;
+	if (R)
+	{
+		R->GetProposals(Views);
+	}
+	const FAIDAProposalView* Pending = Views.FindByPredicate(
+		[](const FAIDAProposalView& View) { return View.State == TEXT("pending"); });
+	if (!Pending)
+	{
+		ShownProposalId.Invalidate();
+		ProposalPanel->SetVisibility(ESlateVisibility::Collapsed);
+		return;
+	}
+
+	ShownProposalId = Pending->Id;
+	FString Body = FString::Printf(TEXT("%s (proposed for %s)"), *Pending->Summary, *Pending->Requester);
+	if (!Pending->CostSummary.IsEmpty())
+	{
+		Body += FString::Printf(TEXT("\nCost: %s"), *Pending->CostSummary);
+	}
+	ProposalText->SetText(FText::FromString(Body));
+	ProposalPanel->SetVisibility(ESlateVisibility::Visible);
+}
+
+void UAIDAChatWidget::HandleApproveClicked()
+{
+	if (AAIDAProposalRelay* R = ProposalRelay.Get(); R && ShownProposalId.IsValid())
+	{
+		R->Approve(ShownProposalId);
+	}
+}
+
+void UAIDAChatWidget::HandleRejectClicked()
+{
+	if (AAIDAProposalRelay* R = ProposalRelay.Get(); R && ShownProposalId.IsValid())
+	{
+		R->Reject(ShownProposalId);
+	}
 }
 
 void UAIDAChatWidget::FocusInput()

@@ -8,6 +8,8 @@
 #include "AIDAChatWidget.generated.h"
 
 class AAIDAChatRelay;
+class AAIDAProposalRelay;
+class UBorder;
 class UEditableTextBox;
 class UHorizontalBox;
 class URichTextBlock;
@@ -178,4 +180,38 @@ private:
 	void HandleTabClicked(const FGuid& ConvId);
 	UFUNCTION()
 	void HandleNewTabClicked();
+
+	//~ Proposal panel (Phase 4 Slice 3) — constructed in C++ like the tab bar, so the BP needs no
+	//~ changes. Shows the first pending proposal (summary + cost + Approve/Reject); collapsed when
+	//~ none is pending. Buttons are cosmetic — the server enforces both approval gates.
+	UPROPERTY(Transient)
+	TWeakObjectPtr<AAIDAProposalRelay> ProposalRelay;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UBorder> ProposalPanel;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> ProposalText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> ApproveButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> RejectButton;
+
+	/** The proposal the panel currently shows (what Approve/Reject act on). */
+	FGuid ShownProposalId;
+
+	/** Build the (initially collapsed) proposal card into the root canvas. */
+	void BuildProposalPanel(UFont* GameFont, float FontSize);
+
+	/** Locate the proposal relay and bind its change delegate (shares the chat relay's retry timer). */
+	bool TryBindProposalRelay();
+
+	UFUNCTION()
+	void HandleProposalsChanged();
+	UFUNCTION()
+	void HandleApproveClicked();
+	UFUNCTION()
+	void HandleRejectClicked();
 };

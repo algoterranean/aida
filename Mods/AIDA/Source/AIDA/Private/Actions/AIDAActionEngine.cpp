@@ -43,7 +43,7 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 		}
 		if (!AIDAActionSpec::ParseDismantleSpec(SpecObj, Config.MaxProposalItems, Selector, ParseError))
 		{
-			ProposalStore.Transition(Id, EAIDAProposalState::Rejected);
+			ProposalStore.Transition(Id, EAIDAProposalState::Rejected, FDateTime::UtcNow().ToUnixTimestamp());
 			OutMessage = FString::Printf(TEXT("stored selector no longer parses (%s) — proposal rejected"), *ParseError);
 			return false;
 		}
@@ -52,7 +52,7 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 		FAIDAActionSeam::ResolveDismantleHandles(WorldContext, Selector, Handles);
 		if (Handles.Num() == 0)
 		{
-			ProposalStore.Transition(Id, EAIDAProposalState::Rejected);
+			ProposalStore.Transition(Id, EAIDAProposalState::Rejected, FDateTime::UtcNow().ToUnixTimestamp());
 			OutMessage = TEXT("nothing left matching the selector — proposal rejected");
 			return false;
 		}
@@ -97,7 +97,7 @@ bool FAIDAActionEngine::Reject(const FGuid& Id, const FString& ApproverId, FStri
 		return false;
 	}
 	Proposal->ApproverId = ApproverId;
-	ProposalStore.Transition(Id, EAIDAProposalState::Rejected);
+	ProposalStore.Transition(Id, EAIDAProposalState::Rejected, FDateTime::UtcNow().ToUnixTimestamp());
 	OutMessage = FString::Printf(TEXT("rejected — %s"), *Proposal->Summary);
 	UE_LOG(LogAIDA, Log, TEXT("[actions] %s rejected by %s."), *Id.ToString(EGuidFormats::DigitsWithHyphens), *ApproverId);
 	return true;
@@ -146,12 +146,13 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	}
 
 	// The persistent record undo works from (docs/PHASE4.md §2d).
+	const int64 NowUtc = FDateTime::UtcNow().ToUnixTimestamp();
 	FAIDAJournalEntry Entry;
 	Entry.ProposalSpecJson = Proposal.SpecJson;
 	Entry.RequesterId = Proposal.RequesterId;
 	Entry.ApproverId = Proposal.ApproverId;
 	Entry.ProposedUtc = Proposal.ProposedUtc;
-	Entry.ExecutedUtc = FDateTime::UtcNow().ToUnixTimestamp();
+	Entry.ExecutedUtc = NowUtc;
 	Entry.AffectedEntityIds = Proposal.AffectedEntityIds;
 	Entry.RefundJson = AIDAActionSpec::CostItemsToJson(Proposal.bDismantle ? AccruedRefund : Proposal.Cost);
 	Entry.bDismantle = Proposal.bDismantle;
@@ -162,7 +163,7 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 		SessionActors.Add(JournalId, BuiltActors);
 	}
 
-	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed);
+	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed, NowUtc);
 
 	const int32 Affected = Proposal.AffectedEntityIds.Num();
 	if (Proposal.bDismantle)

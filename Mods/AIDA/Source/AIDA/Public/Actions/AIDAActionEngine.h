@@ -24,6 +24,9 @@ public:
 
 	bool IsExecuting() const { return ExecutingId.IsValid(); }
 
+	/** The proposal currently executing (invalid when idle) — capture before Tick to publish outcomes. */
+	const FGuid& CurrentExecutingId() const { return ExecutingId; }
+
 	/**
 	 * Approve a pending proposal and start execution: dismantles re-resolve their targets fresh
 	 * (never trusted from the dry-run); builds pay their whole cost upfront from central storage

@@ -25,8 +25,9 @@ public:
 	 * Move a proposal to NewState if the transition is legal (docs/PHASE4.md §2c):
 	 * Pending → Approved/Rejected/Expired; Approved → Executing; Executing → Executed/Failed;
 	 * Executed → Undone. Anything else returns false and leaves the proposal untouched.
+	 * NowUtc stamps ResolvedUtc when the new state is terminal (drives the UI linger/retire).
 	 */
-	bool Transition(const FGuid& Id, EAIDAProposalState NewState);
+	bool Transition(const FGuid& Id, EAIDAProposalState NewState, int64 NowUtc = 0);
 
 	static bool IsLegalTransition(EAIDAProposalState From, EAIDAProposalState To);
 

@@ -14,6 +14,7 @@
 #include "Actions/AIDAActionSeam.h"
 #include "Memory/AIDAMemoryStore.h"
 #include "Net/AIDAChatRelay.h"
+#include "Net/AIDAProposalRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -213,6 +214,7 @@ void UAIDAOrchestrator::RegisterRelayClass()
 	// SpawnOnServer_Replicate: spawns immediately on the server, only registers the class on
 	// clients (so the manager records the replicated actor when it lands — see header note).
 	Mgr->RegisterSubsystemActor(AAIDAChatRelay::StaticClass());
+	Mgr->RegisterSubsystemActor(AAIDAProposalRelay::StaticClass());
 
 	// The in-save memory store (Phase 3). SpawnOnServer, not replicated — persists via IFGSaveInterface;
 	// only the server touches it. Bind the memory facade to it (mints/reads the session GUID).
@@ -247,6 +249,26 @@ void UAIDAOrchestrator::RegisterRelay()
 	RegisterRelayClass();
 	AAIDAChatRelay* R = GetRelay(); // cache + hand it to the session manager (server: spawned above)
 	UE_LOG(LogAIDA, Log, TEXT("Relay registered (server spawn %s)."), R ? TEXT("OK") : TEXT("PENDING"));
+}
+
+AAIDAProposalRelay* UAIDAOrchestrator::GetProposalRelay()
+{
+	if (ProposalRelay.IsValid())
+	{
+		return ProposalRelay.Get();
+	}
+	if (UWorld* World = GetWorld())
+	{
+		if (USubsystemActorManager* Mgr = World->GetSubsystem<USubsystemActorManager>())
+		{
+			if (AAIDAProposalRelay* R = Mgr->GetSubsystemActor<AAIDAProposalRelay>())
+			{
+				ProposalRelay = R;
+				return R;
+			}
+		}
+	}
+	return nullptr;
 }
 
 AAIDAChatRelay* UAIDAOrchestrator::GetRelay()
@@ -698,13 +720,129 @@ void UAIDAOrchestrator::RegisterTools()
 	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
 }
 
+namespace
+{
+	/** How long a resolved (terminal) proposal lingers in the replicated view before retiring. */
+	constexpr int64 kProposalLingerSeconds = 60;
+
+	FString AIDACostSummaryString(const TArray<FAIDACostItem>& Items)
+	{
+		FString Out;
+		for (const FAIDACostItem& Item : Items)
+		{
+			Out += FString::Printf(TEXT("%s%d %s"), Out.IsEmpty() ? TEXT("") : TEXT(", "), Item.Amount, *Item.Item);
+		}
+		return Out;
+	}
+}
+
 void UAIDAOrchestrator::SweepProposals()
 {
 	const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 	for (const FGuid& Id : Actions.Store().SweepExpired(Now, Config.Actions.TtlSeconds))
 	{
 		UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s expired unapproved."), *Id.ToString(EGuidFormats::DigitsWithHyphens));
+		PublishProposal(Id);
 	}
+
+	// Retire resolved proposals once their linger window closes: drop them from the store AND the view.
+	for (const FAIDAProposal& Proposal : Actions.Store().All())
+	{
+		if (FAIDAProposalStore::IsTerminal(Proposal.State) &&
+			Proposal.ResolvedUtc > 0 && Now - Proposal.ResolvedUtc > kProposalLingerSeconds)
+		{
+			Actions.Store().Remove(Proposal.Id);
+			if (AAIDAProposalRelay* R = GetProposalRelay())
+			{
+				R->ServerRemoveProposal(Proposal.Id);
+			}
+		}
+	}
+}
+
+void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
+{
+	AAIDAProposalRelay* R = GetProposalRelay();
+	const FAIDAProposal* Proposal = Actions.Store().Find(ProposalId);
+	if (!R || !Proposal)
+	{
+		return;
+	}
+
+	FAIDAProposalView View;
+	View.Id = Proposal->Id;
+	View.Requester = Proposal->RequesterName;
+	View.Summary = Proposal->Summary;
+	View.CostSummary = AIDACostSummaryString(Proposal->Cost);
+	View.State = AIDAActionSpec::StateToString(Proposal->State);
+	View.ExpiresUtc = Proposal->State == EAIDAProposalState::Pending
+		? Proposal->ProposedUtc + Config.Actions.TtlSeconds : 0;
+	R->ServerUpsertProposal(View);
+}
+
+void UAIDAOrchestrator::AnnounceSystem(const FString& Text)
+{
+	if (Session.IsValid() && !Text.IsEmpty())
+	{
+		Session->PostSystemMessage(Text, AIDADefaultConversationId());
+	}
+}
+
+void UAIDAOrchestrator::HandleProposalDecision(const FAIDARequester& Requester, const FGuid& ProposalId, bool bApprove)
+{
+	// Authority-only, like HandleChatRequest — this mutates the world / replicated state.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		return;
+	}
+
+	const TCHAR* Verb = bApprove ? TEXT("approve") : TEXT("reject");
+
+	// Gate 1: the act tier ("may this player pull triggers at all").
+	if (!Permissions.IsAllowed(EAIDATier::Act, Requester.PlayerId))
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] %s (%s) may not %s proposals (act tier denied)."),
+			*Requester.Author, *Requester.PlayerId, Verb);
+		AnnounceSystem(FString::Printf(TEXT("%s isn't allowed to %s AIDA proposals (act permission)."), *Requester.Author, Verb));
+		return;
+	}
+
+	// Gate 2: the approval policy ("who may decide THIS proposal").
+	const FAIDAProposal* Proposal = Actions.Store().Find(ProposalId);
+	const FString& Policy = Config.Actions.ApprovalPolicy;
+	bool bPolicyOk = Policy == TEXT("any-act");
+	if (Policy == TEXT("requester"))
+	{
+		bPolicyOk = Proposal && Proposal->RequesterId == Requester.PlayerId;
+	}
+	else if (Policy == TEXT("list"))
+	{
+		bPolicyOk = Config.Actions.ApprovalIds.Contains(Requester.PlayerId);
+	}
+	if (!bPolicyOk)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] %s (%s) blocked by approvalPolicy '%s'."),
+			*Requester.Author, *Requester.PlayerId, *Policy);
+		AnnounceSystem(FString::Printf(TEXT("%s can't %s this proposal (approval policy: %s)."), *Requester.Author, Verb, *Policy));
+		return;
+	}
+
+	FString Message;
+	if (bApprove)
+	{
+		if (Actions.Approve(this, Config.Actions, ProposalId, Requester.PlayerId, Message))
+		{
+			StartActionTimer();
+		}
+	}
+	else
+	{
+		Actions.Reject(ProposalId, Requester.PlayerId, Message);
+	}
+	PublishProposal(ProposalId);
+	AnnounceSystem(FString::Printf(TEXT("%s: %s"), *Requester.Author, *Message));
+	UE_LOG(LogAIDA, Log, TEXT("[actions] %s %s %s: %s"), *Requester.Author, Verb,
+		*ProposalId.ToString(EGuidFormats::DigitsWithHyphens), *Message);
 }
 
 void UAIDAOrchestrator::RegisterActionTools()
@@ -781,6 +919,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
 		}
@@ -837,6 +978,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — refunds %s. Awaiting approval."),
+				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, /*bAffordable*/ true, 0.0));
 		}
@@ -1048,12 +1192,14 @@ void UAIDAOrchestrator::ApproveCmd(const TArray<FString>& Args)
 		return;
 	}
 
-	// Console = host-side diagnostic; the RCO path adds the act-tier + approvalPolicy gates (Slice 3).
+	// Console = host-side diagnostic; the RCO path (HandleProposalDecision) adds both approval gates.
 	FString Message;
 	if (Actions.Approve(this, Config.Actions, Id, TEXT("console"), Message))
 	{
 		StartActionTimer();
 	}
+	PublishProposal(Id);
+	AnnounceSystem(FString::Printf(TEXT("console: %s"), *Message));
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Approve: %s"), *Message);
 }
 
@@ -1067,6 +1213,8 @@ void UAIDAOrchestrator::RejectCmd(const TArray<FString>& Args)
 	}
 	FString Message;
 	Actions.Reject(Id, TEXT("console"), Message);
+	PublishProposal(Id);
+	AnnounceSystem(FString::Printf(TEXT("console: %s"), *Message));
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Reject: %s"), *Message);
 }
 
@@ -1083,6 +1231,7 @@ void UAIDAOrchestrator::StartActionTimer()
 
 void UAIDAOrchestrator::OnActionTimer()
 {
+	const FGuid Executing = Actions.CurrentExecutingId(); // captured before Tick clears it on finish
 	if (Actions.Tick(this, Config.Actions, Memory))
 	{
 		return; // more batches to go
@@ -1097,6 +1246,16 @@ void UAIDAOrchestrator::OnActionTimer()
 	ActionTimer.Invalidate();
 	FactoryIndex.Invalidate();
 	MapService.Invalidate(); // dismantles can free resource nodes (extractor occupancy)
+
+	// Publish the outcome (executed/failed) + a System line so every client sees it land.
+	if (const FAIDAProposal* Proposal = Actions.Store().Find(Executing))
+	{
+		PublishProposal(Executing);
+		AnnounceSystem(FString::Printf(TEXT("AIDA %s: %s (%d entit%s affected)."),
+			Proposal->State == EAIDAProposalState::Executed ? TEXT("finished") : TEXT("stopped"),
+			*Proposal->Summary, Proposal->AffectedEntityIds.Num(),
+			Proposal->AffectedEntityIds.Num() == 1 ? TEXT("y") : TEXT("ies")));
+	}
 }
 
 void UAIDAOrchestrator::Propose(const TArray<FString>& Args)

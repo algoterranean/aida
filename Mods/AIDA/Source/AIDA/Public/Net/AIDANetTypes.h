@@ -61,6 +61,29 @@ struct FAIDATranscriptEntry
 };
 
 /**
+ * Client-facing view of one build/dismantle proposal (docs/PHASE4.md §2e). Replicated as a state
+ * array on AAIDAProposalRelay so late joiners see pending proposals for free. Carries display
+ * strings only — no spec JSON, no ids beyond the ProposalId the approve RPC echoes back.
+ */
+USTRUCT(BlueprintType)
+struct FAIDAProposalView
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FGuid Id;
+	/** Display name of the proposing player. */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString Requester;
+	/** Human diff line ("place 100 x Foundation 8m x 2m in a 10x10 grid"). */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString Summary;
+	/** "300 Concrete" (or the refund tally for a dismantle). */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString CostSummary;
+	/** Display state: "pending" | "approved" | "executing" | "executed" | "failed" | "rejected" | "expired" | "undone". */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString State;
+	/** Unix time the pending proposal expires (0 once resolved). */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") int64 ExpiresUtc = 0;
+};
+
+/**
  * Server-internal identity of a chat requester. Resolved in the Net/ layer (which owns the game
  * headers) and passed to the orchestrator so Core/ never touches FGPlayerController. Never replicated.
  */

@@ -140,6 +140,7 @@ struct FAIDAProposal
 	FString RequesterName;
 	FString ApproverId;
 	int64 ProposedUtc = 0;                 // TTL anchor
+	int64 ResolvedUtc = 0;                 // stamped on entering a terminal state (drives UI linger/retire)
 	EAIDAProposalState State = EAIDAProposalState::Pending;
 	TArray<FTransform> Placements;         // build: expanded + validated grid (world units)
 	int32 TargetCount = 0;                 // dismantle: matches found at dry-run (re-resolved at execute)

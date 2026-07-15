@@ -49,11 +49,12 @@ bool FAIDAProposalStore::IsTerminal(EAIDAProposalState State)
 		|| State == EAIDAProposalState::Undone;
 }
 
-bool FAIDAProposalStore::Transition(const FGuid& Id, EAIDAProposalState NewState)
+bool FAIDAProposalStore::Transition(const FGuid& Id, EAIDAProposalState NewState, int64 NowUtc)
 {
 	FAIDAProposal* Proposal = Proposals.Find(Id);
 	if (!Proposal || !IsLegalTransition(Proposal->State, NewState)) { return false; }
 	Proposal->State = NewState;
+	if (IsTerminal(NewState)) { Proposal->ResolvedUtc = NowUtc; }
 	return true;
 }
 
@@ -66,6 +67,7 @@ TArray<FGuid> FAIDAProposalStore::SweepExpired(int64 NowUtc, int32 TtlSeconds)
 		if (P.State == EAIDAProposalState::Pending && NowUtc >= P.ProposedUtc + TtlSeconds)
 		{
 			P.State = EAIDAProposalState::Expired;
+			P.ResolvedUtc = NowUtc;
 			Expired.Add(P.Id);
 		}
 	}
