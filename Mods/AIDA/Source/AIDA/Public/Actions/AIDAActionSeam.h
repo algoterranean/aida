@@ -37,10 +37,11 @@ public:
 	 * is placed at the player's aim hit (running the game's TrySnapToActor / world-grid snapping)
 	 * and its resulting position becomes the grid origin — so building "there" while aiming at an
 	 * existing structure extends it tile-perfectly instead of overlapping it slightly askew.
-	 * Falls back to the raw aim point when the hologram can't spawn.
+	 * InOutYawDeg goes in as the spec's yaw and comes back as the probe's SNAPPED yaw, so the whole
+	 * grid shares the aimed structure's lattice orientation. Falls back to the raw aim point.
 	 */
 	static bool ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
-		const FString& RecipeClassPath, int32 YawDeg, FVector& OutOriginCm);
+		const FString& RecipeClassPath, int32& InOutYawDeg, FVector& OutOriginCm);
 
 	/**
 	 * Ground height (cm) under a point, via the same build-gun-channel trace placements use.

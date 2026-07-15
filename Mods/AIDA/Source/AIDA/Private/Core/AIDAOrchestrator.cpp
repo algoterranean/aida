@@ -373,7 +373,7 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 			}
 			if (!Target.IsValid())
 			{
-				Session->PostSystemMessage(TEXT("No pending proposal to decide."), ConversationId);
+				Session->PostSystemMessage(TEXT("No pending proposal to decide. (Real proposals always get an 'AIDA proposes …' system line — if AIDA claimed one without it, it was mistaken; ask it to propose again.)"), ConversationId);
 				return;
 			}
 			HandleProposalDecision(Requester, Target, Command.Kind == FAIDAChatCommand::EKind::Approve);
@@ -963,9 +963,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (!Spec.bHasOrigin)
 			{
 				FVector AimCm;
-				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, Spec.YawDeg, AimCm))
+				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, /*InOut*/ Spec.YawDeg, AimCm))
 				{
-					Spec.OriginM = AimCm / 100.0; // world cm -> spec metres
+					Spec.OriginM = AimCm / 100.0; // world cm -> spec metres (yaw now carries the snapped orientation)
 				}
 				else if (Ctx.bHasLocation)
 				{

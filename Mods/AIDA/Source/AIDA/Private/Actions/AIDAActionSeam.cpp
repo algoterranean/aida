@@ -166,9 +166,12 @@ namespace
 	}
 
 	/** Position + validate the hologram at one placement; true when no blocking disqualifier remains.
-	 *  bVerboseLog dumps the full trace/hologram/disqualifier state (live-verify diagnostics). */
+	 *  InOutTemplateHit carries the last REAL hit across a grid: tiles hanging over a drop (no ground
+	 *  within trace range) borrow it — floating foundations are legal, and the hologram only needs a
+	 *  believable hit actor. bVerboseLog dumps the full trace/hologram/disqualifier state. */
 	bool PlaceAndValidate(AFGHologram* Hologram, const FTransform& Placement, UFGInventoryComponent* Inventory,
-		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr, bool bVerboseLog = false)
+		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr, bool bVerboseLog = false,
+		FHitResult* InOutTemplateHit = nullptr)
 	{
 		const FVector Target = Placement.GetLocation();
 
@@ -190,7 +193,7 @@ namespace
 			}
 
 			// First from just above the intended plane (so a roof over the area doesn't win) …
-			const FVector End = Target - FVector(0.0, 0.0, 10000.0);   // down to 100 m below
+			const FVector End = Target - FVector(0.0, 0.0, 50000.0);   // down to 500 m below (canyons)
 			bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 300.0), End, AIDABuildGunChannel, Params);
 			if (!bHaveHit)
 			{
@@ -199,6 +202,17 @@ namespace
 				// grid). Retry from 50 m up before giving up.
 				bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 5000.0), End, AIDABuildGunChannel, Params);
 			}
+		}
+		if (!bHaveHit && InOutTemplateHit && InOutTemplateHit->GetActor())
+		{
+			// Over a void (cliff edge inside the grid): borrow the last real hit — floating
+			// foundations are legal, the hologram only rejects hits without a plausible actor.
+			Hit = *InOutTemplateHit;
+			bHaveHit = true;
+		}
+		else if (bHaveHit && InOutTemplateHit)
+		{
+			*InOutTemplateHit = Hit;
 		}
 		if (bHaveHit)
 		{
@@ -393,7 +407,7 @@ bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& Play
 }
 
 bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
-	const FString& RecipeClassPath, int32 YawDeg, FVector& OutOriginCm)
+	const FString& RecipeClassPath, int32& InOutYawDeg, FVector& OutOriginCm)
 {
 	UWorld* World = ResolveWorld(WorldContext);
 	FHitResult Hit;
@@ -405,20 +419,22 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 
 	// Probe hologram at the REAL aim hit: UpdateHologramPlacement runs the game's snapping
 	// (TrySnapToActor against the aimed structure, world-grid alignment), and where the hologram
-	// lands is where the build gun would have put it — the grid origin players expect.
+	// lands — position AND rotation — is where the build gun would have put it. The snapped yaw
+	// becomes the grid's yaw so every row shares the aimed structure's lattice.
 	UClass* RecipeClass = FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>();
 	AFGHologram* Hologram = RecipeClass ? SpawnValidationHologram(World, RecipeClass, Hit.ImpactPoint) : nullptr;
 	if (!Hologram)
 	{
 		return true; // raw aim point is still a usable origin
 	}
-	Hologram->SetScrollRotateValue(YawDeg);
+	Hologram->SetScrollRotateValue(InOutYawDeg);
 	Hologram->UpdateHologramPlacement(Hit);
 	OutOriginCm = Hologram->GetActorLocation();
+	InOutYawDeg = FMath::RoundToInt32(Hologram->GetActorRotation().Yaw);
 	Hologram->Destroy();
 
-	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s"),
-		*Hit.ImpactPoint.ToCompactString(), *OutOriginCm.ToCompactString());
+	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s yaw=%d"),
+		*Hit.ImpactPoint.ToCompactString(), *OutOriginCm.ToCompactString(), InOutYawDeg);
 	return true;
 }
 
@@ -480,11 +496,12 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 		return false;
 	}
 
+	FHitResult TemplateHit;
 	for (int32 Index = 0; Index < Placements.Num(); ++Index)
 	{
 		TSubclassOf<UFGConstructDisqualifier> Blocking;
 		// Verbose diagnostics for the first placements only (a 200-tile grid must not spam the log).
-		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking, /*bVerboseLog*/ Index < 2))
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking, /*bVerboseLog*/ Index < 2, &TemplateHit))
 		{
 			FAIDAPlacementFailure Failure;
 			Failure.Index = Index;
@@ -708,6 +725,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		return OutSkipped;
 	}
 
+	FHitResult TemplateHit;
 	const int32 End = FMath::Min(Cursor + BatchSize, Placements.Num());
 	for (int32 Index = Cursor; Index < End; ++Index)
 	{
@@ -716,7 +734,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		if (!Hologram) { ++OutSkipped; continue; }
 
 		// Re-validate: the world may have changed since the dry-run (players build/walk around).
-		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory))
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, nullptr, false, &TemplateHit))
 		{
 			Hologram->Destroy();
 			++OutSkipped;
