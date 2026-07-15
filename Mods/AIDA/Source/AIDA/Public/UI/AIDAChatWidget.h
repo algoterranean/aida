@@ -46,6 +46,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AIDA")
 	void GetTranscript(TArray<FAIDATranscriptEntry>& OutEntries) const;
 
+	/** Put keyboard focus into the input box (used when the window is opened via the Ctrl+Enter keybind). */
+	void FocusInput();
+
 	/** The whole transcript rendered to a single display string ("Author: body" blocks). */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA")
 	FString RenderedTranscript;

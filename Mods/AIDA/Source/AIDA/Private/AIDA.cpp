@@ -5,9 +5,15 @@
 
 #include "Blueprint/UserWidget.h"
 #include "Engine/Engine.h"
+#include "Engine/Font.h"
 #include "Engine/World.h"
+#include "UObject/UObjectIterator.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/CoreDelegates.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "InputCoreTypes.h"
 #include "UObject/UObjectGlobals.h"
 
 DEFINE_LOG_CATEGORY(LogAIDA);
@@ -20,6 +26,23 @@ namespace
 	const TCHAR* GAIDAChatWidgetClassPath = TEXT("/AIDA/UI/WBP_AIDAChat.WBP_AIDAChat_C");
 
 	IConsoleCommand* GShowChatCommand = nullptr;
+	IConsoleCommand* GFontsCommand = nullptr;
+
+	/** `AIDA.Fonts` — log every loaded /Game/ font asset, to discover the game's chat font for styling. */
+	void DumpFonts(const TArray<FString>& /*Args*/, UWorld* /*World*/)
+	{
+		int32 Count = 0;
+		for (TObjectIterator<UFont> It; It; ++It)
+		{
+			const UFont* Font = *It;
+			if (Font && Font->GetPathName().StartsWith(TEXT("/Game/")))
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[fonts] %s"), *Font->GetPathName());
+				++Count;
+			}
+		}
+		UE_LOG(LogAIDA, Log, TEXT("[fonts] %d loaded /Game/ font(s). (Open the game chat once first if the chat font is missing.)"), Count);
+	}
 
 	/**
 	 * The widget currently shown by AIDA.ShowChat, keyed by world so a second invocation can toggle it
@@ -56,7 +79,7 @@ namespace
 	}
 
 	/** Create + show the chat widget in PC's viewport, tracked under World. */
-	void ShowChatForWorld(UWorld* World, APlayerController* PC)
+	void ShowChatForWorld(UWorld* World, APlayerController* PC, bool bFocusInput)
 	{
 		UClass* WidgetClass = LoadClass<UAIDAChatWidget>(nullptr, GAIDAChatWidgetClassPath);
 		if (!WidgetClass)
@@ -78,18 +101,22 @@ namespace
 		// Let the player click into the chat box while the game keeps running underneath.
 		PC->SetInputMode(FInputModeGameAndUI());
 		PC->bShowMouseCursor = true;
+
+		if (bFocusInput)
+		{
+			Widget->FocusInput();
+		}
 	}
 
 	/**
-	 * `AIDA.ShowChat` — client-side UI command. Toggles the WBP_AIDAChat widget in EVERY local
-	 * game/PIE viewport at once. Registered from module startup (not the orchestrator, which is idle
-	 * on client worlds) so any client can open it. Iterating all local world contexts — rather than
-	 * relying on the single UWorld the console happens to pass — makes it robust from either the
-	 * editor's Cmd box or a PIE window's own console, and in a 2-window listen-server PIE it opens
-	 * the widget in both the host and client windows from one invocation. In a packaged game there is
-	 * only one local world, so it simply toggles that one.
+	 * Toggle the WBP_AIDAChat widget in EVERY local game/PIE viewport at once (shared by the
+	 * `AIDA.ShowChat` console command and the Ctrl+Enter keybind). Iterating all local world contexts —
+	 * rather than the single UWorld the console happens to pass — makes it robust from the editor Cmd
+	 * box, a PIE window's console, or the global input pre-processor. In a packaged game there is only
+	 * one local world, so it simply toggles that one. bFocusInputOnShow puts the cursor in the input box
+	 * (used by the keybind so you can type immediately).
 	 */
-	void ShowChat(const TArray<FString>& Args, UWorld* /*ExecWorld*/)
+	void ToggleChatWidgets(bool bFocusInputOnShow)
 	{
 		if (!GEngine)
 		{
@@ -117,7 +144,7 @@ namespace
 
 		if (Targets.Num() == 0)
 		{
-			UE_LOG(LogAIDA, Warning, TEXT("AIDA.ShowChat: no local player viewport ready yet (start PIE first)."));
+			UE_LOG(LogAIDA, Warning, TEXT("AIDA chat: no local player viewport ready yet."));
 			return;
 		}
 
@@ -138,11 +165,50 @@ namespace
 			HideChatForWorld(T.Key); // clear any existing first (also resets input mode)
 			if (bShow)
 			{
-				ShowChatForWorld(T.Key, T.Value);
+				ShowChatForWorld(T.Key, T.Value, bFocusInputOnShow);
 			}
 		}
 
-		UE_LOG(LogAIDA, Log, TEXT("AIDA.ShowChat: %s in %d viewport(s)."), bShow ? TEXT("shown") : TEXT("hidden"), Targets.Num());
+		UE_LOG(LogAIDA, Log, TEXT("AIDA chat: %s in %d viewport(s)."), bShow ? TEXT("shown") : TEXT("hidden"), Targets.Num());
+	}
+
+	/** `AIDA.ShowChat` console command — toggles the window (no auto-focus; the console box has focus). */
+	void ShowChatConsole(const TArray<FString>& /*Args*/, UWorld* /*ExecWorld*/)
+	{
+		ToggleChatWidgets(/*bFocusInputOnShow=*/false);
+	}
+
+	/**
+	 * Global Slate input pre-processor: Ctrl+Enter toggles the AIDA window from anywhere (even while
+	 * playing) and drops the cursor straight into the input box. Enter then submits (the widget's own
+	 * OnTextCommitted). Runs ahead of game input, so it consumes the chord.
+	 */
+	class FAIDAChatInputProcessor : public IInputProcessor
+	{
+	public:
+		virtual void Tick(const float, FSlateApplication&, TSharedRef<ICursor>) override {}
+		virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& KeyEvent) override
+		{
+			if (KeyEvent.GetKey() == EKeys::Enter && KeyEvent.IsControlDown())
+			{
+				ToggleChatWidgets(/*bFocusInputOnShow=*/true);
+				return true; // consume so the game doesn't also act on the chord
+			}
+			return false;
+		}
+		virtual const TCHAR* GetDebugName() const override { return TEXT("AIDAChatInput"); }
+	};
+
+	TSharedPtr<FAIDAChatInputProcessor> GChatInputProcessor;
+
+	/** Register the Ctrl+Enter pre-processor once Slate is available (idempotent). */
+	void RegisterChatInputProcessor()
+	{
+		if (!GChatInputProcessor.IsValid() && FSlateApplication::IsInitialized())
+		{
+			GChatInputProcessor = MakeShared<FAIDAChatInputProcessor>();
+			FSlateApplication::Get().RegisterInputPreProcessor(GChatInputProcessor);
+		}
 	}
 }
 
@@ -159,8 +225,25 @@ void FAIDAModule::StartupModule()
 	GShowChatCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("AIDA.ShowChat"),
 		TEXT("Toggle the AIDA chat widget in the local player's viewport. Usage: AIDA.ShowChat"),
-		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ShowChat),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ShowChatConsole),
 		ECVF_Default);
+
+	GFontsCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Fonts"),
+		TEXT("Log loaded /Game/ font assets (to find the game chat font). Usage: AIDA.Fonts"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&DumpFonts),
+		ECVF_Default);
+
+	// Ctrl+Enter opens/closes the AIDA window from anywhere. Slate may not be up yet at module load,
+	// so register now if it is, otherwise once the engine finishes initializing.
+	if (FSlateApplication::IsInitialized())
+	{
+		RegisterChatInputProcessor();
+	}
+	else
+	{
+		FCoreDelegates::OnPostEngineInit.AddStatic(&RegisterChatInputProcessor);
+	}
 }
 
 void FAIDAModule::ShutdownModule()
@@ -169,6 +252,20 @@ void FAIDAModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GShowChatCommand);
 		GShowChatCommand = nullptr;
+	}
+	if (GFontsCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GFontsCommand);
+		GFontsCommand = nullptr;
+	}
+
+	if (GChatInputProcessor.IsValid())
+	{
+		if (FSlateApplication::IsInitialized())
+		{
+			FSlateApplication::Get().UnregisterInputPreProcessor(GChatInputProcessor);
+		}
+		GChatInputProcessor.Reset();
 	}
 
 	UAIDARemoteCallObject::UnregisterHooks();

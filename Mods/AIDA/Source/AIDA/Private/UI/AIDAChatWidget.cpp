@@ -8,6 +8,7 @@
 #include "Components/EditableTextBox.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
+#include "Engine/Font.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 
@@ -76,11 +77,16 @@ void UAIDAChatWidget::NativeConstruct()
 		CanvasSlot->SetOffsets(FMargin(-Margin, -BottomInset, SendWidth, InputHeight));
 	}
 
-	// Fonts: shrink both the transcript and the input box to just above console size.
+	// Fonts: use the game's UI font (Open Sans — /Game/FactoryGame/Interface/Font/DescriptionText) so the
+	// window matches the native chat; sized just above console size, with a dark outline so it reads over
+	// the game the way the native chat does. Falls back to the BP's default font if the asset can't load.
+	UFont* GameFont = LoadObject<UFont>(nullptr, TEXT("/Game/FactoryGame/Interface/Font/DescriptionText.DescriptionText"));
 	if (TranscriptText)
 	{
-		FSlateFontInfo Font = TranscriptText->GetFont();
+		FSlateFontInfo Font = GameFont ? FSlateFontInfo(GameFont, FontSize) : TranscriptText->GetFont();
 		Font.Size = FontSize;
+		Font.OutlineSettings.OutlineSize = 1;
+		Font.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 1.f);
 		TranscriptText->SetFont(Font);
 
 		if (InputBox)
@@ -158,6 +164,14 @@ void UAIDAChatWidget::UnbindRelay()
 		R->OnMsgEnd.RemoveDynamic(this, &UAIDAChatWidget::HandleMsgEnd);
 	}
 	Relay.Reset();
+}
+
+void UAIDAChatWidget::FocusInput()
+{
+	if (InputBox)
+	{
+		InputBox->SetKeyboardFocus();
+	}
 }
 
 void UAIDAChatWidget::SendChat(const FString& Text)

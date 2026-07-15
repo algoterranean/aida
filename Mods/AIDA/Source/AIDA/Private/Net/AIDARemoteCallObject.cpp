@@ -91,9 +91,13 @@ void UAIDARemoteCallObject::ServerSendChat_Implementation(const FString& Text)
 			if (const APlayerState* PS = PC->PlayerState)
 			{
 				Requester.Author = PS->GetPlayerName();
-				Requester.PlayerId = PS->GetUniqueId().IsValid()
-					? PS->GetUniqueId()->ToString()
-					: FString();
+				// NOTE: FUniqueNetIdRepl::IsValid() can be true while the resolved id pointer is null
+				// (e.g. the listen-server host), so dereferencing it with -> crashes. Check the shared
+				// pointer itself before calling ToString().
+				if (const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId())
+				{
+					Requester.PlayerId = NetId->ToString();
+				}
 			}
 		}
 		if (Requester.Author.IsEmpty())
