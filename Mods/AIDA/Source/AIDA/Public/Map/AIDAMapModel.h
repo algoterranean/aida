@@ -15,5 +15,6 @@ struct FAIDAResourceNode
 	FString Purity;                    // "Impure" | "Normal" | "Pure"
 	bool bOccupied = false;            // an extractor is built on it
 	FVector Location = FVector::ZeroVector;
-	FIntPoint Grid = FIntPoint::ZeroValue; // world-grid cell (humanized location; region names are a TODO)
+	FIntPoint Grid = FIntPoint::ZeroValue; // world-grid cell (humanized location fallback)
+	FString Region;                    // map-area display name ("Grass Fields", ...) — empty if unavailable
 };

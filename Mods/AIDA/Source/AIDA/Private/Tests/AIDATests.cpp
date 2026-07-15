@@ -13,6 +13,7 @@
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
+#include "Tools/AIDARecipeTools.h"
 #include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -1006,6 +1007,103 @@ bool FAIDAMapToolsNodesTest::RunTest(const FString&)
 		TestEqual(TEXT("untapped count"), Root->GetIntegerField(TEXT("nodes")), 3);
 		TestTrue(TEXT("freeNodes listed"), Root->HasField(TEXT("freeNodes")));
 		TestEqual(TEXT("freeNodes length"), Root->GetArrayField(TEXT("freeNodes")).Num(), 3);
+	}
+	return true;
+}
+
+// A small synthetic catalog for the static-reference serializers (no game headers required).
+static TArray<FAIDARecipeInfo> AIDAMakeTestRecipes()
+{
+	TArray<FAIDARecipeInfo> Recipes;
+
+	FAIDARecipeInfo Plate;
+	Plate.RecipeName = TEXT("Iron Plate");
+	Plate.DurationSeconds = 6.0;                       // 20/min out from 30/min in
+	Plate.Ingredients.Add({ TEXT("Iron Ingot"), 3.0 });
+	Plate.Products.Add({ TEXT("Iron Plate"), 2.0 });
+	Plate.ProducedIn.Add(TEXT("Constructor"));
+	Recipes.Add(MoveTemp(Plate));
+
+	FAIDARecipeInfo Rip;
+	Rip.RecipeName = TEXT("Reinforced Iron Plate");
+	Rip.DurationSeconds = 12.0;
+	Rip.Ingredients.Add({ TEXT("Iron Plate"), 6.0 });
+	Rip.Ingredients.Add({ TEXT("Screw"), 12.0 });
+	Rip.Products.Add({ TEXT("Reinforced Iron Plate"), 1.0 });
+	Rip.ProducedIn.Add(TEXT("Assembler"));
+	Recipes.Add(MoveTemp(Rip));
+
+	return Recipes;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDARecipeToolsRecipeTest, "AIDA.RecipeTools.LookupRecipe",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDARecipeToolsRecipeTest::RunTest(const FString&)
+{
+	const TArray<FAIDARecipeInfo> Recipes = AIDAMakeTestRecipes();
+
+	// Filter by product name (case-insensitive substring). "reinforced" -> just the RIP recipe.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildRecipeJson(Recipes, TEXT("reinforced")));
+		if (!TestNotNull(TEXT("recipe json parses"), Root.Get())) { return false; }
+		TestEqual(TEXT("one match"), Root->GetIntegerField(TEXT("matches")), 1);
+		const TArray<TSharedPtr<FJsonValue>>& List = Root->GetArrayField(TEXT("recipes"));
+		if (!TestEqual(TEXT("one recipe listed"), List.Num(), 1)) { return false; }
+		const TSharedPtr<FJsonObject> R = List[0]->AsObject();
+		TestEqual(TEXT("recipe name"), R->GetStringField(TEXT("recipe")), FString(TEXT("Reinforced Iron Plate")));
+		TestEqual(TEXT("two inputs"), R->GetArrayField(TEXT("inputs")).Num(), 2);
+		const TSharedPtr<FJsonObject> Out0 = R->GetArrayField(TEXT("outputs"))[0]->AsObject();
+		// 1 per craft over 12 s -> 5/min.
+		TestEqual(TEXT("output perMin"), Out0->GetNumberField(TEXT("perMin")), 5.0);
+		TestEqual(TEXT("producedIn"), R->GetArrayField(TEXT("producedIn"))[0]->AsString(), FString(TEXT("Assembler")));
+	}
+
+	// A product-name substring shared by both recipes ("iron plate") matches both.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildRecipeJson(Recipes, TEXT("iron plate")));
+		TestEqual(TEXT("two matches"), Root->GetIntegerField(TEXT("matches")), 2);
+	}
+
+	// Empty filter lists everything.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildRecipeJson(Recipes, FString()));
+		TestEqual(TEXT("all recipes"), Root->GetIntegerField(TEXT("matches")), 2);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDARecipeToolsBuildingTest, "AIDA.RecipeTools.LookupBuilding",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDARecipeToolsBuildingTest::RunTest(const FString&)
+{
+	TArray<FAIDABuildingInfo> Buildings;
+	Buildings.Add({ TEXT("Constructor"), 4.0, false, 0.0, 0.0, 0.0 });
+	FAIDABuildingInfo Miner; Miner.Name = TEXT("Miner Mk.1"); Miner.bVariablePower = true; Miner.MinPowerMW = 5.0; Miner.MaxPowerMW = 5.0;
+	Buildings.Add(MoveTemp(Miner));
+	FAIDABuildingInfo Gen; Gen.Name = TEXT("Coal Generator"); Gen.PowerProductionMW = 75.0;
+	Buildings.Add(MoveTemp(Gen));
+
+	// Fixed-power building: reports powerMW, not min/max.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildBuildingJson(Buildings, TEXT("construct")));
+		if (!TestNotNull(TEXT("building json parses"), Root.Get())) { return false; }
+		TestEqual(TEXT("one match"), Root->GetIntegerField(TEXT("matches")), 1);
+		const TSharedPtr<FJsonObject> B = Root->GetArrayField(TEXT("buildings"))[0]->AsObject();
+		TestEqual(TEXT("power"), B->GetNumberField(TEXT("powerMW")), 4.0);
+		TestFalse(TEXT("no minPower for fixed"), B->HasField(TEXT("minPowerMW")));
+	}
+
+	// Generator: reports powerProductionMW.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildBuildingJson(Buildings, TEXT("generator")));
+		const TSharedPtr<FJsonObject> B = Root->GetArrayField(TEXT("buildings"))[0]->AsObject();
+		TestEqual(TEXT("production"), B->GetNumberField(TEXT("powerProductionMW")), 75.0);
+	}
+
+	// Empty filter lists all three.
+	{
+		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildBuildingJson(Buildings, FString()));
+		TestEqual(TEXT("all buildings"), Root->GetIntegerField(TEXT("matches")), 3);
 	}
 	return true;
 }

@@ -6,6 +6,7 @@
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
+#include "Tools/AIDARecipeTools.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
@@ -39,7 +40,11 @@ namespace
 		"- get_item_balance(item?): net production vs consumption per item; deficits first.\n"
 		"- inspect_cluster(id): one cluster's building census, net inputs/outputs, and efficiency.\n"
 		"- find_bottleneck(item): why an item's production is limited (starved input, power, or backed up).\n"
-		"- get_resource_nodes(resource?, untapped_only?): map resource nodes by purity and occupancy.\n\n"
+		"- get_resource_nodes(resource?, untapped_only?): map resource nodes by purity and occupancy.\n"
+		"- lookup_recipe(item?): static recipe reference — inputs/outputs (amount + per-minute), craft time, "
+		"and which building makes it. Use for 'how is X made / what does X need', not live factory data.\n"
+		"- lookup_building(name?): static building reference — a production building's power draw (and, for "
+		"generators, power output).\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -416,6 +421,37 @@ void UAIDAOrchestrator::RegisterTools()
 		}
 	});
 
+	// Slice 3b static-reference tools (docs/PHASE2.md). Chat tier — pure game data, no live state read.
+	Tools.Register({
+		TEXT("lookup_recipe"),
+		TEXT("Static recipe reference: how an item is made. Pass 'item' to find recipes that produce it (inputs/outputs with per-minute rates, craft time, and the building that makes it). Use for crafting questions, not the player's live factory."),
+		TEXT(R"({"type":"object","properties":{"item":{"type":"string","description":"Item or recipe name to look up (e.g. \"Reinforced Iron Plate\")."}}})"),
+		EAIDAToolTier::Chat,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Item;
+			Args->TryGetStringField(TEXT("item"), Item);
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			return FAIDAToolResult::Ok(AIDARecipeTools::BuildRecipeJson(RecipeCatalog.GetRecipes(World, Now), Item));
+		}
+	});
+
+	Tools.Register({
+		TEXT("lookup_building"),
+		TEXT("Static building reference: a production building's power draw (and, for generators, power output). Pass 'name' to filter (e.g. \"Assembler\", \"Refinery\")."),
+		TEXT(R"({"type":"object","properties":{"name":{"type":"string","description":"Building name to look up (e.g. \"Constructor\")."}}})"),
+		EAIDAToolTier::Chat,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Name;
+			Args->TryGetStringField(TEXT("name"), Name);
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			return FAIDAToolResult::Ok(AIDARecipeTools::BuildBuildingJson(RecipeCatalog.GetBuildings(World, Now), Name));
+		}
+	});
+
 	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
 }
 
@@ -556,6 +592,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Scan resource nodes and log the grouped summary JSON (checks Phase 2 map scan without the LLM). Run on server/host. Usage: AIDA.Nodes"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Nodes),
 		ECVF_Default);
+
+	RecipesCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Recipes"),
+		TEXT("Log the static recipe + building catalog for a filter (checks Slice 3b lookup tools without the LLM). Run on server/host. Usage: AIDA.Recipes [item/name filter...]"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Recipes),
+		ECVF_Default);
 }
 
 void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
@@ -627,6 +669,22 @@ void UAIDAOrchestrator::Nodes(const TArray<FString>& /*Args*/)
 	const double Now = World ? World->GetTimeSeconds() : 0.0;
 	const FString Json = AIDAMapTools::BuildResourceNodesJson(MapService.GetNodes(World, Now), FString(), /*bUntappedOnly=*/false);
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Nodes summary: %s"), *Json);
+}
+
+void UAIDAOrchestrator::Recipes(const TArray<FString>& Args)
+{
+	// Catalog reads the recipe manager (a world subsystem) — server/host only.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Recipes runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+	const FString Filter = FString::Join(Args, TEXT(" "));
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Recipes recipes: %s"), *AIDARecipeTools::BuildRecipeJson(RecipeCatalog.GetRecipes(World, Now), Filter));
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Recipes buildings: %s"), *AIDARecipeTools::BuildBuildingJson(RecipeCatalog.GetBuildings(World, Now), Filter));
 }
 
 void UAIDAOrchestrator::Say(const TArray<FString>& Args)

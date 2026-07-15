@@ -23,6 +23,13 @@ public:
 	/** Scan the world's resource nodes into OutNodes right now. Clears OutNodes first. */
 	static void ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResourceNode>& OutNodes);
 
+	/**
+	 * Map-area display name for a world location ("Grass Fields", ...) via the minimap capture actor's
+	 * area texture, or empty when the texture/area is unavailable (e.g. a dedicated server). Static so
+	 * both the node scan and tag_node can name a position.
+	 */
+	static FString RegionNameForLocation(UObject* WorldContext, const FVector& WorldLocation);
+
 private:
 	TArray<FAIDAResourceNode> Cached;
 	double LastExtractSeconds = 0.0;

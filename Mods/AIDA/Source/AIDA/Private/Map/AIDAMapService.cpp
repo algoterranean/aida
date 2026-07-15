@@ -5,6 +5,9 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "FGMapArea.h"
+#include "FGMapAreaTexture.h"
+#include "FGMinimapCaptureActor.h"
 #include "FGWorldGridSubsystem.h"
 #include "Resources/FGResourceNode.h"
 #include "Resources/FGResourceDescriptor.h"
@@ -25,6 +28,27 @@ namespace
 	}
 }
 
+FString FAIDAMapService::RegionNameForLocation(UObject* WorldContext, const FVector& WorldLocation)
+{
+	UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
+	if (!World) { return FString(); }
+
+	// The area lookup lives on the minimap capture actor's area texture; it may be absent on a
+	// dedicated server or before the minimap is built. Callers fall back to grid coordinates.
+	for (TActorIterator<AFGMinimapCaptureActor> It(World); It; ++It)
+	{
+		if (UFGMapAreaTexture* AreaTexture = It->GetMapAreaTexture())
+		{
+			const TSubclassOf<UFGMapArea> Area = AreaTexture->GetMapAreaForWorldLocation(WorldLocation);
+			if (!Area) { return FString(); }
+			FString Name = UFGMapArea::GetUserSetAreaDisplayName(Area).ToString();
+			if (Name.IsEmpty()) { Name = UFGMapArea::GetAreaDisplayName(Area).ToString(); }
+			return Name;
+		}
+	}
+	return FString();
+}
+
 void FAIDAMapService::ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResourceNode>& OutNodes)
 {
 	OutNodes.Reset();
@@ -38,6 +62,14 @@ void FAIDAMapService::ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResour
 
 	AFGWorldGridSubsystem* Grid = AFGWorldGridSubsystem::Get(WorldContext);
 
+	// Resolve the area texture once and reuse it for every node (rather than iterating actors per node).
+	UFGMapAreaTexture* AreaTexture = nullptr;
+	for (TActorIterator<AFGMinimapCaptureActor> It(World); It; ++It)
+	{
+		AreaTexture = It->GetMapAreaTexture();
+		if (AreaTexture) { break; }
+	}
+
 	for (TActorIterator<AFGResourceNode> It(World); It; ++It)
 	{
 		AFGResourceNode* Node = *It;
@@ -50,6 +82,14 @@ void FAIDAMapService::ExtractNodesInto(UObject* WorldContext, TArray<FAIDAResour
 		Out.bOccupied = Node->IsOccupied();
 		Out.Location = Node->GetActorLocation();
 		if (Grid) { Out.Grid = Grid->GetWorldGridCoordinatesForLocation(Out.Location); }
+		if (AreaTexture)
+		{
+			if (const TSubclassOf<UFGMapArea> Area = AreaTexture->GetMapAreaForWorldLocation(Out.Location))
+			{
+				Out.Region = UFGMapArea::GetUserSetAreaDisplayName(Area).ToString();
+				if (Out.Region.IsEmpty()) { Out.Region = UFGMapArea::GetAreaDisplayName(Area).ToString(); }
+			}
+		}
 		OutNodes.Add(MoveTemp(Out));
 	}
 

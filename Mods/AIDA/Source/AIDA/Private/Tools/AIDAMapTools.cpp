@@ -74,6 +74,7 @@ FString AIDAMapTools::BuildResourceNodesJson(const TArray<FAIDAResourceNode>& No
 			const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 			O->SetStringField(TEXT("resource"), N.Resource);
 			O->SetStringField(TEXT("purity"), N.Purity);
+			if (!N.Region.IsEmpty()) { O->SetStringField(TEXT("region"), N.Region); }
 			TArray<TSharedPtr<FJsonValue>> GridArr;
 			GridArr.Add(MakeShared<FJsonValueNumber>(N.Grid.X));
 			GridArr.Add(MakeShared<FJsonValueNumber>(N.Grid.Y));
