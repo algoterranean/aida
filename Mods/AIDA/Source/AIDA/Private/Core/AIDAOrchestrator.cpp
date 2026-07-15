@@ -25,10 +25,6 @@
 
 namespace
 {
-	// Phase 3 snapshot defaults (config wiring lands in Slice 3).
-	constexpr int32 kSnapshotKeepMax = 200;
-	constexpr float kSnapshotIntervalSeconds = 30.f * 60.f;
-
 	/** Map a tool's declared tier onto the permission tier the orchestrator gates it with. */
 	EAIDATier ToPermissionTier(EAIDAToolTier Tier)
 	{
@@ -200,12 +196,13 @@ void UAIDAOrchestrator::RegisterRelayClass()
 		Mgr->RegisterSubsystemActor(AAIDAMemoryStore::StaticClass());
 		Memory.Init(this);
 
-		// Periodic history snapshots into the sidecar ring buffer (Phase 3). A looping world timer; the
-		// first snapshot lands one interval in (an on-demand take_snapshot can seed one sooner).
+		// Periodic history snapshots into the sidecar ring buffer (Phase 3). A looping world timer at the
+		// configured interval; the first snapshot lands one interval in (take_snapshot can seed one sooner).
 		if (!SnapshotTimer.IsValid())
 		{
+			const float IntervalSeconds = FMath::Max(1, Config.Snapshots.IntervalMinutes) * 60.f;
 			World->GetTimerManager().SetTimer(SnapshotTimer, this, &UAIDAOrchestrator::OnSnapshotTimer,
-				kSnapshotIntervalSeconds, /*bLoop=*/true);
+				IntervalSeconds, /*bLoop=*/true);
 		}
 	}
 
@@ -943,7 +940,7 @@ void UAIDAOrchestrator::TakeSnapshot(const FString& Label)
 
 	const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 	const FAIDASnapshot Snap = AIDASnapshotTools::MakeSnapshot(SnapshotAggregates(), Now, Label);
-	Memory.AppendSnapshot(Snap, kSnapshotKeepMax);
+	Memory.AppendSnapshot(Snap, Config.Snapshots.Keep);
 	UE_LOG(LogAIDA, Log, TEXT("[memory] snapshot taken (label='%s', %d items); %d total."),
 		*Label, Snap.ItemBalance.Num(), Memory.LoadSnapshots().Num());
 }
