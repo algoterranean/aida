@@ -10,6 +10,8 @@
 #include "Tools/AIDANotesTools.h"
 #include "Tools/AIDASnapshotTools.h"
 #include "Tools/AIDAToolJson.h"
+#include "Actions/AIDAActionSpec.h"
+#include "Actions/AIDAActionSeam.h"
 #include "Memory/AIDAMemoryStore.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
@@ -87,6 +89,14 @@ namespace
 		"- compare_to(timestamp?, item?): how the factory changed vs an earlier snapshot (per-item + power "
 		"deltas). Use for 'how has my X changed', 'what changed since...'. Omit timestamp for the latest "
 		"snapshot.\n\n"
+		"World-modifying proposal tools (only registered when the server enables them):\n"
+		"- propose_build(spec): propose placing buildables on a snapped grid. NOTHING is built until a "
+		"player with act permission approves the proposal. Only call it when the player explicitly asks "
+		"you to build/place something. On success, relay the returned summary + cost and say it awaits "
+		"approval; on a tool error (invalid placement, cost, cap), revise the spec or explain the reason. "
+		"Never claim something was built until get_proposal_status says executed.\n"
+		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
+		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -162,6 +172,11 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(NodesCommand);
 		NodesCommand = nullptr;
+	}
+	if (ProposeCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(ProposeCommand);
+		ProposeCommand = nullptr;
 	}
 	LLMClient.Reset();
 	Session.Reset();
@@ -663,7 +678,177 @@ void UAIDAOrchestrator::RegisterTools()
 		}
 	});
 
+	// Phase 4 proposal tools (docs/PHASE4.md). Gated by the actions.enabled kill-switch: when off,
+	// the model never even sees propose_* in its tool list.
+	if (Config.Actions.bEnabled)
+	{
+		RegisterActionTools();
+	}
+
 	UE_LOG(LogAIDA, Log, TEXT("[tools] registered %d tool(s)."), Tools.Num());
+}
+
+void UAIDAOrchestrator::SweepProposals()
+{
+	const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+	for (const FGuid& Id : Proposals.SweepExpired(Now, Config.Actions.TtlSeconds))
+	{
+		UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s expired unapproved."), *Id.ToString(EGuidFormats::DigitsWithHyphens));
+	}
+}
+
+void UAIDAOrchestrator::RegisterActionTools()
+{
+	// propose_build: parse spec -> resolve recipe -> expand grid -> hologram dry-run -> store Pending.
+	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
+	Tools.Register({
+		TEXT("propose_build"),
+		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY? in metres}}."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+
+			FAIDABuildSpec Spec;
+			FString Error;
+			if (!AIDAActionSpec::ParseBuildSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			FAIDARecipeResolution Recipe;
+			if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Buildable, Recipe))
+			{
+				FString Msg = FString::Printf(TEXT("no unlocked buildable matches '%s'"), *Spec.Buildable);
+				if (Recipe.Suggestions.Num() > 0)
+				{
+					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Recipe.Suggestions, TEXT(", ")));
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+			Spec.Buildable = Recipe.DisplayName; // canonical name for the summary
+
+			const TArray<FTransform> Placements = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
+
+			FAIDADryRunResult DryRun;
+			if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Spec.YawDeg, Placements, DryRun))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+			}
+			if (!DryRun.bOk)
+			{
+				const FString Msg = FString::Printf(TEXT("%d of %d placements invalid"), DryRun.Failures.Num(), Placements.Num());
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
+			}
+			if (Config.Actions.CostMode == TEXT("central") && !DryRun.bAffordable)
+			{
+				FString Msg = TEXT("not affordable from central storage (dimensional depot): needs ");
+				for (int32 i = 0; i < DryRun.Cost.Num(); ++i)
+				{
+					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), DryRun.Cost[i].Amount, *DryRun.Cost[i].Item);
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			FAIDAProposal Proposal;
+			Proposal.SpecJson = AIDAToCompactJson(SpecObj->ToSharedRef());
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = Placements;
+			Proposal.RecipeClassPath = Recipe.RecipeClassPath;
+			Proposal.Cost = DryRun.Cost;
+			Proposal.Summary = AIDAActionSpec::SummarizeBuild(Spec);
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			if (!Proposals.Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
+		}
+	});
+
+	// propose_dismantle: resolve live targets (count + refund) and store Pending. Targets are
+	// re-resolved at execute time (Slice 2) — never trusted from this dry-run.
+	Tools.Register({
+		TEXT("propose_dismantle"),
+		TEXT("PROPOSE removing buildables near a point. Nothing is dismantled until a player with act permission approves. Returns the matched count + refund tally and a proposalId. Selector: {version:1, buildable:'display name or empty for any', center:{x,y,z in metres}, radiusM, maxCount?}."),
+		TEXT(R"({"type":"object","properties":{"selector":{"type":"object","description":"The versioned dismantle selector (see tool description)."}},"required":["selector"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SelectorObj = nullptr;
+			Args->TryGetObjectField(TEXT("selector"), SelectorObj);
+
+			FAIDADismantleSpec Selector;
+			FString Error;
+			if (!AIDAActionSpec::ParseDismantleSpec(SelectorObj ? *SelectorObj : nullptr, Config.Actions.MaxProposalItems, Selector, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			FAIDADismantleResolution Targets;
+			if (!FAIDAActionSeam::ResolveDismantleTargets(this, Selector, Targets))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(TEXT("dismantle target scan unavailable"), {}));
+			}
+			if (Targets.Count == 0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					FString::Printf(TEXT("no%s buildables within %.0f m of the given point"),
+						Selector.Buildable.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" '%s'"), *Selector.Buildable),
+						Selector.RadiusM), {}));
+			}
+
+			FAIDAProposal Proposal;
+			Proposal.bDismantle = true;
+			Proposal.SpecJson = AIDAToCompactJson(SelectorObj->ToSharedRef());
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.TargetCount = Targets.Count;
+			Proposal.Cost = Targets.Refund;
+			Proposal.Summary = AIDAActionSpec::SummarizeDismantle(Selector);
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			if (!Proposals.Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, /*bAffordable*/ true, 0.0));
+		}
+	});
+
+	// get_proposal_status: read-only view over the live store, so the model never guesses outcomes.
+	Tools.Register({
+		TEXT("get_proposal_status"),
+		TEXT("Status of AIDA's build/dismantle proposals (pending, approved, executed, rejected, expired). Pass 'proposalId' for one, or omit it to list all current proposals."),
+		TEXT(R"({"type":"object","properties":{"proposalId":{"type":"string","description":"Optional proposal id to check."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			FString IdText;
+			Args->TryGetStringField(TEXT("proposalId"), IdText);
+			FGuid Filter;
+			FGuid::Parse(IdText, Filter); // invalid text leaves the filter unset => list all
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildStatusJson(Proposals.All(), Filter, Now, Config.Actions.TtlSeconds));
+		}
+	});
 }
 
 void UAIDAOrchestrator::BuildToolDefs(TArray<FAIDAToolDef>& OutDefs) const
@@ -822,6 +1007,39 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Take a factory history snapshot now (checks Phase 3 snapshots without the LLM). Run on server/host. Usage: AIDA.Snapshot [label...]"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Snapshot),
 		ECVF_Default);
+
+	ProposeCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Propose"),
+		TEXT("Drive propose_build directly with a spec JSON (checks the Phase 4 dry-run without the LLM). Run on server/host. Usage: AIDA.Propose {\"version\":1,\"buildable\":\"Foundation\",...}"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Propose),
+		ECVF_Default);
+}
+
+void UAIDAOrchestrator::Propose(const TArray<FString>& Args)
+{
+	if (!Config.Actions.bEnabled || !Tools.Contains(TEXT("propose_build")))
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Propose: actions are disabled (actions.enabled=false)."));
+		return;
+	}
+
+	// The console splits on spaces; rejoin to recover the JSON spec.
+	const FString SpecJson = FString::Join(Args, TEXT(" ")).TrimStartAndEnd();
+	if (SpecJson.IsEmpty())
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Propose: pass a build spec, e.g. AIDA.Propose {\"version\":1,\"buildable\":\"Foundation\",\"origin\":{\"x\":0,\"y\":0},\"grid\":{\"countX\":3,\"countY\":3}}"));
+		return;
+	}
+
+	FAIDAToolContext Ctx;
+	Ctx.Author = TEXT("console");
+	Ctx.PlayerId = TEXT("debug");
+
+	// Dispatch through the registry exactly like the tool loop would (minus the permission gate —
+	// this is a host-side diagnostic, like AIDA.Say).
+	const FString ArgsJson = FString::Printf(TEXT("{\"spec\":%s}"), *SpecJson);
+	const FAIDAToolResult Result = Tools.Dispatch(TEXT("propose_build"), ArgsJson, Ctx);
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Propose %s: %s"), Result.bIsError ? TEXT("ERROR") : TEXT("ok"), *Result.Content);
 }
 
 void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)

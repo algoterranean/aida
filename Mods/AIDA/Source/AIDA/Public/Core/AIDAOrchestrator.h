@@ -11,6 +11,7 @@
 #include "Map/AIDAMapService.h"       // TTL-cached resource-node scan
 #include "Recipes/AIDARecipeService.h" // TTL-cached static recipe + building catalog
 #include "Memory/AIDAMemory.h"          // Phase 3 persistence facade (in-save + sidecar)
+#include "Actions/AIDAProposalStore.h"  // Phase 4 proposal pipeline (in-memory store + state machine)
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
 #include "AIDAOrchestrator.generated.h"
@@ -77,6 +78,12 @@ private:
 	/** Register the built-in tools exposed to the model (Phase 2 Slice 0: an echo verifier). */
 	void RegisterTools();
 
+	/** Register the Phase 4 proposal tools (propose_build/propose_dismantle/get_proposal_status). */
+	void RegisterActionTools();
+
+	/** Lazily expire pending proposals past their TTL (docs/PHASE4.md §3; timer piggyback lands in Slice 2). */
+	void SweepProposals();
+
 	/** Snapshot the registry's specs as the wire tool definitions sent to the model. */
 	void BuildToolDefs(TArray<FAIDAToolDef>& OutDefs) const;
 
@@ -128,6 +135,12 @@ private:
 	/** `AIDA.Snapshot` — take a factory history snapshot now (Phase 3 check, no LLM). */
 	void Snapshot(const TArray<FString>& Args);
 
+	/**
+	 * `AIDA.Propose <spec json>` — drive propose_build directly (no LLM): parse → dry-run → store,
+	 * logging the report. The widget-free Phase 4 Slice 1 verifier, like AIDA.Say for chat.
+	 */
+	void Propose(const TArray<FString>& Args);
+
 	/** Build a snapshot from the current aggregates and append it to the sidecar ring buffer. Server-only. */
 	void TakeSnapshot(const FString& Label);
 
@@ -150,6 +163,7 @@ private:
 	FAIDAMapService MapService;
 	FAIDARecipeCatalog RecipeCatalog;
 	FAIDAMemory Memory;
+	FAIDAProposalStore Proposals;
 	IConsoleCommand* PingCommand = nullptr;
 	IConsoleCommand* SayCommand = nullptr;
 	IConsoleCommand* ToolPingCommand = nullptr;
@@ -158,6 +172,7 @@ private:
 	IConsoleCommand* RecipesCommand = nullptr;
 	IConsoleCommand* MemoryCommand = nullptr;
 	IConsoleCommand* SnapshotCommand = nullptr;
+	IConsoleCommand* ProposeCommand = nullptr;
 
 	//~ Periodic history snapshots (Phase 3). Defaults; config wiring lands in Slice 3.
 	UFUNCTION()

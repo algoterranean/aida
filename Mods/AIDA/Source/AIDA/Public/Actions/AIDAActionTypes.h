@@ -9,6 +9,10 @@
  * ActionEngine never trusts model coordinates — every placement passes dry-run validation.
  */
 
+/** Specs speak metres (tool convention); the world speaks cm. One constant, shared by the Actions TUs
+ *  (unity builds merge their anonymous namespaces, so per-.cpp copies would collide). */
+inline constexpr double AIDAMetersToCm = 100.0;
+
 /** Proposal lifecycle. Legal transitions are enforced by FAIDAProposalStore::IsLegalTransition. */
 enum class EAIDAProposalState : uint8
 {
@@ -81,6 +85,33 @@ struct FAIDAEntityId
 	int32 Index = INDEX_NONE;              // lw only
 	FVector Pos = FVector::ZeroVector;     // cm
 	int32 YawDeg = 0;
+};
+
+/** Outcome of resolving a spec's display name to an unlocked build recipe (FAIDAActionSeam). */
+struct FAIDARecipeResolution
+{
+	FString RecipeClassPath;
+	FString DisplayName;                   // canonical building name (for summaries)
+	double FootprintXM = 8.0;              // clearance-box size, metres — the default grid step
+	double FootprintYM = 8.0;
+	TArray<FString> Suggestions;           // close matches when resolution failed
+};
+
+/** Outcome of a non-mutating dry run over expanded placements (FAIDAActionSeam::DryRunBuild). */
+struct FAIDADryRunResult
+{
+	bool bOk = false;
+	FString Error;                         // set when the run failed wholesale (no hologram, bad recipe)
+	TArray<FAIDAPlacementFailure> Failures;
+	TArray<FAIDACostItem> Cost;            // total for all placements
+	bool bAffordable = false;              // vs central storage (callers ignore under costMode "free")
+};
+
+/** Outcome of resolving a dismantle selector against live buildables (count + refund tally). */
+struct FAIDADismantleResolution
+{
+	int32 Count = 0;
+	TArray<FAIDACostItem> Refund;
 };
 
 /**

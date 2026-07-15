@@ -8,8 +8,6 @@
 
 namespace
 {
-	constexpr double MetersToCm = 100.0;
-
 	/** Read a {x,y,z} object (metres; z optional) into a vector. False if the field is missing/malformed. */
 	bool ReadVectorM(const TSharedPtr<FJsonObject>& Parent, const TCHAR* Field, FVector& Out)
 	{
@@ -137,15 +135,15 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 
 TArray<FTransform> AIDAActionSpec::ExpandGrid(const FAIDABuildSpec& Spec, double DefaultStepXM, double DefaultStepYM)
 {
-	const double StepXCm = (Spec.Grid.StepXM > 0.0 ? Spec.Grid.StepXM : DefaultStepXM) * MetersToCm;
-	const double StepYCm = (Spec.Grid.StepYM > 0.0 ? Spec.Grid.StepYM : DefaultStepYM) * MetersToCm;
+	const double StepXCm = (Spec.Grid.StepXM > 0.0 ? Spec.Grid.StepXM : DefaultStepXM) * AIDAMetersToCm;
+	const double StepYCm = (Spec.Grid.StepYM > 0.0 ? Spec.Grid.StepYM : DefaultStepYM) * AIDAMetersToCm;
 
 	// Step axes rotate with the yaw so a rotated grid stays coherent (rows follow the buildable's X).
 	const double YawRad = FMath::DegreesToRadians(static_cast<double>(Spec.YawDeg));
 	const FVector AxisX(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.0);
 	const FVector AxisY(-FMath::Sin(YawRad), FMath::Cos(YawRad), 0.0);
 
-	const FVector OriginCm = Spec.OriginM * MetersToCm;
+	const FVector OriginCm = Spec.OriginM * AIDAMetersToCm;
 	const FRotator Rotation(0.0, static_cast<double>(Spec.YawDeg), 0.0);
 
 	TArray<FTransform> Out;
