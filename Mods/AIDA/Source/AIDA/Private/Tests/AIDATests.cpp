@@ -1024,6 +1024,23 @@ bool FAIDAMarkdownTest::RunTest(const FString&)
 	TestEqual(TEXT("code protects markers"), AIDAMarkdownToRichText(TEXT("`a**b`")), FString(TEXT("<Code>a**b</>")));
 	// Two lines preserved.
 	TestEqual(TEXT("newline preserved"), AIDAMarkdownToRichText(TEXT("a\nb")), FString(TEXT("a\nb")));
+
+	// Table: separator row dropped, pipes removed, header bold, cell data preserved.
+	{
+		const FString T = AIDAMarkdownToRichText(TEXT("| Item | Net |\n|------|-----|\n| Iron | -90 |"));
+		TestTrue(TEXT("table header styled"), T.Contains(TEXT("<MonoHeader>")));
+		TestTrue(TEXT("table rows mono"), T.Contains(TEXT("<Mono>")));
+		TestFalse(TEXT("table pipes removed"), T.Contains(TEXT("|")));
+		TestFalse(TEXT("table separator dropped"), T.Contains(TEXT("---")));
+		TestTrue(TEXT("table data kept"), T.Contains(TEXT("Iron")) && T.Contains(TEXT("-90")));
+	}
+	// Malformed table (bare separator, no header) still renders as a headerless mono table, no pipes.
+	{
+		const FString T = AIDAMarkdownToRichText(TEXT("|---|---|\n| Iron | -90 |\n| Wire | -360 |"));
+		TestFalse(TEXT("bare table pipes removed"), T.Contains(TEXT("|")));
+		TestTrue(TEXT("bare table rows mono"), T.Contains(TEXT("<Mono>")));
+		TestFalse(TEXT("bare table has no header style"), T.Contains(TEXT("<MonoHeader>")));
+	}
 	return true;
 }
 

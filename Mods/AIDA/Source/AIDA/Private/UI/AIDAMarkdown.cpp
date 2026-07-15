@@ -3,8 +3,8 @@
 namespace
 {
 	/**
-	 * Wrap each shortest pair of `Marker` in Open/Close tags. Unbalanced trailing markers are left as
-	 * literal text. Case-sensitive so we don't disturb tag names.
+	 * Wrap each shortest pair of `Marker` in Open/Close tags. Unbalanced trailing markers, and empty
+	 * spans (adjacent markers), are left as literal text. Case-sensitive so we don't disturb tag names.
 	 */
 	FString WrapPairs(const FString& In, const FString& Marker, const TCHAR* Open, const TCHAR* Close)
 	{
@@ -50,6 +50,93 @@ namespace
 		S = WrapPairs(S, TEXT("*"), TEXT("<Italic>"), TEXT("</>"));
 		return S;
 	}
+
+	/** Split a Markdown table row "| a | b |" into trimmed cells (outer pipes dropped). */
+	void ParseTableCells(const FString& Row, TArray<FString>& OutCells)
+	{
+		FString Trimmed = Row;
+		Trimmed.TrimStartAndEndInline();
+		Trimmed.RemoveFromStart(TEXT("|"));
+		Trimmed.RemoveFromEnd(TEXT("|"));
+		Trimmed.ParseIntoArray(OutCells, TEXT("|"), /*bCullEmpty=*/false);
+		for (FString& Cell : OutCells) { Cell.TrimStartAndEndInline(); }
+	}
+
+	/** A markdown separator row like |---|:--:|---| (cells are only - : and spaces, with at least one -). */
+	bool IsSeparatorRow(const FString& Row)
+	{
+		TArray<FString> Cells;
+		ParseTableCells(Row, Cells);
+		if (Cells.Num() == 0) { return false; }
+		for (const FString& Cell : Cells)
+		{
+			if (Cell.IsEmpty() || !Cell.Contains(TEXT("-"))) { return false; }
+			for (const TCHAR C : Cell)
+			{
+				if (C != '-' && C != ':' && C != ' ') { return false; }
+			}
+		}
+		return true;
+	}
+
+	bool IsTableRow(const FString& TrimmedLine)
+	{
+		return TrimmedLine.StartsWith(TEXT("|"));
+	}
+
+	/** Strip inline markdown markers so cell widths are measured on visible text. */
+	FString StripInlineMarkers(const FString& In)
+	{
+		return In.Replace(TEXT("**"), TEXT("")).Replace(TEXT("`"), TEXT("")).Replace(TEXT("*"), TEXT(""));
+	}
+
+	/** Render a Markdown table as column-aligned monospace text; bHasHeader bolds the first data row. */
+	FString RenderTable(const TArray<FString>& Rows, bool bHasHeader)
+	{
+		// Parse cells (plain text), skipping separator rows.
+		TArray<TArray<FString>> Grid;
+		for (const FString& Row : Rows)
+		{
+			if (IsSeparatorRow(Row)) { continue; }
+			TArray<FString> Cells;
+			ParseTableCells(Row, Cells);
+			for (FString& Cell : Cells) { Cell = StripInlineMarkers(Cell); }
+			Grid.Add(MoveTemp(Cells));
+		}
+		if (Grid.Num() == 0) { return FString(); }
+		const int32 HeaderIndex = bHasHeader ? 0 : INDEX_NONE;
+
+		int32 ColumnCount = 0;
+		for (const TArray<FString>& Row : Grid) { ColumnCount = FMath::Max(ColumnCount, Row.Num()); }
+
+		TArray<int32> Widths;
+		Widths.Init(0, ColumnCount);
+		for (const TArray<FString>& Row : Grid)
+		{
+			for (int32 c = 0; c < Row.Num(); ++c) { Widths[c] = FMath::Max(Widths[c], Row[c].Len()); }
+		}
+
+		// Build each row as space-padded plain cells, then wrap the whole row in a monospace style so the
+		// padding aligns (the game's proportional font can't align by spaces). Header gets its own style.
+		FString Out;
+		for (int32 r = 0; r < Grid.Num(); ++r)
+		{
+			const TArray<FString>& Row = Grid[r];
+			FString Cells;
+			for (int32 c = 0; c < ColumnCount; ++c)
+			{
+				const FString Cell = Row.IsValidIndex(c) ? Row[c] : FString();
+				FString Padded = Cell;
+				while (Padded.Len() < Widths[c]) { Padded.AppendChar(' '); }
+				Cells += Padded;
+				if (c < ColumnCount - 1) { Cells += TEXT("  "); }
+			}
+			const TCHAR* Style = (r == HeaderIndex) ? TEXT("MonoHeader") : TEXT("Mono");
+			Out += FString::Printf(TEXT("<%s>%s</>"), Style, *Cells);
+			if (r < Grid.Num() - 1) { Out += TEXT("\n"); }
+		}
+		return Out;
+	}
 }
 
 FString AIDAMarkdownToRichText(const FString& Markdown)
@@ -68,14 +155,37 @@ FString AIDAMarkdownToRichText(const FString& Markdown)
 		if (Trimmed.StartsWith(TEXT("```")))
 		{
 			bInFence = !bInFence; // toggle; the fence line itself is dropped
+			continue;
 		}
-		else if (bInFence)
+		if (bInFence)
 		{
 			Out += FString::Printf(TEXT("<Code>%s</>"), *Line);
 			if (i < Lines.Num() - 1) { Out += TEXT("\n"); }
 			continue;
 		}
-		else if (Trimmed.StartsWith(TEXT("#")))
+
+		// Table detection. Two forms: a proper header row followed by a |---| separator, OR (some models
+		// emit these) a separator row with no header above it. Either way, consume the run of '|' lines.
+		const bool bHeaderThenSeparator = IsTableRow(Trimmed) && i + 1 < Lines.Num() && IsSeparatorRow(Lines[i + 1]);
+		const bool bBareSeparator = IsSeparatorRow(Trimmed);
+		if (bHeaderThenSeparator || bBareSeparator)
+		{
+			TArray<FString> TableRows;
+			int32 j = i;
+			for (; j < Lines.Num(); ++j)
+			{
+				FString RowTrim = Lines[j];
+				RowTrim.TrimStartInline();
+				if (!IsTableRow(RowTrim)) { break; }
+				TableRows.Add(Lines[j]);
+			}
+			Out += RenderTable(TableRows, /*bHasHeader=*/bHeaderThenSeparator);
+			if (j < Lines.Num()) { Out += TEXT("\n"); }
+			i = j - 1; // for-loop ++ lands on the first non-table line
+			continue;
+		}
+
+		if (Trimmed.StartsWith(TEXT("#")))
 		{
 			FString Header = Trimmed;
 			while (Header.StartsWith(TEXT("#"))) { Header.RightChopInline(1); }

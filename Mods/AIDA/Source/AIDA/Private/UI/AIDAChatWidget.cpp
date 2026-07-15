@@ -13,6 +13,7 @@
 #include "Engine/DataTable.h"
 #include "Engine/Font.h"
 #include "Engine/World.h"
+#include "Styling/CoreStyle.h"
 #include "TimerManager.h"
 #include "UI/AIDAMarkdown.h"
 
@@ -208,11 +209,18 @@ void UAIDAChatWidget::BuildTranscriptRich(UFont* GameFont, float FontSize)
 		Row.TextStyle.SetColorAndOpacity(FSlateColor(Color));
 		StyleSet->AddRow(Name, Row);
 	};
+	// Engine monospace font (DroidSansMono — what the console uses) so code + tables align by character.
+	FSlateFontInfo MonoFont = FCoreStyle::GetDefaultFontStyle(TEXT("Mono"), FontSize);
+	MonoFont.OutlineSettings.OutlineSize = 1;
+	MonoFont.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 1.f);
+
 	AddStyle(TEXT("Default"), MakeFont(NAME_None, FontSize), FLinearColor::White);
 	AddStyle(TEXT("Bold"), MakeFont(TEXT("Bold"), FontSize), FLinearColor::White);
 	AddStyle(TEXT("Italic"), MakeFont(TEXT("Italic"), FontSize), FLinearColor::White);
-	AddStyle(TEXT("Code"), MakeFont(NAME_None, FontSize), FLinearColor(0.70f, 0.88f, 1.0f, 1.0f));
+	AddStyle(TEXT("Code"), MonoFont, FLinearColor(0.70f, 0.88f, 1.0f, 1.0f));
 	AddStyle(TEXT("Header"), MakeFont(TEXT("Bold"), FontSize + 3.f), FLinearColor::White);
+	AddStyle(TEXT("Mono"), MonoFont, FLinearColor::White);
+	AddStyle(TEXT("MonoHeader"), MonoFont, FLinearColor(1.0f, 0.85f, 0.4f, 1.0f)); // amber header
 
 	TranscriptRich = WidgetTree->ConstructWidget<URichTextBlock>();
 	TranscriptRich->SetTextStyleSet(StyleSet);

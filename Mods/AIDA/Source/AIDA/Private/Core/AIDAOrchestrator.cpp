@@ -44,9 +44,10 @@ namespace
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
 		"Style: this is an in-game chat overlay, so keep answers short and concrete. Light Markdown is "
-		"rendered — use **bold** for key items/numbers and short bullet lists ('- ') when listing a few "
-		"things; avoid big headers and long lists. You are NOT a general-purpose or coding assistant — stay "
-		"focused on this Satisfactory factory.");
+		"rendered — use **bold** for key items/numbers and short bullet lists ('- '); Markdown tables render "
+		"aligned, so if you use one always include a header row and its |---| separator. Avoid big headers "
+		"and long lists. You are NOT a general-purpose or coding assistant — stay focused on this "
+		"Satisfactory factory.");
 }
 
 bool UAIDAOrchestrator::ShouldCreateSubsystem(UObject* Outer) const
