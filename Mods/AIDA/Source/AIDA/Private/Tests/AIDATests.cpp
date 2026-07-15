@@ -2,6 +2,8 @@
 
 #if WITH_AUTOMATION_TESTS
 
+#include "Algo/Reverse.h"
+
 #include "Core/AIDAConfigLoader.h"
 #include "Core/AIDASessionManager.h"
 #include "Core/AIDARateLimiter.h"
@@ -14,6 +16,7 @@
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
+#include "Tools/AIDAPromptPack.h"
 #include "Memory/AIDASidecarStore.h"
 #include "Tools/AIDANotesTools.h"
 #include "Tools/AIDASnapshotTools.h"
@@ -1785,6 +1788,69 @@ bool FAIDAChatCommandsTest::RunTest(const FString&)
 	TestTrue(TEXT("unknown -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
 	TestTrue(TEXT("bare /aida intercepts"), AIDAChatCommands::TryParse(TEXT("/aida"), Cmd, Error));
 	TestFalse(TEXT("bare /aida has usage"), Error.IsEmpty());
+	return true;
+}
+
+// The generated game data pack (docs/PROMPT.md §2): section routing, per-minute conversion,
+// generator fuel/water lines, and the name-sorted (cache-stable) ordering.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAPromptPackTest, "AIDA.PromptPack.Build",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAPromptPackTest::RunTest(const FString&)
+{
+	TArray<FAIDABuildingInfo> Buildings;
+
+	FAIDABuildingInfo Assembler;
+	Assembler.Name = TEXT("Assembler");
+	Assembler.PowerConsumptionMW = 15.0;
+	Assembler.PowerExponent = 1.321929;
+	Assembler.FootprintXM = 10.0; Assembler.FootprintYM = 15.0; Assembler.HeightM = 11.0;
+	Buildings.Add(Assembler);
+
+	FAIDABuildingInfo CoalGen;
+	CoalGen.Name = TEXT("Coal-Powered Generator");
+	CoalGen.PowerProductionMW = 75.0;
+	CoalGen.Fuels.Add({ TEXT("Coal"), 15.0 });
+	CoalGen.Fuels.Add({ TEXT("Compacted Coal"), 7.14 });
+	CoalGen.SupplementalM3PerMin = 45.0;
+	Buildings.Add(CoalGen);
+
+	FAIDABuildingInfo Belt;
+	Belt.Name = TEXT("Conveyor Belt Mk.2");
+	Belt.BeltItemsPerMin = 120.0;
+	Buildings.Add(Belt);
+
+	FAIDABuildingInfo Miner;
+	Miner.Name = TEXT("Miner Mk.1");
+	Miner.PowerConsumptionMW = 5.0;
+	Miner.ExtractPerMinNormal = 60.0;
+	Buildings.Add(Miner);
+
+	FAIDABuildingInfo Foundation;
+	Foundation.Name = TEXT("Foundation (2 m)");
+	Foundation.FootprintXM = 8.0; Foundation.FootprintYM = 8.0; Foundation.HeightM = 2.0;
+	Buildings.Add(Foundation);
+
+	const FString Pack = AIDAPromptPack::Build(AIDAMakeTestRecipes(), Buildings);
+
+	// Section routing: each synthetic building lands in its section with its numbers formatted.
+	TestTrue(TEXT("producer line"), Pack.Contains(TEXT("Assembler: 15 MW, exp 1.32, 10x15x11 m")));
+	TestTrue(TEXT("generator line"), Pack.Contains(
+		TEXT("Coal-Powered Generator: 75 MW out; burns/min: Coal 15 or Compacted Coal 7.14; water 45 m3/min")));
+	TestTrue(TEXT("belt line"), Pack.Contains(TEXT("Conveyor Belt Mk.2: 120 items/min")));
+	TestTrue(TEXT("miner line"), Pack.Contains(TEXT("Miner Mk.1: 60/min on a normal node, 5 MW")));
+	TestTrue(TEXT("structure line"), Pack.Contains(TEXT("Foundation (2 m): 8x8x2 m")));
+
+	// Recipes converted to per-minute: Iron Plate is 3-in/2-out per 6 s craft -> 30 -> 20.
+	TestTrue(TEXT("recipe per-min"), Pack.Contains(TEXT("Iron Plate [Constructor, 6s]: Iron Ingot 30 -> Iron Plate 20")));
+	TestTrue(TEXT("multi-input joined"), Pack.Contains(TEXT("Iron Plate 30 + Screw 60 -> Reinforced Iron Plate 5")));
+
+	// Cache stability: same inputs in a different order produce byte-identical output.
+	Algo::Reverse(Buildings);
+	TestEqual(TEXT("order-independent bytes"), AIDAPromptPack::Build(AIDAMakeTestRecipes(), Buildings), Pack);
+
+	// Static guidance is always present.
+	TestTrue(TEXT("clock rules"), Pack.Contains(TEXT("## Clock speed rules")));
+	TestTrue(TEXT("authority header"), Pack.Contains(TEXT("GAME DATA PACK")));
 	return true;
 }
 

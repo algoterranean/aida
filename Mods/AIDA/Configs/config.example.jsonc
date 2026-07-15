@@ -39,5 +39,8 @@
     "undoWindow": 25,                             // how far back /aida undo may reach
     "costMode": "central"                         // "central" (deduct vs central storage) | "free"
   },
-  "prompts": { "systemPromptFile": "prompts/system.md", "toolsFile": "tools.json" }
+  // packEnabled appends the generated game data pack (recipes/buildings/logistics, ~15-25k tokens,
+  // rebuilt every 5 min) to the system prompt so the model does rate/power/layout math without
+  // lookup round-trips. Costs more per request unless the provider caches prompt prefixes.
+  "prompts": { "systemPromptFile": "prompts/system.md", "toolsFile": "tools.json", "packEnabled": true }
 }

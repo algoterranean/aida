@@ -92,6 +92,8 @@ struct FAIDAPromptsConfig
 
 	UPROPERTY() FString SystemPromptFile = TEXT("prompts/system.md");
 	UPROPERTY() FString ToolsFile = TEXT("tools.json");
+	/** Append the generated game data pack (recipes/buildings/logistics, docs/PROMPT.md §2) to the system prompt. */
+	UPROPERTY() bool bPackEnabled = true;
 };
 
 USTRUCT()

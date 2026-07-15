@@ -6,6 +6,7 @@
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
+#include "Tools/AIDAPromptPack.h"
 #include "Tools/AIDARecipeTools.h"
 #include "Tools/AIDANotesTools.h"
 #include "Tools/AIDASnapshotTools.h"
@@ -190,6 +191,26 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(NodesCommand);
 		NodesCommand = nullptr;
+	}
+	if (RecipesCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(RecipesCommand);
+		RecipesCommand = nullptr;
+	}
+	if (DumpPackCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(DumpPackCommand);
+		DumpPackCommand = nullptr;
+	}
+	if (MemoryCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(MemoryCommand);
+		MemoryCommand = nullptr;
+	}
+	if (SnapshotCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(SnapshotCommand);
+		SnapshotCommand = nullptr;
 	}
 	if (ProposeCommand)
 	{
@@ -490,6 +511,15 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 		return;
 	}
 
+	// Assemble the system prompt most-stable-first (docs/PROMPT.md §5, prompt-cache friendliness):
+	// persona/rules, then the generated game data pack (rebuilt at most every PackTtlSeconds), and
+	// the volatile per-request state line LAST so it never invalidates the stable prefix.
+	FString SystemPrompt(GAIDASystemPrompt);
+	if (Config.Prompts.bPackEnabled)
+	{
+		SystemPrompt += TEXT("\n\n") + GetPromptPack();
+	}
+
 	// Ground the model in the AUTHORITATIVE proposal state every request — it kept inventing queue
 	// rules ("must wait for the previous proposal") and phantom proposals when it had to guess.
 	if (Config.Actions.bEnabled)
@@ -513,8 +543,9 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 			StateLine += TEXT(" One approved proposal is executing right now.");
 		}
 		StateLine += TEXT(" Never claim you must wait for a previous proposal — just call propose_build; if a limit applies, the tool error will say so.");
-		LLMClient->SetSystemPrompt(FString(GAIDASystemPrompt) + StateLine);
+		SystemPrompt += StateLine;
 	}
+	LLMClient->SetSystemPrompt(SystemPrompt);
 
 	// Build context BEFORE opening the AIDA message so the empty reply isn't included.
 	TArray<FAIDAChatMessage> Context;
@@ -1403,6 +1434,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Recipes),
 		ECVF_Default);
 
+	DumpPackCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.DumpPack"),
+		TEXT("Rebuild + log the generated game data pack appended to the system prompt (docs/PROMPT.md §2 eyeball check, no LLM). Run on server/host. Usage: AIDA.DumpPack"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::DumpPack),
+		ECVF_Default);
+
 	MemoryCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("AIDA.Memory"),
 		TEXT("Log the memory session id + note/marker/journal counts + sidecar snapshot count (checks Phase 3 persistence). Run on server/host. Usage: AIDA.Memory"),
@@ -1650,6 +1687,40 @@ void UAIDAOrchestrator::Recipes(const TArray<FString>& Args)
 	const FString Filter = FString::Join(Args, TEXT(" "));
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Recipes recipes: %s"), *AIDARecipeTools::BuildRecipeJson(RecipeCatalog.GetRecipes(World, Now), Filter));
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Recipes buildings: %s"), *AIDARecipeTools::BuildBuildingJson(RecipeCatalog.GetBuildings(World, Now), Filter));
+}
+
+const FString& UAIDAOrchestrator::GetPromptPack()
+{
+	UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+	if (PromptPackBuiltAt < 0.0 || (Now - PromptPackBuiltAt) >= PackTtlSeconds)
+	{
+		PromptPackCache = AIDAPromptPack::Build(RecipeCatalog.GetRecipes(World, Now), RecipeCatalog.GetBuildings(World, Now));
+		PromptPackBuiltAt = Now;
+		UE_LOG(LogAIDA, Log, TEXT("[prompt] game data pack rebuilt: %d chars (~%d tokens)."),
+			PromptPackCache.Len(), PromptPackCache.Len() / 4);
+	}
+	return PromptPackCache;
+}
+
+void UAIDAOrchestrator::DumpPack(const TArray<FString>& /*Args*/)
+{
+	// The pack reads the recipe manager (a world subsystem) — server/host only.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.DumpPack runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	PromptPackBuiltAt = -1.0; // force a fresh build so the dump reflects current unlocks
+	const FString& Pack = GetPromptPack();
+	// UE_LOG truncates very long lines on some sinks — dump in chunks so the whole pack is readable.
+	constexpr int32 ChunkChars = 4000;
+	for (int32 Start = 0; Start < Pack.Len(); Start += ChunkChars)
+	{
+		UE_LOG(LogAIDA, Log, TEXT("AIDA.DumpPack [%d/%d]:\n%s"),
+			Start / ChunkChars + 1, (Pack.Len() + ChunkChars - 1) / ChunkChars, *Pack.Mid(Start, ChunkChars));
+	}
 }
 
 void UAIDAOrchestrator::MemoryStatus(const TArray<FString>& /*Args*/)

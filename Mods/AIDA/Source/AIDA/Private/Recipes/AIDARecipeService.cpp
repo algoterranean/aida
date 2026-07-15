@@ -4,9 +4,16 @@
 
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "FGClearanceInterface.h"
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
 #include "ItemAmount.h"
+#include "Buildables/FGBuildable.h"
+#include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildableFactory.h"
+#include "Buildables/FGBuildableGeneratorFuel.h"
+#include "Buildables/FGBuildablePipeline.h"
+#include "Buildables/FGBuildableResourceExtractor.h"
 #include "Resources/FGBuildingDescriptor.h"
 #include "Resources/FGItemDescriptor.h"
 
@@ -33,6 +40,106 @@ namespace
 	bool IsBuildingDescriptor(TSubclassOf<UFGItemDescriptor> ItemClass)
 	{
 		return ItemClass && ItemClass->IsChildOf(UFGBuildingDescriptor::StaticClass());
+	}
+
+	/** Read a protected float UPROPERTY off a CDO by name (no public getter). 0 when absent. */
+	double ReflectedFloat(const UObject* CDO, const TCHAR* PropertyName)
+	{
+		if (!CDO) { return 0.0; }
+		if (const FFloatProperty* Prop = FindFProperty<FFloatProperty>(CDO->GetClass(), PropertyName))
+		{
+			return static_cast<double>(Prop->GetPropertyValue_InContainer(CDO));
+		}
+		return 0.0;
+	}
+
+	bool ReflectedBool(const UObject* CDO, const TCHAR* PropertyName)
+	{
+		if (!CDO) { return false; }
+		if (const FBoolProperty* Prop = FindFProperty<FBoolProperty>(CDO->GetClass(), PropertyName))
+		{
+			return Prop->GetPropertyValue_InContainer(CDO);
+		}
+		return false;
+	}
+
+	/**
+	 * Fill the prompt-pack fields (docs/PROMPT.md §2) from the buildable CDO: clearance footprint,
+	 * clock/power exponent, logistics throughputs, and generator fuel burn — everything the model
+	 * needs for ratio/power/layout math without a lookup round-trip. Named uniquely (unity build
+	 * merges anonymous namespaces across Private/*.cpp — ResolveFootprint already exists in Actions).
+	 */
+	void FillPackFields(const AFGBuildable* CDO, FAIDABuildingInfo& Info)
+	{
+		if (!CDO) { return; }
+
+		// Footprint/height from the union of the CDO's clearance boxes (same source the build gun uses).
+		TArray<FFGClearanceData> Clearances;
+		IFGClearanceInterface::Execute_GetClearanceData(const_cast<AFGBuildable*>(CDO), Clearances);
+		FBox Union(ForceInit);
+		for (const FFGClearanceData& Data : Clearances)
+		{
+			if (Data.IsValid()) { Union += Data.GetTransformedClearanceBox(); }
+		}
+		if (Union.IsValid)
+		{
+			const FVector Size = Union.GetSize();
+			if (Size.X > 1.0) { Info.FootprintXM = Size.X / 100.0; }
+			if (Size.Y > 1.0) { Info.FootprintYM = Size.Y / 100.0; }
+			if (Size.Z > 1.0) { Info.HeightM = Size.Z / 100.0; }
+		}
+
+		// Clock scaling: power = base × (clock/100)^exponent. The exponent is a protected UPROPERTY
+		// on AFGBuildableFactory with no getter → reflection. Only meaningful for powered buildings.
+		if (CDO->IsA<AFGBuildableFactory>() && (Info.PowerConsumptionMW > 0.0 || Info.bVariablePower))
+		{
+			Info.PowerExponent = ReflectedFloat(CDO, TEXT("mPowerConsumptionExponent"));
+		}
+
+		// Logistics tiers. Belt mSpeed is cm/s with 120 cm item spacing → items/min = speed/2.
+		if (const AFGBuildableConveyorBase* Belt = Cast<AFGBuildableConveyorBase>(CDO))
+		{
+			Info.BeltItemsPerMin = Belt->GetSpeed() / 2.0;
+		}
+		else if (const AFGBuildablePipeline* Pipe = Cast<AFGBuildablePipeline>(CDO))
+		{
+			Info.PipeM3PerMin = Pipe->GetFlowLimit() * 60.0; // m³/s → m³/min
+		}
+		else if (const AFGBuildableResourceExtractor* Extractor = Cast<AFGBuildableResourceExtractor>(CDO))
+		{
+			const double CycleTime = Extractor->GetDefaultExtractCycleTime();
+			if (CycleTime > 0.0)
+			{
+				double PerMin = Extractor->GetNumExtractedItemsPerCycle() * 60.0 / CycleTime;
+				// Fluid extractors count cm³ per cycle (≥1000/cycle); solids extract single-digit items.
+				if (Extractor->GetNumExtractedItemsPerCycle() >= 1000) { PerMin /= 1000.0; }
+				Info.ExtractPerMinNormal = PerMin;
+			}
+		}
+		else if (const AFGBuildableGeneratorFuel* Generator = Cast<AFGBuildableGeneratorFuel>(CDO))
+		{
+			const double MW = Info.PowerProductionMW;
+			for (const TSoftClassPtr<UFGItemDescriptor>& FuelSoft : Generator->GetDefaultFuelClasses())
+			{
+				const TSubclassOf<UFGItemDescriptor> Fuel = FuelSoft.LoadSynchronous();
+				if (!Fuel) { continue; }
+				const double EnergyMJ = UFGItemDescriptor::GetEnergyValue(Fuel);
+				if (EnergyMJ <= 0.0 || MW <= 0.0) { continue; }
+				double BurnPerMin = MW * 60.0 / EnergyMJ; // MJ/min ÷ MJ/item
+				const EResourceForm Form = UFGItemDescriptor::GetForm(Fuel);
+				if (Form == EResourceForm::RF_LIQUID || Form == EResourceForm::RF_GAS)
+				{
+					BurnPerMin /= 1000.0; // fluid energy is per litre → m³/min
+				}
+				Info.Fuels.Add({ ItemName(Fuel), BurnPerMin });
+			}
+			// Supplemental (water) intake: ratio is litres per MJ produced (protected, no getter).
+			if (ReflectedBool(CDO, TEXT("mRequiresSupplementalResource")))
+			{
+				const double Ratio = ReflectedFloat(CDO, TEXT("mSupplementalToPowerRatio"));
+				Info.SupplementalM3PerMin = MW * 60.0 * Ratio / 1000.0;
+			}
+		}
 	}
 }
 
@@ -69,9 +176,12 @@ void FAIDARecipeCatalog::ExtractInto(UObject* WorldContext, TArray<FAIDARecipeIn
 		Info.MinPowerMW = UFGBuildingDescriptor::GetMinimumPowerConsumption(Descriptor);
 		Info.MaxPowerMW = UFGBuildingDescriptor::GetMaximumPowerConsumption(Descriptor);
 		Info.PowerProductionMW = UFGBuildingDescriptor::GetPowerProduction(Descriptor);
+
+		UClass* Buildable = UFGBuildingDescriptor::GetBuildableClass(Descriptor).Get();
+		FillPackFields(Buildable ? Buildable->GetDefaultObject<AFGBuildable>() : nullptr, Info);
 		OutBuildings.Add(MoveTemp(Info));
 
-		if (UClass* Buildable = UFGBuildingDescriptor::GetBuildableClass(Descriptor).Get())
+		if (Buildable)
 		{
 			BuildableToName.Add(Buildable, OutBuildings.Last().Name);
 		}

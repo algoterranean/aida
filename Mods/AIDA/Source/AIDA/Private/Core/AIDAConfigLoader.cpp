@@ -169,6 +169,7 @@ bool FAIDAConfigLoader::LoadFromString(const FString& Jsonc, FAIDAConfig& OutCon
 	{
 		(*Prompts)->TryGetStringField(TEXT("systemPromptFile"), Parsed.Prompts.SystemPromptFile);
 		(*Prompts)->TryGetStringField(TEXT("toolsFile"), Parsed.Prompts.ToolsFile);
+		(*Prompts)->TryGetBoolField(TEXT("packEnabled"), Parsed.Prompts.bPackEnabled);
 	}
 
 	if (!Validate(Parsed, OutError))

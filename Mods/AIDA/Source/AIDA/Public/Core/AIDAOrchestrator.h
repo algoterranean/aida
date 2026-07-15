@@ -151,6 +151,16 @@ private:
 	/** `AIDA.Recipes` — dump the recipe/building catalog for a filter (static-catalog check, no LLM). */
 	void Recipes(const TArray<FString>& Args);
 
+	/** `AIDA.DumpPack` — rebuild + log the generated game data pack (docs/PROMPT.md §2 eyeball check, no LLM). */
+	void DumpPack(const TArray<FString>& Args);
+
+	/**
+	 * The generated game data pack appended to the system prompt (docs/PROMPT.md §2). Built lazily
+	 * from the recipe catalog and cached for PackTtlSeconds — the bytes must stay stable across
+	 * requests (prompt-cache friendliness), so it is NOT rebuilt per message. Server-only.
+	 */
+	const FString& GetPromptPack();
+
 	/** `AIDA.Memory` — dump the memory session id + note/marker/journal + sidecar snapshot counts. */
 	void MemoryStatus(const TArray<FString>& Args);
 
@@ -199,6 +209,9 @@ private:
 	FAIDAFactoryIndex FactoryIndex;
 	FAIDAMapService MapService;
 	FAIDARecipeCatalog RecipeCatalog;
+	FString PromptPackCache;
+	double PromptPackBuiltAt = -1.0;
+	static constexpr double PackTtlSeconds = 300.0;
 	FAIDAMemory Memory;
 	FAIDAActionEngine Actions;
 	IConsoleCommand* PingCommand = nullptr;
@@ -207,6 +220,7 @@ private:
 	IConsoleCommand* IndexCommand = nullptr;
 	IConsoleCommand* NodesCommand = nullptr;
 	IConsoleCommand* RecipesCommand = nullptr;
+	IConsoleCommand* DumpPackCommand = nullptr;
 	IConsoleCommand* MemoryCommand = nullptr;
 	IConsoleCommand* SnapshotCommand = nullptr;
 	IConsoleCommand* ProposeCommand = nullptr;
