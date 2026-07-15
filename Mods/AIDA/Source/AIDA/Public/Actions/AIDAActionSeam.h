@@ -33,6 +33,16 @@ public:
 	static bool ResolveAimPoint(UObject* WorldContext, const FString& PlayerId, FVector& OutPointCm);
 
 	/**
+	 * The aim point, SNAPPED the way the build gun would place this recipe there: a probe hologram
+	 * is placed at the player's aim hit (running the game's TrySnapToActor / world-grid snapping)
+	 * and its resulting position becomes the grid origin — so building "there" while aiming at an
+	 * existing structure extends it tile-perfectly instead of overlapping it slightly askew.
+	 * Falls back to the raw aim point when the hologram can't spawn.
+	 */
+	static bool ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
+		const FString& RecipeClassPath, int32 YawDeg, FVector& OutOriginCm);
+
+	/**
 	 * Ground height (cm) under a point, via the same build-gun-channel trace placements use.
 	 * Feeds followTerrain specs: placement Z is pre-adjusted per tile at propose time.
 	 */

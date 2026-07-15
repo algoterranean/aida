@@ -945,12 +945,25 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
-			// No origin = "where the requesting player is aiming" (build-gun trace), falling back to
-			// their position — players mean "build it THERE", and it keeps the grid off their feet.
+			FAIDARecipeResolution Recipe;
+			if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Buildable, Recipe))
+			{
+				FString Msg = FString::Printf(TEXT("no unlocked buildable matches '%s'"), *Spec.Buildable);
+				if (Recipe.Suggestions.Num() > 0)
+				{
+					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Recipe.Suggestions, TEXT(", ")));
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+			Spec.Buildable = Recipe.DisplayName; // canonical name for the summary
+
+			// No origin = "where the requesting player is aiming", SNAPPED like the build gun (extends
+			// an aimed structure tile-perfectly / aligns to the world grid), falling back to their
+			// position — players mean "build it THERE", and it keeps the grid off their feet.
 			if (!Spec.bHasOrigin)
 			{
 				FVector AimCm;
-				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, Spec.YawDeg, AimCm))
 				{
 					Spec.OriginM = AimCm / 100.0; // world cm -> spec metres
 				}
@@ -973,18 +986,6 @@ void UAIDAOrchestrator::RegisterActionTools()
 				Origin->SetField(TEXT("z"), AIDANumber(Spec.OriginM.Z));
 				(*SpecObj)->SetObjectField(TEXT("origin"), Origin);
 			}
-
-			FAIDARecipeResolution Recipe;
-			if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Buildable, Recipe))
-			{
-				FString Msg = FString::Printf(TEXT("no unlocked buildable matches '%s'"), *Spec.Buildable);
-				if (Recipe.Suggestions.Num() > 0)
-				{
-					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Recipe.Suggestions, TEXT(", ")));
-				}
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
-			}
-			Spec.Buildable = Recipe.DisplayName; // canonical name for the summary
 
 			TArray<FTransform> Placements = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
 

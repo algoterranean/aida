@@ -336,48 +336,89 @@ bool FAIDAActionSeam::ResolveBuildRecipe(UObject* WorldContext, const FString& D
 	return true;
 }
 
+namespace
+{
+	/** The requesting player's build-gun-channel aim hit (150 m reach). Empty-id = the listen host. */
+	bool TraceAimHit(UWorld* World, const FString& PlayerId, FHitResult& OutHit)
+	{
+		if (!World || PlayerId == TEXT("debug")) { return false; }
+
+		// Same identity convention as the orchestrator's location resolver: the listen-server host's
+		// net id resolves to null → an empty id string matches the empty-id controller.
+		APlayerController* Requester = nullptr;
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			APlayerState* PS = PC ? PC->PlayerState : nullptr;
+			if (!PS) { continue; }
+			const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
+			const FString Id = NetId.IsValid() ? NetId->ToString() : FString();
+			if (Id == PlayerId)
+			{
+				Requester = PC;
+				break;
+			}
+		}
+		if (!Requester) { return false; }
+
+		FVector ViewLocation;
+		FRotator ViewRotation;
+		Requester->GetPlayerViewPoint(ViewLocation, ViewRotation);
+
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAAimTrace), /*bTraceComplex*/ false);
+		if (APawn* Pawn = Requester->GetPawn()) { Params.AddIgnoredActor(Pawn); }
+
+		if (!World->LineTraceSingleByChannel(OutHit, ViewLocation, ViewLocation + ViewRotation.Vector() * 15000.0, AIDABuildGunChannel, Params))
+		{
+			UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim trace MISSED (view=%s dir=%s)"),
+				*ViewLocation.ToCompactString(), *ViewRotation.Vector().ToCompactString());
+			return false;
+		}
+		UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim hit %s (%s) at %s"),
+			*GetNameSafe(OutHit.GetActor()), OutHit.GetActor() ? *GetNameSafe(OutHit.GetActor()->GetClass()) : TEXT("-"),
+			*OutHit.ImpactPoint.ToCompactString());
+		return true;
+	}
+}
+
 bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& PlayerId, FVector& OutPointCm)
 {
-	UWorld* World = ResolveWorld(WorldContext);
-	if (!World || PlayerId == TEXT("debug")) { return false; }
-
-	// Same identity convention as the orchestrator's location resolver: the listen-server host's
-	// net id resolves to null → an empty id string matches the empty-id controller.
-	APlayerController* Requester = nullptr;
-	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
-	{
-		APlayerController* PC = It->Get();
-		APlayerState* PS = PC ? PC->PlayerState : nullptr;
-		if (!PS) { continue; }
-		const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
-		const FString Id = NetId.IsValid() ? NetId->ToString() : FString();
-		if (Id == PlayerId)
-		{
-			Requester = PC;
-			break;
-		}
-	}
-	if (!Requester) { return false; }
-
-	FVector ViewLocation;
-	FRotator ViewRotation;
-	Requester->GetPlayerViewPoint(ViewLocation, ViewRotation);
-
-	FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAAimTrace), /*bTraceComplex*/ false);
-	if (APawn* Pawn = Requester->GetPawn()) { Params.AddIgnoredActor(Pawn); }
-
-	// The build gun's own channel and roughly its reach (150 m) — "there" means what they can see.
 	FHitResult Hit;
-	if (!World->LineTraceSingleByChannel(Hit, ViewLocation, ViewLocation + ViewRotation.Vector() * 15000.0, AIDABuildGunChannel, Params))
+	if (!TraceAimHit(ResolveWorld(WorldContext), PlayerId, Hit))
 	{
-		UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim trace MISSED (view=%s dir=%s)"),
-			*ViewLocation.ToCompactString(), *ViewRotation.Vector().ToCompactString());
 		return false;
 	}
-	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim hit %s (%s) at %s"),
-		*GetNameSafe(Hit.GetActor()), Hit.GetActor() ? *GetNameSafe(Hit.GetActor()->GetClass()) : TEXT("-"),
-		*Hit.ImpactPoint.ToCompactString());
 	OutPointCm = Hit.ImpactPoint;
+	return true;
+}
+
+bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
+	const FString& RecipeClassPath, int32 YawDeg, FVector& OutOriginCm)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	FHitResult Hit;
+	if (!TraceAimHit(World, PlayerId, Hit))
+	{
+		return false;
+	}
+	OutOriginCm = Hit.ImpactPoint;
+
+	// Probe hologram at the REAL aim hit: UpdateHologramPlacement runs the game's snapping
+	// (TrySnapToActor against the aimed structure, world-grid alignment), and where the hologram
+	// lands is where the build gun would have put it — the grid origin players expect.
+	UClass* RecipeClass = FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>();
+	AFGHologram* Hologram = RecipeClass ? SpawnValidationHologram(World, RecipeClass, Hit.ImpactPoint) : nullptr;
+	if (!Hologram)
+	{
+		return true; // raw aim point is still a usable origin
+	}
+	Hologram->SetScrollRotateValue(YawDeg);
+	Hologram->UpdateHologramPlacement(Hit);
+	OutOriginCm = Hologram->GetActorLocation();
+	Hologram->Destroy();
+
+	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s"),
+		*Hit.ImpactPoint.ToCompactString(), *OutOriginCm.ToCompactString());
 	return true;
 }
 
