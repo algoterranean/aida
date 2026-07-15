@@ -248,44 +248,21 @@ TArray<FAIDALogisticsFlow> FAIDAFactoryAggregator::BuildLogistics(const TArray<F
 	return Flows;
 }
 
-TArray<FAIDAPowerReport> FAIDAFactoryAggregator::BuildPowerReport(const TArray<FAIDAMachine>& Machines,
-	const TArray<FAIDAPowerCircuitStats>& Circuits)
+TArray<FAIDAPowerReport> FAIDAFactoryAggregator::BuildPowerReport(const TArray<FAIDAPowerCircuitStats>& Circuits)
 {
-	// Consumption is summed from machine loads (draws only); generation/capacity/battery come from stats.
-	TMap<int32, double> ConsumedByCircuit;
-	for (const FAIDAMachine& M : Machines)
-	{
-		if (M.CircuitId != 0 && M.PowerMW > 0.0)
-		{
-			ConsumedByCircuit.FindOrAdd(M.CircuitId) += M.PowerMW;
-		}
-	}
-
-	TMap<int32, FAIDAPowerCircuitStats> StatsById;
+	// One report per circuit, straight from the game's authoritative circuit stats (produced / capacity /
+	// consumed / battery). Circuit id 0 is a real single-grid id, so we do NOT filter it out.
+	TArray<FAIDAPowerReport> Reports;
+	Reports.Reserve(Circuits.Num());
 	for (const FAIDAPowerCircuitStats& S : Circuits)
 	{
-		if (S.CircuitId != 0) { StatsById.Add(S.CircuitId, S); }
-	}
-
-	// Report every circuit that either has stats or has drawing machines.
-	TSet<int32> CircuitIds;
-	for (const TPair<int32, double>& P : ConsumedByCircuit) { CircuitIds.Add(P.Key); }
-	for (const TPair<int32, FAIDAPowerCircuitStats>& P : StatsById) { CircuitIds.Add(P.Key); }
-
-	TArray<FAIDAPowerReport> Reports;
-	Reports.Reserve(CircuitIds.Num());
-	for (int32 Id : CircuitIds)
-	{
 		FAIDAPowerReport R;
-		R.CircuitId = Id;
-		R.ConsumedMW = ConsumedByCircuit.FindRef(Id);
-		if (const FAIDAPowerCircuitStats* S = StatsById.Find(Id))
-		{
-			R.ProducedMW = S->ProducedMW;
-			R.CapacityMW = S->CapacityMW;
-			R.BatteryMWh = S->BatteryMWh;
-			R.BatteryDrainSeconds = S->BatteryDrainSeconds;
-		}
+		R.CircuitId = S.CircuitId;
+		R.ProducedMW = S.ProducedMW;
+		R.CapacityMW = S.CapacityMW;
+		R.ConsumedMW = S.ConsumedMW;
+		R.BatteryMWh = S.BatteryMWh;
+		R.BatteryDrainSeconds = S.BatteryDrainSeconds;
 		Reports.Add(MoveTemp(R));
 	}
 	Reports.Sort([](const FAIDAPowerReport& A, const FAIDAPowerReport& B) { return A.CircuitId < B.CircuitId; });
@@ -352,7 +329,7 @@ FAIDABottleneckResult FAIDAFactoryAggregator::FindBottleneck(const FAIDAFactoryS
 	Result.StarvedInputs.Sort([](const FAIDAItemRate& A, const FAIDAItemRate& B) { return A.PerMinute > B.PerMinute; });
 
 	// Power: any producer circuit over capacity?
-	const TArray<FAIDAPowerReport> Power = BuildPowerReport(Snapshot.Machines, Snapshot.Circuits);
+	const TArray<FAIDAPowerReport> Power = BuildPowerReport(Snapshot.Circuits);
 	int32 OverloadedCircuit = -1;
 	for (const FAIDAPowerReport& P : Power)
 	{
@@ -397,7 +374,7 @@ FAIDAFactoryAggregates FAIDAFactoryAggregator::Aggregate(const FAIDAFactorySnaps
 		ClusterOfMachineId.Add(Snapshot.Machines[i].Id, Labels[i]);
 	}
 	Result.Flows = BuildLogistics(Snapshot.Edges, ClusterOfMachineId);
-	Result.Power = BuildPowerReport(Snapshot.Machines, Snapshot.Circuits);
+	Result.Power = BuildPowerReport(Snapshot.Circuits);
 
 	return Result;
 }

@@ -48,9 +48,8 @@ public:
 	static TArray<FAIDALogisticsFlow> BuildLogistics(const TArray<FAIDAConveyorEdge>& Edges,
 		const TMap<int32, int32>& ClusterOfMachineId);
 
-	/** Per-circuit power: capacity/produced/battery from circuit stats, consumption summed from machine loads. */
-	static TArray<FAIDAPowerReport> BuildPowerReport(const TArray<FAIDAMachine>& Machines,
-		const TArray<FAIDAPowerCircuitStats>& Circuits);
+	/** Per-circuit power report, straight from the game's authoritative circuit stats (keeps circuit id 0). */
+	static TArray<FAIDAPowerReport> BuildPowerReport(const TArray<FAIDAPowerCircuitStats>& Circuits);
 
 	/**
 	 * Diagnose why one item's production is limited, without the belt/pipe graph: locate its producers,

@@ -6,6 +6,7 @@
 #include "Buildables/FGBuildableFactory.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildableResourceExtractor.h"
+#include "Resources/FGExtractableResourceInterface.h"
 #include "FGRecipe.h"
 #include "ItemAmount.h"
 #include "Resources/FGItemDescriptor.h"
@@ -62,6 +63,8 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 
 	const TArray<AFGBuildable*>& Buildables = Subsystem->GetAllBuildablesRef();
 	int32 NextId = 1;
+	int32 ExtractorCount = 0;
+	int32 ExtractorWithResource = 0;
 	TSet<UFGPowerCircuit*> SeenCircuits;
 
 	for (AFGBuildable* Buildable : Buildables)
@@ -98,13 +101,18 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 		else if (AFGBuildableResourceExtractor* Extractor = Cast<AFGBuildableResourceExtractor>(Factory))
 		{
 			bIsMachine = true;
+			++ExtractorCount;
+			// GetResourceNode() is DEPRECATED and returns null in current versions — read the resource
+			// off the extractable-resource interface instead, or every mined item reads as a false deficit.
 			TSubclassOf<UFGItemDescriptor> ResourceClass;
-			if (AFGResourceNode* Node = Extractor->GetResourceNode())
+			const TScriptInterface<IFGExtractableResourceInterface> Resource = Extractor->GetExtractableResource();
+			if (Resource.GetObject())
 			{
-				ResourceClass = Node->GetResourceClass();
+				ResourceClass = Resource->GetResourceClass();
 			}
 			if (ResourceClass)
 			{
+				++ExtractorWithResource;
 				Machine.Outputs.Add({ ExtractItemKey(ResourceClass), static_cast<double>(Extractor->GetExtractionPerMinute()) });
 			}
 		}
@@ -135,13 +143,14 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 		Report.CircuitId = Circuit->GetCircuitID();
 		Report.ProducedMW = Stats.PowerProduced;
 		Report.CapacityMW = Stats.PowerProductionCapacity;
+		Report.ConsumedMW = Stats.PowerConsumed;
 		Report.BatteryMWh = Circuit->GetBatterySumPowerStore();
 		Report.BatteryDrainSeconds = Circuit->GetTimeToBatteriesEmpty();
 		Out.Circuits.Add(MoveTemp(Report));
 	}
 
-	UE_LOG(LogAIDA, Log, TEXT("[index] extracted %d machines, %d power circuits (edges deferred)."),
-		Out.Machines.Num(), Out.Circuits.Num());
+	UE_LOG(LogAIDA, Log, TEXT("[index] extracted %d machines (%d/%d extractors resolved a resource), %d power circuits (edges deferred)."),
+		Out.Machines.Num(), ExtractorWithResource, ExtractorCount, Out.Circuits.Num());
 }
 
 const FAIDAFactorySnapshot& FAIDAFactoryIndex::GetSnapshot(UObject* WorldContext, double NowSeconds, double TtlSeconds)

@@ -13,9 +13,6 @@ namespace
 	constexpr int32 MaxItemsInBalance = 40;
 	constexpr int32 MaxMachineIdsInCluster = 60;
 
-	/** Round to one decimal place — plenty for rates/power and keeps token counts down. */
-	double Round1(double V) { return FMath::RoundToDouble(V * 10.0) / 10.0; }
-
 	/** Centroid humanized to whole metres (world units are cm), as [x, y] — Z dropped for the overview. */
 	TArray<TSharedPtr<FJsonValue>> CentroidMetres(const FVector& Centroid)
 	{
@@ -33,7 +30,7 @@ namespace
 		{
 			const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 			O->SetStringField(TEXT("item"), R.Item);
-			O->SetNumberField(TEXT("perMin"), Round1(R.PerMinute));
+			O->SetField(TEXT("perMin"), AIDANumber(R.PerMinute));
 			Arr.Add(MakeShared<FJsonValueObject>(O));
 		}
 		return Arr;
@@ -80,7 +77,7 @@ FString AIDAFactoryTools::BuildOverviewJson(const FAIDAFactoryAggregates& Aggreg
 		O->SetNumberField(TEXT("machines"), C.MachineIds.Num());
 		O->SetArrayField(TEXT("centroid_m"), CentroidMetres(C.Centroid));
 		O->SetStringField(TEXT("primaryOutput"), PrimaryOutput(C));
-		O->SetNumberField(TEXT("efficiency"), Round1(C.Efficiency));
+		O->SetField(TEXT("efficiency"), AIDANumber(C.Efficiency));
 		ClusterList.Add(MakeShared<FJsonValueObject>(O));
 	}
 	Root->SetArrayField(TEXT("clusterList"), ClusterList);
@@ -98,7 +95,7 @@ FString AIDAFactoryTools::BuildOverviewJson(const FAIDAFactoryAggregates& Aggreg
 	{
 		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetStringField(TEXT("item"), Deficits[i]->Item);
-		O->SetNumberField(TEXT("deficit"), Round1(-Deficits[i]->Net()));
+		O->SetField(TEXT("deficit"), AIDANumber(-Deficits[i]->Net()));
 		DeficitArr.Add(MakeShared<FJsonValueObject>(O));
 	}
 	Root->SetArrayField(TEXT("topDeficits"), DeficitArr);
@@ -109,9 +106,9 @@ FString AIDAFactoryTools::BuildOverviewJson(const FAIDAFactoryAggregates& Aggreg
 	{
 		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetNumberField(TEXT("circuit"), R.CircuitId);
-		O->SetNumberField(TEXT("produced_MW"), Round1(R.ProducedMW));
-		O->SetNumberField(TEXT("capacity_MW"), Round1(R.CapacityMW));
-		O->SetNumberField(TEXT("consumed_MW"), Round1(R.ConsumedMW));
+		O->SetField(TEXT("produced_MW"), AIDANumber(R.ProducedMW));
+		O->SetField(TEXT("capacity_MW"), AIDANumber(R.CapacityMW));
+		O->SetField(TEXT("consumed_MW"), AIDANumber(R.ConsumedMW));
 		O->SetBoolField(TEXT("overloaded"), R.IsOverloaded());
 		PowerArr.Add(MakeShared<FJsonValueObject>(O));
 	}
@@ -130,9 +127,9 @@ FString AIDAFactoryTools::BuildItemBalanceJson(const FAIDAFactoryAggregates& Agg
 			{
 				const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 				O->SetStringField(TEXT("item"), B.Item);
-				O->SetNumberField(TEXT("produced"), Round1(B.Produced));
-				O->SetNumberField(TEXT("consumed"), Round1(B.Consumed));
-				O->SetNumberField(TEXT("net"), Round1(B.Net()));
+				O->SetField(TEXT("produced"), AIDANumber(B.Produced));
+				O->SetField(TEXT("consumed"), AIDANumber(B.Consumed));
+				O->SetField(TEXT("net"), AIDANumber(B.Net()));
 				O->SetBoolField(TEXT("deficit"), B.IsDeficit());
 				return AIDAToCompactJson(O);
 			}
@@ -155,9 +152,9 @@ FString AIDAFactoryTools::BuildItemBalanceJson(const FAIDAFactoryAggregates& Agg
 		const FAIDAItemBalance& B = *Items[i];
 		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetStringField(TEXT("item"), B.Item);
-		O->SetNumberField(TEXT("produced"), Round1(B.Produced));
-		O->SetNumberField(TEXT("consumed"), Round1(B.Consumed));
-		O->SetNumberField(TEXT("net"), Round1(B.Net()));
+		O->SetField(TEXT("produced"), AIDANumber(B.Produced));
+		O->SetField(TEXT("consumed"), AIDANumber(B.Consumed));
+		O->SetField(TEXT("net"), AIDANumber(B.Net()));
 		Arr.Add(MakeShared<FJsonValueObject>(O));
 	}
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -181,7 +178,7 @@ FString AIDAFactoryTools::BuildClusterJson(const FAIDAFactoryAggregates& Aggrega
 	Root->SetNumberField(TEXT("id"), Cluster->Id);
 	Root->SetNumberField(TEXT("machines"), Cluster->MachineIds.Num());
 	Root->SetArrayField(TEXT("centroid_m"), CentroidMetres(Cluster->Centroid));
-	Root->SetNumberField(TEXT("efficiency"), Round1(Cluster->Efficiency));
+	Root->SetField(TEXT("efficiency"), AIDANumber(Cluster->Efficiency));
 
 	// Census, ordered by building name for stability.
 	TArray<FString> Buildings;
@@ -239,12 +236,12 @@ FString AIDAFactoryTools::BuildBottleneckJson(const FAIDABottleneckResult& Resul
 	Root->SetStringField(TEXT("item"), Result.Item);
 	Root->SetStringField(TEXT("status"), Status);
 	Root->SetStringField(TEXT("explanation"), Explanation);
-	Root->SetNumberField(TEXT("produced"), Round1(Result.Produced));
-	Root->SetNumberField(TEXT("consumed"), Round1(Result.Consumed));
-	Root->SetNumberField(TEXT("net"), Round1(Result.Net()));
+	Root->SetField(TEXT("produced"), AIDANumber(Result.Produced));
+	Root->SetField(TEXT("consumed"), AIDANumber(Result.Consumed));
+	Root->SetField(TEXT("net"), AIDANumber(Result.Net()));
 	Root->SetNumberField(TEXT("producers"), Result.ProducerCount);
 	Root->SetNumberField(TEXT("idle"), Result.ProducersIdle);
-	Root->SetNumberField(TEXT("avgProductivity"), Round1(Result.AvgProductivity));
+	Root->SetField(TEXT("avgProductivity"), AIDANumber(Result.AvgProductivity));
 	if (!Result.LimitingDetail.IsEmpty()) { Root->SetStringField(TEXT("limiting"), Result.LimitingDetail); }
 	if (Result.StarvedInputs.Num() > 0) { Root->SetArrayField(TEXT("starvedInputs"), RatesToJson(Result.StarvedInputs)); }
 

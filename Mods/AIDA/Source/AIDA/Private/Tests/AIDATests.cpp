@@ -768,29 +768,23 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryPowerTest, "AIDA.Factory.Power",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAFactoryPowerTest::RunTest(const FString&)
 {
-	TArray<FAIDAMachine> Machines;
-	FAIDAMachine A = AIDAMakeTestMachine(1, FVector::ZeroVector); A.CircuitId = 1; A.PowerMW = 60.0;
-	FAIDAMachine B = AIDAMakeTestMachine(2, FVector::ZeroVector); B.CircuitId = 1; B.PowerMW = 30.0;
-	FAIDAMachine Gen = AIDAMakeTestMachine(3, FVector::ZeroVector); Gen.CircuitId = 1; Gen.PowerMW = -50.0; // generator: not a draw
-	FAIDAMachine C = AIDAMakeTestMachine(4, FVector::ZeroVector); C.CircuitId = 2; C.PowerMW = 70.0;
-	Machines = { A, B, Gen, C };
-
+	// Reports come straight from circuit stats now (authoritative consumed), incl. circuit id 0.
 	TArray<FAIDAPowerCircuitStats> Circuits;
-	Circuits.Add({ 1, /*Produced*/ 90.0, /*Capacity*/ 100.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
-	Circuits.Add({ 2, /*Produced*/ 20.0, /*Capacity*/ 50.0,  /*Battery*/ 0.0, /*Drain*/ -1.0 });
+	Circuits.Add({ 0, /*Produced*/ 90.0, /*Capacity*/ 100.0, /*Consumed*/ 90.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
+	Circuits.Add({ 2, /*Produced*/ 20.0, /*Capacity*/ 50.0,  /*Consumed*/ 70.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
 
-	const TArray<FAIDAPowerReport> Reports = FAIDAFactoryAggregator::BuildPowerReport(Machines, Circuits);
+	const TArray<FAIDAPowerReport> Reports = FAIDAFactoryAggregator::BuildPowerReport(Circuits);
 	TestEqual(TEXT("two circuits, sorted by id"), Reports.Num(), 2);
 	if (Reports.Num() == 2)
 	{
-		TestEqual(TEXT("[0] circuit 1"), Reports[0].CircuitId, 1);
-		AIDA_TEST_NEAR("circuit 1 draw excludes generator", Reports[0].ConsumedMW, 90.0);
-		AIDA_TEST_NEAR("circuit 1 capacity", Reports[0].CapacityMW, 100.0);
-		AIDA_TEST_NEAR("circuit 1 headroom", Reports[0].Headroom(), 10.0);
-		TestFalse(TEXT("circuit 1 not overloaded"), Reports[0].IsOverloaded());
+		TestEqual(TEXT("[0] circuit id 0 kept"), Reports[0].CircuitId, 0);
+		AIDA_TEST_NEAR("circuit 0 consumed", Reports[0].ConsumedMW, 90.0);
+		AIDA_TEST_NEAR("circuit 0 capacity", Reports[0].CapacityMW, 100.0);
+		AIDA_TEST_NEAR("circuit 0 headroom", Reports[0].Headroom(), 10.0);
+		TestFalse(TEXT("circuit 0 not overloaded"), Reports[0].IsOverloaded());
 
 		TestEqual(TEXT("[1] circuit 2"), Reports[1].CircuitId, 2);
-		AIDA_TEST_NEAR("circuit 2 draw", Reports[1].ConsumedMW, 70.0);
+		AIDA_TEST_NEAR("circuit 2 consumed", Reports[1].ConsumedMW, 70.0);
 		TestTrue(TEXT("circuit 2 overloaded (70 > 50)"), Reports[1].IsOverloaded());
 	}
 	return true;
@@ -951,7 +945,7 @@ bool FAIDAFactoryBottleneckTest::RunTest(const FString&)
 		Smelter.PowerMW = 10.0;
 		FAIDAFactorySnapshot Snap;
 		Snap.Machines = { Miner, Smelter };
-		Snap.Circuits.Add({ 1, /*Produced*/ 5.0, /*Capacity*/ 5.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
+		Snap.Circuits.Add({ 1, /*Produced*/ 5.0, /*Capacity*/ 5.0, /*Consumed*/ 10.0, /*Battery*/ 0.0, /*Drain*/ -1.0 });
 
 		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("IronIngot"));
 		TestTrue(TEXT("power-limited"), R.Kind == EAIDABottleneck::Power);

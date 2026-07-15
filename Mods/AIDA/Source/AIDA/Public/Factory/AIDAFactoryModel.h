@@ -57,6 +57,7 @@ struct FAIDAPowerCircuitStats
 	int32 CircuitId = 0;
 	double ProducedMW = 0.0;         // current generation on the circuit
 	double CapacityMW = 0.0;         // max generation capacity
+	double ConsumedMW = 0.0;         // current draw (authoritative, from the circuit)
 	double BatteryMWh = 0.0;         // stored battery energy
 	double BatteryDrainSeconds = -1.0; // time-to-empty; <0 = not draining / no batteries
 };
