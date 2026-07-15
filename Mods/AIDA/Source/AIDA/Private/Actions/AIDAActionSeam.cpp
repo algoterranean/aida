@@ -217,6 +217,11 @@ namespace
 		Hologram->SetHologramLocationAndRotation(Hit);
 		Hologram->PostHologramPlacement(Hit);
 
+		// The disqualifier list only ever ACCUMULATES — the build gun resets it every frame before
+		// re-validating. Without this, the spawn-time defaults (Initializing + InvalidAimLocation)
+		// stick forever and every placement reports "Invalid aim location!" (live-verify round 4).
+		Hologram->ResetConstructDisqualifiers();
+
 		// Public validation entry (CheckValidPlacement/CheckClearance are protected). The inventory is
 		// only consumed by CheckCanAfford — which hard-asserts on null — and its Unaffordable verdict
 		// is filtered below; affordability is judged against central storage by the callers.
