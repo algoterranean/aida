@@ -41,6 +41,7 @@ struct FAIDABuildSpec
 	int32 Version = 1;
 	FString Buildable;                     // display name, fuzzy-resolved server-side (unlocked only)
 	FVector OriginM = FVector::ZeroVector; // metres
+	bool bHasOrigin = false;               // omitted origin = at the requesting player (Ctx.Location)
 	int32 YawDeg = 0;                      // snapped to 0/90/180/270
 	FAIDAGridSpec Grid;
 };
@@ -51,6 +52,7 @@ struct FAIDADismantleSpec
 	int32 Version = 1;
 	FString Buildable;                     // display-name match; "" = anything
 	FVector CenterM = FVector::ZeroVector; // metres
+	bool bHasCenter = false;               // omitted center = at the requesting player (Ctx.Location)
 	double RadiusM = 0.0;
 	int32 MaxCount = 20;
 };

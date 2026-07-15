@@ -42,7 +42,8 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Proposal->SpecJson);
 			FJsonSerializer::Deserialize(Reader, SpecObj);
 		}
-		if (!AIDAActionSpec::ParseDismantleSpec(SpecObj, Config.MaxProposalItems, Selector, ParseError))
+		if (!AIDAActionSpec::ParseDismantleSpec(SpecObj, Config.MaxProposalItems, Selector, ParseError) ||
+			!Selector.bHasCenter) // a stored selector must carry its concrete center — never default to (0,0)
 		{
 			ProposalStore.Transition(Id, EAIDAProposalState::Rejected, FDateTime::UtcNow().ToUnixTimestamp());
 			OutMessage = FString::Printf(TEXT("stored selector no longer parses (%s) — proposal rejected"), *ParseError);

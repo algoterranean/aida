@@ -1442,19 +1442,32 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 		TestEqual(TEXT("default count 1x1"), Spec.Grid.CountX * Spec.Grid.CountY, 1);
 	}
 
-	// Rejections: wrong version, missing buildable, missing origin, over-cap grid.
+	// Rejections: wrong version, missing buildable, malformed origin, over-cap grid.
 	{
 		FAIDABuildSpec Spec;
 		TestFalse(TEXT("rejects version 2"), AIDAActionSpec::ParseBuildSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 2, "buildable": "x", "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
 		TestFalse(TEXT("rejects missing buildable"), AIDAActionSpec::ParseBuildSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
-		TestFalse(TEXT("rejects missing origin"), AIDAActionSpec::ParseBuildSpec(
-			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x" })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects malformed origin"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x", "origin": { "x": "here" } })")), 200, Spec, Error));
 		TestFalse(TEXT("rejects over-cap"), AIDAActionSpec::ParseBuildSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x", "origin": { "x": 0, "y": 0 },
 			                            "grid": { "countX": 20, "countY": 20 } })")), 200, Spec, Error));
 		TestTrue(TEXT("cap error names the cap"), Error.Contains(TEXT("200")));
+	}
+
+	// Omitted origin/center = "at the player" (the tool fills it from the requester's location).
+	{
+		FAIDABuildSpec Spec;
+		TestTrue(TEXT("origin optional"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x" })")), 200, Spec, Error));
+		TestFalse(TEXT("omitted origin flagged"), Spec.bHasOrigin);
+
+		FAIDADismantleSpec Sel;
+		TestTrue(TEXT("center optional"), AIDAActionSpec::ParseDismantleSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "radiusM": 10 })")), 200, Sel, Error));
+		TestFalse(TEXT("omitted center flagged"), Sel.bHasCenter);
 	}
 
 	// Dismantle selector: valid, maxCount clamped to the cap, radius required.

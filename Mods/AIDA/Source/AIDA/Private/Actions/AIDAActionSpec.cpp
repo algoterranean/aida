@@ -63,10 +63,16 @@ bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 M
 	}
 	Parsed.Buildable = Parsed.Buildable.TrimStartAndEnd();
 
-	if (!ReadVectorM(Spec, TEXT("origin"), Parsed.OriginM))
+	// origin is optional: omitted = "at the requesting player" (the tool fills it from Ctx.Location).
+	// A present-but-malformed origin is still an error (a garbled position must not silently relocate).
+	if (Spec->HasField(TEXT("origin")))
 	{
-		OutError = TEXT("'origin' must be an object with numeric x and y (metres)");
-		return false;
+		if (!ReadVectorM(Spec, TEXT("origin"), Parsed.OriginM))
+		{
+			OutError = TEXT("'origin' must be an object with numeric x and y (metres) — or omit it to build at the player");
+			return false;
+		}
+		Parsed.bHasOrigin = true;
 	}
 
 	double Yaw = 0.0;
@@ -112,10 +118,15 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 	Spec->TryGetStringField(TEXT("buildable"), Parsed.Buildable); // "" = anything
 	Parsed.Buildable = Parsed.Buildable.TrimStartAndEnd();
 
-	if (!ReadVectorM(Spec, TEXT("center"), Parsed.CenterM))
+	// center is optional, like a build spec's origin: omitted = "around the requesting player".
+	if (Spec->HasField(TEXT("center")))
 	{
-		OutError = TEXT("'center' must be an object with numeric x and y (metres)");
-		return false;
+		if (!ReadVectorM(Spec, TEXT("center"), Parsed.CenterM))
+		{
+			OutError = TEXT("'center' must be an object with numeric x and y (metres) — or omit it to search around the player");
+			return false;
+		}
+		Parsed.bHasCenter = true;
 	}
 	if (!Spec->TryGetNumberField(TEXT("radiusM"), Parsed.RadiusM) || Parsed.RadiusM <= 0.0)
 	{

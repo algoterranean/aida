@@ -94,9 +94,11 @@ namespace
 		"World-modifying proposal tools (only registered when the server enables them):\n"
 		"- propose_build(spec): propose placing buildables on a snapped grid. NOTHING is built until a "
 		"player with act permission approves the proposal. Only call it when the player explicitly asks "
-		"you to build/place something. On success, relay the returned summary + cost and say it awaits "
-		"approval; on a tool error (invalid placement, cost, cap), revise the spec or explain the reason. "
-		"Never claim something was built until get_proposal_status says executed.\n"
+		"you to build/place something. Omit the spec's 'origin' to build at the player's position ('here', "
+		"'at my position', or no location given) — you never need to ask for coordinates. On success, "
+		"relay the returned summary + cost and say it awaits approval; on a tool error (invalid placement, "
+		"cost, cap), revise the spec or explain the reason. Never claim something was built until "
+		"get_proposal_status says executed.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
@@ -890,7 +892,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY? in metres}}."),
+		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY? in metres}}. OMIT origin to build at the requesting player's position — never ask the player for coordinates."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -905,6 +907,25 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (!AIDAActionSpec::ParseBuildSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			// No origin = "at the requesting player" — the same location plumbing tag_node uses.
+			if (!Spec.bHasOrigin)
+			{
+				if (!Ctx.bHasLocation)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("couldn't resolve the requesting player's position — pass an explicit 'origin' {x,y in metres}"), {}));
+				}
+				Spec.OriginM = Ctx.Location / 100.0; // world cm -> spec metres
+				Spec.bHasOrigin = true;
+
+				// Write the resolved origin back into the stored/journaled spec — the record (and any
+				// later re-parse) must carry the concrete position, not "wherever the player is".
+				const TSharedRef<FJsonObject> Origin = MakeShared<FJsonObject>();
+				Origin->SetField(TEXT("x"), AIDANumber(Spec.OriginM.X));
+				Origin->SetField(TEXT("y"), AIDANumber(Spec.OriginM.Y));
+				Origin->SetField(TEXT("z"), AIDANumber(Spec.OriginM.Z));
+				(*SpecObj)->SetObjectField(TEXT("origin"), Origin);
 			}
 
 			FAIDARecipeResolution Recipe;
@@ -970,7 +991,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// re-resolved at execute time (Slice 2) — never trusted from this dry-run.
 	Tools.Register({
 		TEXT("propose_dismantle"),
-		TEXT("PROPOSE removing buildables near a point. Nothing is dismantled until a player with act permission approves. Returns the matched count + refund tally and a proposalId. Selector: {version:1, buildable:'display name or empty for any', center:{x,y,z in metres}, radiusM, maxCount?}."),
+		TEXT("PROPOSE removing buildables near a point. Nothing is dismantled until a player with act permission approves. Returns the matched count + refund tally and a proposalId. Selector: {version:1, buildable:'display name or empty for any', center?:{x,y,z in metres}, radiusM, maxCount?}. OMIT center to search around the requesting player — never ask the player for coordinates."),
 		TEXT(R"({"type":"object","properties":{"selector":{"type":"object","description":"The versioned dismantle selector (see tool description)."}},"required":["selector"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -985,6 +1006,25 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (!AIDAActionSpec::ParseDismantleSpec(SelectorObj ? *SelectorObj : nullptr, Config.Actions.MaxProposalItems, Selector, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			// No center = "around the requesting player", mirroring propose_build's origin default.
+			if (!Selector.bHasCenter)
+			{
+				if (!Ctx.bHasLocation)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("couldn't resolve the requesting player's position — pass an explicit 'center' {x,y in metres}"), {}));
+				}
+				Selector.CenterM = Ctx.Location / 100.0; // world cm -> spec metres
+				Selector.bHasCenter = true;
+
+				// The engine RE-PARSES this stored selector at approval to re-resolve targets — it has
+				// no player context there, so the concrete center must live in the stored JSON.
+				const TSharedRef<FJsonObject> Center = MakeShared<FJsonObject>();
+				Center->SetField(TEXT("x"), AIDANumber(Selector.CenterM.X));
+				Center->SetField(TEXT("y"), AIDANumber(Selector.CenterM.Y));
+				Center->SetField(TEXT("z"), AIDANumber(Selector.CenterM.Z));
+				(*SelectorObj)->SetObjectField(TEXT("center"), Center);
 			}
 
 			FAIDADismantleResolution Targets;
