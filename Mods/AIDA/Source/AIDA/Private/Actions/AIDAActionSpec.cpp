@@ -79,6 +79,8 @@ bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 M
 	Spec->TryGetNumberField(TEXT("yawDeg"), Yaw);
 	Parsed.YawDeg = SnapYaw(Yaw);
 
+	Spec->TryGetBoolField(TEXT("followTerrain"), Parsed.bFollowTerrain);
+
 	const TSharedPtr<FJsonObject>* Grid = nullptr;
 	if (Spec->TryGetObjectField(TEXT("grid"), Grid) && Grid)
 	{

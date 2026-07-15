@@ -1463,6 +1463,11 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 		TestTrue(TEXT("origin optional"), AIDAActionSpec::ParseBuildSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x" })")), 200, Spec, Error));
 		TestFalse(TEXT("omitted origin flagged"), Spec.bHasOrigin);
+		TestFalse(TEXT("flat by default"), Spec.bFollowTerrain);
+
+		TestTrue(TEXT("followTerrain parses"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x", "followTerrain": true })")), 200, Spec, Error));
+		TestTrue(TEXT("followTerrain set"), Spec.bFollowTerrain);
 
 		FAIDADismantleSpec Sel;
 		TestTrue(TEXT("center optional"), AIDAActionSpec::ParseDismantleSpec(

@@ -44,6 +44,8 @@ struct FAIDABuildSpec
 	bool bHasOrigin = false;               // omitted origin = at the requesting player (Ctx.Location)
 	int32 YawDeg = 0;                      // snapped to 0/90/180/270
 	FAIDAGridSpec Grid;
+	/** Default false = a FLAT grid at the origin's height; true = each tile drops to its own terrain. */
+	bool bFollowTerrain = false;
 };
 
 /** propose_dismantle selector v1. */

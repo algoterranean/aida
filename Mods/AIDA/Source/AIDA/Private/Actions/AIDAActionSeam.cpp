@@ -200,7 +200,16 @@ namespace
 				bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 5000.0), End, AIDABuildGunChannel, Params);
 			}
 		}
-		if (!bHaveHit)
+		if (bHaveHit)
+		{
+			// Keep the genuine hit actor (validity) but aim the hit at the placement's EXACT position:
+			// grids are FLAT at the intended plane by default — per-tile terrain Z made sloped ground
+			// produce stepped foundations (live-verify). Terrain-following specs pre-adjust placement
+			// Z upstream instead.
+			Hit.Location = Target;
+			Hit.ImpactPoint = Target;
+		}
+		else
 		{
 			// Nothing below (void/water): fall back to the synthetic hit; the hologram's own
 			// validation then reports the placement, one index at a time, instead of crashing out.
@@ -369,6 +378,29 @@ bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& Play
 		*GetNameSafe(Hit.GetActor()), Hit.GetActor() ? *GetNameSafe(Hit.GetActor()->GetClass()) : TEXT("-"),
 		*Hit.ImpactPoint.ToCompactString());
 	OutPointCm = Hit.ImpactPoint;
+	return true;
+}
+
+bool FAIDAActionSeam::ProbeGroundZ(UObject* WorldContext, const FVector& AtCm, double& OutGroundZCm)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World) { return false; }
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAGroundProbe), /*bTraceComplex*/ false);
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (APawn* Pawn = It->Get() ? It->Get()->GetPawn() : nullptr) { Params.AddIgnoredActor(Pawn); }
+	}
+
+	// Low first (roofs over the area must not win), then from high on rising terrain.
+	const FVector End = AtCm - FVector(0.0, 0.0, 10000.0);
+	FHitResult Hit;
+	if (!World->LineTraceSingleByChannel(Hit, AtCm + FVector(0.0, 0.0, 300.0), End, AIDABuildGunChannel, Params) &&
+		!World->LineTraceSingleByChannel(Hit, AtCm + FVector(0.0, 0.0, 5000.0), End, AIDABuildGunChannel, Params))
+	{
+		return false;
+	}
+	OutGroundZCm = Hit.Location.Z;
 	return true;
 }
 
@@ -658,11 +690,14 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		// Capture the undo handle (docs/PHASE4.md §2d). Lightweight-bound buildables are destroyed
 		// and migrated to the instance subsystem right after Construct — journal class+transform
 		// (index unknown here; undo re-resolves by transform). Full actors keep a weak ptr too.
+		// The journaled transform is the BUILT actor's, not the intended placement — the hologram
+		// may snap/adjust, and undo's transform match must hit what actually exists (live-verify:
+		// grounded tiles drifted metres from the plan and undo missed 8 of 9).
 		AFGBuildable* Buildable = Cast<AFGBuildable>(Built);
 		FAIDAEntityId Entity;
 		Entity.ClassPath = Built->GetClass()->GetPathName();
-		Entity.Pos = Placements[Index].GetLocation();
-		Entity.YawDeg = FMath::RoundToInt32(Placements[Index].Rotator().Yaw);
+		Entity.Pos = Built->GetActorLocation();
+		Entity.YawDeg = FMath::RoundToInt32(Built->GetActorRotation().Yaw);
 		if (Buildable && Buildable->ShouldConvertToLightweight())
 		{
 			Entity.Type = TEXT("lw");

@@ -33,6 +33,12 @@ public:
 	static bool ResolveAimPoint(UObject* WorldContext, const FString& PlayerId, FVector& OutPointCm);
 
 	/**
+	 * Ground height (cm) under a point, via the same build-gun-channel trace placements use.
+	 * Feeds followTerrain specs: placement Z is pre-adjusted per tile at propose time.
+	 */
+	static bool ProbeGroundZ(UObject* WorldContext, const FVector& AtCm, double& OutGroundZCm);
+
+	/**
 	 * Validate every placement without mutating the world: spawn ONE hidden-from-clients
 	 * (non-replicated) hologram, walk it across the placements (synthetic upward hit +
 	 * ValidatePlacementAndCost), collect per-index disqualifiers, tally cost × count, check

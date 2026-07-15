@@ -898,7 +898,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}}. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps."),
+		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. Grids are FLAT at the origin's height by default; set followTerrain:true ONLY if the player asks to follow/trace the ground. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -955,7 +955,24 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 			Spec.Buildable = Recipe.DisplayName; // canonical name for the summary
 
-			const TArray<FTransform> Placements = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
+			TArray<FTransform> Placements = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
+
+			// Grids are FLAT at the origin's height by default; followTerrain drops each tile to its
+			// own ground (the "trace the ground" request) by adjusting placement Z here, up front —
+			// the journal then records exactly what gets built.
+			if (Spec.bFollowTerrain)
+			{
+				for (FTransform& Placement : Placements)
+				{
+					double GroundZ;
+					if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
+					{
+						FVector Location = Placement.GetLocation();
+						Location.Z = GroundZ;
+						Placement.SetLocation(Location);
+					}
+				}
+			}
 
 			FAIDADryRunResult DryRun;
 			if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Placements, DryRun))
