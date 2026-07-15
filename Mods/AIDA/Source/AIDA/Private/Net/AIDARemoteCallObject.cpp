@@ -166,6 +166,21 @@ void UAIDARemoteCallObject::ServerRejectProposal_Implementation(const FGuid& Pro
 	}
 }
 
+bool UAIDARemoteCallObject::ServerAdjustProposal_Validate(const FVector& DeltaCm, int32 YawDeltaDeg)
+{
+	// One keypress worth of adjustment: bounded delta, sane rotation.
+	return DeltaCm.Size() <= 10000.0 && FMath::Abs(YawDeltaDeg) <= 180;
+}
+
+void UAIDARemoteCallObject::ServerAdjustProposal_Implementation(const FVector& DeltaCm, int32 YawDeltaDeg)
+{
+	UWorld* World = GetWorld();
+	if (UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr)
+	{
+		Orchestrator->HandleProposalAdjust(ResolveRequester(), DeltaCm, YawDeltaDeg, /*bQuietSuccess*/ true);
+	}
+}
+
 FAIDARequester UAIDARemoteCallObject::ResolveRequester() const
 {
 	FAIDARequester Requester;

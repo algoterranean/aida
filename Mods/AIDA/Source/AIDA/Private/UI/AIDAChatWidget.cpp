@@ -317,6 +317,14 @@ void UAIDAChatWidget::BuildProposalPanel(UFont* GameFont, float FontSize)
 	RejectButton->SetBackgroundColor(FLinearColor(0.6f, 0.25f, 0.25f, 1.0f));
 	RejectButton->AddChild(MakeText(TEXT("Reject"), FontSize, FLinearColor::White));
 	Row->AddChildToHorizontalBox(RejectButton);
+
+	// Ghost-adjust keybind hint (the ghost itself is the feedback; this is the discoverability).
+	if (UVerticalBoxSlot* HintSlot = Column->AddChildToVerticalBox(MakeText(
+		TEXT("Ctrl+Arrows move · Ctrl+PgUp/PgDn raise · Ctrl+Wheel rotate (Shift = 1 m)"),
+		FontSize - 1.f, FLinearColor(0.75f, 0.75f, 0.75f, 1.0f))))
+	{
+		HintSlot->SetPadding(FMargin(0.f, 8.f, 0.f, 0.f));
+	}
 }
 
 void UAIDAChatWidget::HandleProposalsChanged()
@@ -574,8 +582,49 @@ void UAIDAChatWidget::RefocusInput()
 	}
 }
 
+bool UAIDAChatWidget::TryAdjustGhost(const FKey& Key, bool bFineStep)
+{
+	AAIDAProposalRelay* R = ProposalRelay.Get();
+	if (!R || !R->HasPendingProposal())
+	{
+		return false;
+	}
+
+	// Camera-relative cardinals snapped to the world lattice: Up-arrow pushes the ghost away from
+	// the camera, Right pushes it right, etc. — how players think while looking at the ghost.
+	FVector Forward = FVector::ForwardVector;
+	const APlayerController* PC = GetOwningPlayer();
+	if (PC && PC->PlayerCameraManager)
+	{
+		const double SnappedYaw = FMath::RoundToDouble(PC->PlayerCameraManager->GetCameraRotation().Yaw / 90.0) * 90.0;
+		Forward = FRotator(0.0, SnappedYaw, 0.0).Vector();
+	}
+	const FVector Right = FVector::CrossProduct(FVector::UpVector, Forward) * -1.0; // yaw+90 = right hand
+
+	const double StepCm = (bFineStep ? 1.0 : 8.0) * 100.0; // Shift = 1 m fine steps, else one tile
+	FVector Delta = FVector::ZeroVector;
+	if (Key == EKeys::Up)            { Delta = Forward * StepCm; }
+	else if (Key == EKeys::Down)     { Delta = -Forward * StepCm; }
+	else if (Key == EKeys::Right)    { Delta = Right * StepCm; }
+	else if (Key == EKeys::Left)     { Delta = -Right * StepCm; }
+	else if (Key == EKeys::PageUp)   { Delta = FVector(0.0, 0.0, StepCm); }
+	else if (Key == EKeys::PageDown) { Delta = FVector(0.0, 0.0, -StepCm); }
+	else
+	{
+		return false;
+	}
+	R->Adjust(Delta, 0);
+	return true;
+}
+
 FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
 {
+	// Ctrl+Arrows / Ctrl+PgUp/PgDn move the pending proposal ghost (Shift for 1 m fine steps).
+	if (InKeyEvent.IsControlDown() && TryAdjustGhost(InKeyEvent.GetKey(), InKeyEvent.IsShiftDown()))
+	{
+		return FReply::Handled();
+	}
+
 	// Up/Down = shell-style recall of this conversation's sent lines, only while typing in the box.
 	if (InputBox && InputBox->HasKeyboardFocus())
 	{
@@ -598,6 +647,20 @@ FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, cons
 		}
 	}
 	return Super::NativeOnPreviewKeyDown(InGeometry, InKeyEvent);
+}
+
+FReply UAIDAChatWidget::NativeOnMouseWheel(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
+{
+	// Ctrl+Wheel rotates the pending proposal ghost 90° per notch (plain wheel stays the hotbar's).
+	if (InMouseEvent.IsControlDown())
+	{
+		if (AAIDAProposalRelay* R = ProposalRelay.Get(); R && R->HasPendingProposal())
+		{
+			R->Adjust(FVector::ZeroVector, InMouseEvent.GetWheelDelta() > 0.f ? 90 : -90);
+			return FReply::Handled();
+		}
+	}
+	return Super::NativeOnMouseWheel(InGeometry, InMouseEvent);
 }
 
 void UAIDAChatWidget::RenderActiveConversation()

@@ -50,6 +50,14 @@ public:
 	/** Client→server: reject a pending proposal via the local player's RCO. */
 	UFUNCTION(BlueprintCallable, Category = "AIDA")
 	void Reject(const FGuid& ProposalId);
+
+	/** Client→server: nudge/rotate the newest pending proposal (the ghost-adjust keybinds). */
+	UFUNCTION(BlueprintCallable, Category = "AIDA")
+	void Adjust(const FVector& DeltaCm, int32 YawDeltaDeg);
+
+	/** True when any replicated proposal is still pending (the keybinds only act then). */
+	UFUNCTION(BlueprintPure, Category = "AIDA")
+	bool HasPendingProposal() const;
 	//~ End client view
 
 	/** Fired whenever the replicated proposal list changes (bind the ProposalUI to this). */

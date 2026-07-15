@@ -47,6 +47,14 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerRejectProposal(const FGuid& ProposalId);
 
+	/**
+	 * Client→server: nudge/rotate the newest pending proposal (the ghost-adjust keybinds). The
+	 * server act-gates, re-validates the moved placements, and republishes — same path as the
+	 * /aida nudge and /aida rotate chat commands.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerAdjustProposal(const FVector& DeltaCm, int32 YawDeltaDeg);
+
 	/** Server→owning client: authoritative body for a single message. */
 	UFUNCTION(Client, Reliable)
 	void ClientReceiveMessageBody(FAIDATranscriptEntry Entry);

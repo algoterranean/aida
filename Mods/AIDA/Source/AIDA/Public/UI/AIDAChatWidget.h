@@ -68,8 +68,12 @@ class UAIDAChatWidget : public UUserWidget
 public:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
-	/** Up/Down recall the current conversation's input history while the input box has focus. */
+	/** Up/Down recall the current conversation's input history while the input box has focus.
+	 *  Ctrl+Arrows / Ctrl+PgUp/PgDn nudge a pending proposal ghost (Shift = 1 m fine steps). */
 	virtual FReply NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
+
+	/** Ctrl+Wheel rotates a pending proposal ghost by 90° per notch. */
+	virtual FReply NativeOnMouseWheel(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent) override;
 
 	/** Send a chat line to the server (bind your text box's submit to this). */
 	UFUNCTION(BlueprintCallable, Category = "AIDA")
@@ -160,6 +164,13 @@ private:
 
 	/** Refocus the input box now AND next tick — Slate steals focus after commits/button clicks. */
 	void RefocusInput();
+
+	/**
+	 * Ghost-adjust keybinds: translate a Ctrl+key/wheel gesture into a proposal adjustment and send
+	 * it via the relay. Arrow directions are camera-relative, snapped to the world lattice. Returns
+	 * false when there is no pending proposal (the input falls through to its normal meaning).
+	 */
+	bool TryAdjustGhost(const FKey& Key, bool bFineStep);
 
 	//~ Per-conversation transcript state (one per tab). Each conversation is independent.
 	struct FRenderedMessage

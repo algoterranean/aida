@@ -149,6 +149,23 @@ void AAIDAProposalRelay::Reject(const FGuid& ProposalId)
 	}
 }
 
+void AAIDAProposalRelay::Adjust(const FVector& DeltaCm, int32 YawDeltaDeg)
+{
+	if (UAIDARemoteCallObject* RCO = GetLocalRCO())
+	{
+		RCO->ServerAdjustProposal(DeltaCm, YawDeltaDeg);
+	}
+}
+
+bool AAIDAProposalRelay::HasPendingProposal() const
+{
+	for (const FAIDAProposalView& View : Proposals)
+	{
+		if (View.State == TEXT("pending")) { return true; }
+	}
+	return false;
+}
+
 UAIDARemoteCallObject* AAIDAProposalRelay::GetLocalRCO() const
 {
 	// The local player's controller: null on a dedicated server (no local player).

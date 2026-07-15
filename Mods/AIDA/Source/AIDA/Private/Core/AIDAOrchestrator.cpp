@@ -382,20 +382,10 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 
 			if (Command.Kind == FAIDAChatCommand::EKind::Nudge || Command.Kind == FAIDAChatCommand::EKind::Rotate)
 			{
-				// Moving a proposed build is act-tier, like proposing/approving one.
-				if (!Permissions.IsAllowed(EAIDATier::Act, Requester.PlayerId))
-				{
-					Session->PostSystemMessage(TEXT("You don't have act permission to adjust AIDA proposals."), ConversationId);
-					return;
-				}
 				const FVector DeltaCm = Command.Kind == FAIDAChatCommand::EKind::Nudge
 					? Command.NudgeDir * Command.NudgeDistM * 100.0 : FVector::ZeroVector;
 				const int32 YawDelta = Command.Kind == FAIDAChatCommand::EKind::Rotate ? Command.RotateDeg : 0;
-
-				FString Message;
-				Actions.AdjustPending(this, Config.Actions, Target, DeltaCm, YawDelta, Message);
-				PublishProposal(Target); // moves every client's ghost
-				Session->PostSystemMessage(Message, ConversationId);
+				HandleProposalAdjust(Requester, DeltaCm, YawDelta);
 				return;
 			}
 
@@ -925,6 +915,49 @@ void UAIDAOrchestrator::AnnounceSystem(const FString& Text)
 	if (Session.IsValid() && !Text.IsEmpty())
 	{
 		Session->PostSystemMessage(Text, AIDADefaultConversationId());
+	}
+}
+
+void UAIDAOrchestrator::HandleProposalAdjust(const FAIDARequester& Requester, const FVector& DeltaCm, int32 YawDeltaDeg,
+	bool bQuietSuccess)
+{
+	// Authority-only, like the other proposal paths.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		return;
+	}
+
+	// Moving a proposed build is act-tier, like proposing/approving one.
+	if (!Permissions.IsAllowed(EAIDATier::Act, Requester.PlayerId))
+	{
+		AnnounceSystem(FString::Printf(TEXT("%s isn't allowed to adjust AIDA proposals (act permission)."), *Requester.Author));
+		return;
+	}
+
+	// The newest pending proposal is the adjustable one (matches the ghost the player is looking at).
+	SweepProposals();
+	FGuid Target;
+	int64 NewestUtc = -1;
+	for (const FAIDAProposal& Proposal : Actions.Store().All())
+	{
+		if (Proposal.State == EAIDAProposalState::Pending && Proposal.ProposedUtc > NewestUtc)
+		{
+			NewestUtc = Proposal.ProposedUtc;
+			Target = Proposal.Id;
+		}
+	}
+	if (!Target.IsValid())
+	{
+		AnnounceSystem(TEXT("No pending proposal to adjust."));
+		return;
+	}
+
+	FString Message;
+	const bool bAdjusted = Actions.AdjustPending(this, Config.Actions, Target, DeltaCm, YawDeltaDeg, Message);
+	PublishProposal(Target); // moves every client's ghost
+	if (!bAdjusted || !bQuietSuccess)
+	{
+		AnnounceSystem(Message);
 	}
 }
 

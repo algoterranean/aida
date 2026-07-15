@@ -62,6 +62,14 @@ public:
 	 * denials post a System chat line and log the player id. The UI's buttons are cosmetic.
 	 */
 	void HandleProposalDecision(const FAIDARequester& Requester, const FGuid& ProposalId, bool bApprove);
+
+	/**
+	 * Nudge/rotate the newest pending proposal (ghost adjust — chat commands and keybinds both land
+	 * here). Act-gated; the engine re-validates the moved placements and keeps the original on
+	 * failure; the republished view moves every client's ghost.
+	 */
+	void HandleProposalAdjust(const FAIDARequester& Requester, const FVector& DeltaCm, int32 YawDeltaDeg,
+		bool bQuietSuccess = false); // keybind taps: the moving ghost IS the feedback, don't spam chat
 	//~ End server API
 
 private:
