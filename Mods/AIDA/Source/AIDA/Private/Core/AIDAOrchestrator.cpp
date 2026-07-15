@@ -477,6 +477,32 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 		return;
 	}
 
+	// Ground the model in the AUTHORITATIVE proposal state every request — it kept inventing queue
+	// rules ("must wait for the previous proposal") and phantom proposals when it had to guess.
+	if (Config.Actions.bEnabled)
+	{
+		SweepProposals();
+		TArray<FString> Pending;
+		for (const FAIDAProposal& Proposal : Actions.Store().All())
+		{
+			if (Proposal.State == EAIDAProposalState::Pending)
+			{
+				Pending.Add(FString::Printf(TEXT("%s (id %s)"), *Proposal.Summary,
+					*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens)));
+			}
+		}
+		FString StateLine = TEXT("\n\nLIVE PROPOSAL STATE (authoritative, refreshed each message): ");
+		StateLine += Pending.Num() > 0
+			? FString::Printf(TEXT("pending approval: %s."), *FString::Join(Pending, TEXT("; ")))
+			: TEXT("no pending proposals.");
+		if (Actions.IsExecuting())
+		{
+			StateLine += TEXT(" One approved proposal is executing right now.");
+		}
+		StateLine += TEXT(" Never claim you must wait for a previous proposal — just call propose_build; if a limit applies, the tool error will say so.");
+		LLMClient->SetSystemPrompt(FString(GAIDASystemPrompt) + StateLine);
+	}
+
 	// Build context BEFORE opening the AIDA message so the empty reply isn't included.
 	TArray<FAIDAChatMessage> Context;
 	BuildChatContext(ConversationId, Context);
