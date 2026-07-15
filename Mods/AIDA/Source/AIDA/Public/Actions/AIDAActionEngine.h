@@ -68,9 +68,21 @@ public:
 	 */
 	TArray<FString> TakeUndoReport();
 
+	/** Human lines from the last manifold execution's FAILED runs (empty when all connected),
+	 *  cleared on read — announced alongside the completion line. */
+	TArray<FString> TakeRunReport();
+
 private:
 	void FinishExecution(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 	void ResetScratch();
+
+	/**
+	 * Advance a manifold proposal (docs/PHASE4-MANIFOLDS.md §5): phase 0 batches the attachments
+	 * (index-aligned capture), then ONE connecting run per tick — phase 1 trunk hops, phase 2 drops
+	 * to the machines. Failed runs (missing endpoint, no snap, unaffordable) are counted + reported,
+	 * never fatal. True while more work remains.
+	 */
+	bool TickManifold(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 
 	/** One journal entry queued for reversal. */
 	struct FUndoJob
@@ -99,6 +111,14 @@ private:
 	int32 SkippedCount = 0;
 	int32 RemovedCount = 0;
 	int32 MissingCount = 0;
+
+	//~ Manifold scratch: attachments captured PER PLACEMENT INDEX (null = skipped/lost — its runs
+	//  then fail loudly instead of silently re-mapping to a neighbor).
+	TArray<TWeakObjectPtr<AActor>> AttachmentActors;
+	int32 RunBuiltCount = 0;
+	int32 RunFailCount = 0;
+	TArray<FString> RunFailures; // first few human-readable reasons for the outcome announcement
+	TArray<FString> RunReport;   // published lines (survives scratch reset until read)
 
 	/** Journal id → live actors built this session (undo's fast path; transform re-resolve after reload). */
 	TMap<FGuid, TArray<TWeakObjectPtr<AActor>>> SessionActors;

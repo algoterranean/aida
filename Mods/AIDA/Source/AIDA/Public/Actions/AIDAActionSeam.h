@@ -89,11 +89,14 @@ public:
 	 * Construct(). Placements that fail re-validation (world changed since dry-run) are skipped and
 	 * counted, not fatal. Captures journal entity ids (lightweight = class+transform; full actor =
 	 * class+recipe+transform) plus live actor ptrs for the in-session undo cache. Returns the number
-	 * of placements consumed (advanced past), built or skipped.
+	 * of placements consumed (advanced past), built or skipped. OutPerIndexActors (optional) gets
+	 * EXACTLY one entry per consumed index — the built actor, or null for skipped/lightweight —
+	 * for callers that must keep placements index-aligned (manifold attachments).
 	 */
 	static int32 ExecuteBuildBatch(UObject* WorldContext, const FString& RecipeClassPath,
 		const TArray<FTransform>& Placements, int32 Cursor, int32 BatchSize,
-		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, int32& OutSkipped);
+		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, int32& OutSkipped,
+		TArray<TWeakObjectPtr<AActor>>* OutPerIndexActors = nullptr);
 
 	/**
 	 * Re-resolve a dismantle selector into per-entity handles at APPROVAL time (never trusted from
@@ -132,4 +135,32 @@ public:
 	 * path (re-validated — something may occupy the spot now; that's a reported failure, not fatal).
 	 */
 	static bool UndoRebuildEntity(UObject* WorldContext, const FAIDAEntityId& Entity);
+
+	//~ Manifolds (docs/PHASE4-MANIFOLDS.md).
+
+	/**
+	 * Resolve a manifold's machine ports LIVE: machines matching the selector, each contributing its
+	 * PortIndex-th UNCONNECTED port of the wanted kind/direction (belt: factory connection input/
+	 * output; pipe: consumer/producer pipe connection). Machines whose matching ports are all taken
+	 * are counted in OutSkippedConnected, not returned — re-running a manifold extends only what's
+	 * missing. OutMachineName reports the first match's canonical display name.
+	 */
+	static bool ResolveMachinePorts(UObject* WorldContext, const FAIDADismantleSpec& Selector,
+		bool bPipe, bool bOutput, int32 PortIndex,
+		TArray<FAIDAManifoldPort>& OutPorts, int32& OutSkippedConnected, FString& OutMachineName);
+
+	/**
+	 * Build ONE connecting run (belt or pipe) between two live actors' ports, exactly like the build
+	 * gun: spawn the spline hologram, place at the from-port, DoMultiStepPlacement, place at the
+	 * to-port — BOTH ends must report IsConnectionSnapped (an unsnapped end would silently construct
+	 * a support pole instead of a connection) — validate, then Construct. Ports are picked on the
+	 * live actor by direction + best normal alignment with WantDir (belts: from = an output, to = an
+	 * input; pipes are direction-agnostic). bChargeCost deducts the ACTUAL length-scaled cost from
+	 * central storage first (runs are charged as built — docs/PHASE4-MANIFOLDS.md §4); an
+	 * unaffordable or unsnappable run fails loudly via OutError and builds nothing.
+	 */
+	static bool BuildConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
+		AActor* FromActor, const FVector& FromWantDir, AActor* ToActor, const FVector& ToWantDir,
+		bool bChargeCost, TArray<FAIDACostItem>& OutCost,
+		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
 };

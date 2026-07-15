@@ -107,12 +107,19 @@ namespace
 		"cost, cap), revise the spec or explain the reason. Never claim something was built until "
 		"get_proposal_status says executed.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
+		"- propose_manifold(spec): propose the belt-plumbing for a row of machines — one splitter (or "
+		"merger) per machine plus the connecting belts, or the pipe-junction + pipe equivalent. Use it "
+		"whenever the player asks to belt up / feed / connect a row of machines; do NOT build splitters "
+		"and belts one-by-one with propose_build. direction 'in' feeds machine inputs, 'out' collects "
+		"outputs. Omit machines.center to use the machines the player is looking at. Machines already "
+		"connected on that port are skipped automatically.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
 		"/aida undo (or /aida undo N) in this chat. Players decide proposals with the on-screen card or "
 		"/aida approve, /aida reject — a pending proposal shows a live hologram ghost of the whole build, "
 		"and players can move it with /aida nudge <north|south|east|west|up|down> [metres] and "
-		"/aida rotate [degrees] before approving.\n"
+		"/aida rotate [degrees] before approving (manifold proposals are anchored to their machines "
+		"and cannot be nudged).\n"
 		"CRITICAL: a proposal exists ONLY when a propose_* call in THIS turn returned a proposalId. Never "
 		"announce a proposal, cost, or 'awaiting approval' without that tool result — if you did not call "
 		"the tool, or it returned an error, say exactly that instead. Never invent costs or ids.\n\n"
@@ -1268,6 +1275,195 @@ void UAIDAOrchestrator::RegisterActionTools()
 		}
 	});
 
+	// propose_manifold: resolve live machine ports -> pure row-fit plan -> attachment dry-run ->
+	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
+	Tools.Register({
+		TEXT("propose_manifold"),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+
+			FAIDAManifoldSpec Spec;
+			FString Error;
+			if (!AIDAActionSpec::ParseManifoldSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			// Transport (belt/pipe) and attachment (splitter/merger/junction) both resolve like any
+			// buildable — unlocked recipes only, suggestions on a miss.
+			FAIDARecipeResolution Transport;
+			if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Transport, Transport))
+			{
+				FString Msg = FString::Printf(TEXT("no unlocked buildable matches transport '%s'"), *Spec.Transport);
+				if (Transport.Suggestions.Num() > 0)
+				{
+					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Transport.Suggestions, TEXT(", ")));
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+			const FString AttachmentName = !Spec.Attachment.IsEmpty() ? Spec.Attachment
+				: (Spec.bPipe ? TEXT("Pipeline Junction Cross")
+					: (Spec.bOutput ? TEXT("Conveyor Merger") : TEXT("Conveyor Splitter")));
+			FAIDARecipeResolution Attachment;
+			if (!FAIDAActionSeam::ResolveBuildRecipe(this, AttachmentName, Attachment))
+			{
+				FString Msg = FString::Printf(TEXT("no unlocked buildable matches attachment '%s'"), *AttachmentName);
+				if (Attachment.Suggestions.Num() > 0)
+				{
+					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Attachment.Suggestions, TEXT(", ")));
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			// No center = "the machines the player is looking at", falling back to their position —
+			// the same default as the other propose_* tools. Written back into the stored spec.
+			if (!Spec.Machines.bHasCenter)
+			{
+				FVector AimCm;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				{
+					Spec.Machines.CenterM = AimCm / 100.0;
+				}
+				else if (Ctx.bHasLocation)
+				{
+					Spec.Machines.CenterM = Ctx.Location / 100.0;
+				}
+				else
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'machines.center' {x,y in metres}"), {}));
+				}
+				Spec.Machines.bHasCenter = true;
+
+				const TSharedPtr<FJsonObject>* MachinesObj = nullptr;
+				if ((*SpecObj)->TryGetObjectField(TEXT("machines"), MachinesObj))
+				{
+					const TSharedRef<FJsonObject> Center = MakeShared<FJsonObject>();
+					Center->SetField(TEXT("x"), AIDANumber(Spec.Machines.CenterM.X));
+					Center->SetField(TEXT("y"), AIDANumber(Spec.Machines.CenterM.Y));
+					Center->SetField(TEXT("z"), AIDANumber(Spec.Machines.CenterM.Z));
+					(*MachinesObj)->SetObjectField(TEXT("center"), Center);
+				}
+			}
+
+			TArray<FAIDAManifoldPort> Ports;
+			int32 SkippedConnected = 0;
+			FString MachineName;
+			FAIDAActionSeam::ResolveMachinePorts(this, Spec.Machines, Spec.bPipe, Spec.bOutput, Spec.PortIndex,
+				Ports, SkippedConnected, MachineName);
+			if (Ports.Num() == 0)
+			{
+				const FString Msg = SkippedConnected > 0
+					? FString::Printf(TEXT("all %d matching machine(s) already have that port connected — nothing to plumb"), SkippedConnected)
+					: FString::Printf(TEXT("no '%s' with a free %s port within %.0f m of the given point"),
+						*Spec.Machines.Buildable, Spec.bPipe ? TEXT("pipe") : (Spec.bOutput ? TEXT("output") : TEXT("input")),
+						Spec.Machines.RadiusM);
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+			if (!MachineName.IsEmpty()) { Spec.Machines.Buildable = MachineName; } // canonical for the summary
+
+			// Pure row fit: sorted attachment transforms + the shared axis (docs/PHASE4-MANIFOLDS.md §3).
+			TArray<FAIDAManifoldPortPoint> Points;
+			Points.Reserve(Ports.Num());
+			for (const FAIDAManifoldPort& Port : Ports)
+			{
+				Points.Add({ Port.PosCm, Port.NormalCm });
+			}
+			const double FootprintM = FMath::Max(Attachment.FootprintXM, Attachment.FootprintYM);
+			FAIDAManifoldPlan Plan = AIDAActionSpec::PlanManifold(Points, Spec.bOutput, Spec.bPipe,
+				Spec.StandoffM, FootprintM, /*MaxRunM*/ 56.0);
+			if (!Plan.Error.IsEmpty())
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+			}
+
+			// Reorder the ports to the plan's sort so everything downstream is index-aligned.
+			TArray<FAIDAManifoldPort> SortedPorts;
+			SortedPorts.Reserve(Plan.PortOrder.Num());
+			for (const int32 PortIdx : Plan.PortOrder)
+			{
+				SortedPorts.Add(Ports[PortIdx]);
+			}
+
+			// Attachments stand on the floor under each trunk point; belts auto-route the height.
+			for (FTransform& Placement : Plan.Attachments)
+			{
+				double GroundZ;
+				if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
+				{
+					FVector Location = Placement.GetLocation();
+					Location.Z = GroundZ;
+					Placement.SetLocation(Location);
+				}
+			}
+
+			FAIDADryRunResult DryRun;
+			if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+			}
+			if (!DryRun.bOk)
+			{
+				const FString Msg = FString::Printf(TEXT("%d of %d attachment placement(s) invalid"),
+					DryRun.Failures.Num(), Plan.Attachments.Num());
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
+			}
+			if (Config.Actions.CostMode == TEXT("central") && !DryRun.bAffordable)
+			{
+				FString Msg = TEXT("attachments not affordable from central storage (dimensional depot): needs ");
+				for (int32 i = 0; i < DryRun.Cost.Num(); ++i)
+				{
+					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), DryRun.Cost[i].Amount, *DryRun.Cost[i].Item);
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			const int32 RunCount = 2 * SortedPorts.Num() - 1;
+			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid();
+			Proposal.SpecJson = AIDAToCompactJson(SpecObj->ToSharedRef());
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = MoveTemp(Plan.Attachments);
+			Proposal.RecipeClassPath = Attachment.RecipeClassPath;
+			Proposal.Cost = DryRun.Cost;
+			Proposal.bManifold = true;
+			Proposal.bManifoldPipe = Spec.bPipe;
+			Proposal.bManifoldOutput = Spec.bOutput;
+			Proposal.TransportRecipePath = Transport.RecipeClassPath;
+			Proposal.TransportName = Transport.DisplayName;
+			Proposal.Ports = MoveTemp(SortedPorts);
+			Proposal.RowAxis = Plan.RowAxis;
+			Proposal.DropDir = Plan.DropDir;
+			Proposal.Summary = AIDAActionSpec::SummarizeManifold(Spec, Attachment.DisplayName, Transport.DisplayName,
+				Proposal.Ports.Num(), RunCount, AIDAActionSpec::CompassName(-Plan.RowAxis));
+			if (SkippedConnected > 0)
+			{
+				Proposal.Summary += FString::Printf(TEXT(" [%d machine(s) already connected, skipped]"), SkippedConnected);
+			}
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — attachments cost %s; runs charged as built. Awaiting approval."),
+				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
+		}
+	});
+
 	// get_proposal_status: read-only view over the live store, so the model never guesses outcomes.
 	Tools.Register({
 		TEXT("get_proposal_status"),
@@ -1570,6 +1766,13 @@ void UAIDAOrchestrator::OnActionTimer()
 
 	// A finished undo run reports per-entry results ("undid 97 of 100 …") the same way.
 	for (const FString& Line : Actions.TakeUndoReport())
+	{
+		AnnounceSystem(Line);
+	}
+
+	// Manifold executions report their failed runs (skipped attachments, unsnappable/unaffordable
+	// belts) so a half-plumbed row is loud, never a surprise.
+	for (const FString& Line : Actions.TakeRunReport())
 	{
 		AnnounceSystem(Line);
 	}

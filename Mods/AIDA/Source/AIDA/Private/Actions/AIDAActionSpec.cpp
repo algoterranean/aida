@@ -148,6 +148,210 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 	return true;
 }
 
+bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError)
+{
+	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }
+	if (!CheckVersion(Spec, OutError)) { return false; }
+
+	FAIDAManifoldSpec Parsed;
+
+	FString Kind = TEXT("belt");
+	Spec->TryGetStringField(TEXT("kind"), Kind);
+	Kind = Kind.TrimStartAndEnd().ToLower();
+	if (Kind == TEXT("pipe")) { Parsed.bPipe = true; }
+	else if (Kind != TEXT("belt")) { OutError = TEXT("'kind' must be \"belt\" or \"pipe\""); return false; }
+
+	FString Direction = TEXT("in");
+	Spec->TryGetStringField(TEXT("direction"), Direction);
+	Direction = Direction.TrimStartAndEnd().ToLower();
+	if (Direction == TEXT("out")) { Parsed.bOutput = true; }
+	else if (Direction != TEXT("in")) { OutError = TEXT("'direction' must be \"in\" (feed inputs) or \"out\" (collect outputs)"); return false; }
+
+	if (!Spec->TryGetStringField(TEXT("transport"), Parsed.Transport) || Parsed.Transport.TrimStartAndEnd().IsEmpty())
+	{
+		OutError = TEXT("'transport' (belt or pipe display name, e.g. \"Conveyor Belt Mk.2\") is required");
+		return false;
+	}
+	Parsed.Transport = Parsed.Transport.TrimStartAndEnd();
+	Spec->TryGetStringField(TEXT("attachment"), Parsed.Attachment);
+	Parsed.Attachment = Parsed.Attachment.TrimStartAndEnd();
+
+	const TSharedPtr<FJsonObject>* Machines = nullptr;
+	if (!Spec->TryGetObjectField(TEXT("machines"), Machines) || !Machines)
+	{
+		OutError = TEXT("'machines' selector object is required");
+		return false;
+	}
+	if (!(*Machines)->TryGetStringField(TEXT("buildable"), Parsed.Machines.Buildable) ||
+		Parsed.Machines.Buildable.TrimStartAndEnd().IsEmpty())
+	{
+		OutError = TEXT("'machines.buildable' (machine display name) is required");
+		return false;
+	}
+	Parsed.Machines.Buildable = Parsed.Machines.Buildable.TrimStartAndEnd();
+	if ((*Machines)->HasField(TEXT("center")))
+	{
+		if (!ReadVectorM(*Machines, TEXT("center"), Parsed.Machines.CenterM))
+		{
+			OutError = TEXT("'machines.center' must be an object with numeric x and y (metres) — or omit it to use where the requester is aiming");
+			return false;
+		}
+		Parsed.Machines.bHasCenter = true;
+	}
+	Parsed.Machines.RadiusM = 30.0;
+	if ((*Machines)->TryGetNumberField(TEXT("radiusM"), Parsed.Machines.RadiusM) && Parsed.Machines.RadiusM <= 0.0)
+	{
+		OutError = TEXT("'machines.radiusM' must be a positive number");
+		return false;
+	}
+	Parsed.Machines.MaxCount = 0; // 0 = every match in radius
+	int32 MaxCount = 0;
+	if ((*Machines)->TryGetNumberField(TEXT("maxCount"), MaxCount))
+	{
+		if (MaxCount < 0) { OutError = TEXT("'machines.maxCount' must be >= 0 (0 = all)"); return false; }
+		Parsed.Machines.MaxCount = MaxCount;
+	}
+	if (MaxItems > 0)
+	{
+		Parsed.Machines.MaxCount = (Parsed.Machines.MaxCount == 0)
+			? MaxItems : FMath::Min(Parsed.Machines.MaxCount, MaxItems);
+	}
+
+	if (Spec->TryGetNumberField(TEXT("standoffM"), Parsed.StandoffM) && (Parsed.StandoffM < 1.0 || Parsed.StandoffM > 20.0))
+	{
+		OutError = TEXT("'standoffM' must be between 1 and 20");
+		return false;
+	}
+	int32 Port = 0;
+	if (Spec->TryGetNumberField(TEXT("port"), Port))
+	{
+		if (Port < 0) { OutError = TEXT("'port' must be >= 0"); return false; }
+		Parsed.PortIndex = Port;
+	}
+
+	Out = MoveTemp(Parsed);
+	return true;
+}
+
+FAIDAManifoldPlan AIDAActionSpec::PlanManifold(const TArray<FAIDAManifoldPortPoint>& Ports, bool bOutput, bool bPipe,
+	double StandoffM, double FootprintM, double MaxRunM)
+{
+	FAIDAManifoldPlan Plan;
+	if (Ports.Num() < 1)
+	{
+		Plan.Error = TEXT("no machine ports to connect");
+		return Plan;
+	}
+
+	// The machines must broadly face the same way (v1): the trunk is one straight line in front of
+	// them. Average the XY normals and reject any port more than ~45° off the average.
+	FVector AvgNormal = FVector::ZeroVector;
+	for (const FAIDAManifoldPortPoint& Port : Ports)
+	{
+		AvgNormal += FVector(Port.NormalCm.X, Port.NormalCm.Y, 0.0).GetSafeNormal();
+	}
+	AvgNormal = FVector(AvgNormal.X, AvgNormal.Y, 0.0).GetSafeNormal();
+	if (AvgNormal.IsNearlyZero())
+	{
+		Plan.Error = TEXT("machine ports face opposing directions — a manifold needs a row of machines facing the same way");
+		return Plan;
+	}
+	for (const FAIDAManifoldPortPoint& Port : Ports)
+	{
+		const FVector N = FVector(Port.NormalCm.X, Port.NormalCm.Y, 0.0).GetSafeNormal();
+		if (FVector::DotProduct(N, AvgNormal) < 0.7)
+		{
+			Plan.Error = TEXT("machine ports face different directions — a manifold needs a row of machines facing the same way (split into one manifold per row)");
+			return Plan;
+		}
+	}
+
+	Plan.DropDir = -AvgNormal;
+	Plan.RowAxis = FVector::CrossProduct(FVector::UpVector, AvgNormal).GetSafeNormal();
+
+	// Sort ports along the axis; attachments land at each port's projection onto the trunk line.
+	TArray<int32> Order;
+	Order.Reserve(Ports.Num());
+	for (int32 i = 0; i < Ports.Num(); ++i) { Order.Add(i); }
+	Order.Sort([&](int32 A, int32 B)
+	{
+		return FVector::DotProduct(Ports[A].PosCm, Plan.RowAxis) < FVector::DotProduct(Ports[B].PosCm, Plan.RowAxis);
+	});
+
+	const double FootprintCm = FootprintM * AIDAMetersToCm;
+	const double MaxRunCm = MaxRunM * AIDAMetersToCm;
+	const double StandoffCm = StandoffM * AIDAMetersToCm;
+
+	// Attachment yaw: pass-through runs along the axis. Conveyor attachments flow local -X → +X, so
+	// splitters take yaw = axis yaw (flow ascending, feed at index 0) and mergers flip 180° (flow
+	// descending, collection at index 0 — the open end is always the first machine along the axis).
+	const double AxisYaw = FMath::RadiansToDegrees(FMath::Atan2(Plan.RowAxis.Y, Plan.RowAxis.X));
+	Plan.YawDeg = FMath::RoundToInt32(AxisYaw);
+	if (bOutput && !bPipe) { Plan.YawDeg = ((Plan.YawDeg + 180) % 360 + 360) % 360; }
+
+	// The trunk is ONE straight line (that's the point of a manifold): axis coordinate varies per
+	// port, the normal coordinate is shared — the ports' centroid pushed out by the standoff.
+	FVector Centroid = FVector::ZeroVector;
+	for (const FAIDAManifoldPortPoint& Port : Ports) { Centroid += Port.PosCm; }
+	Centroid /= Ports.Num();
+	const double TrunkN = FVector::DotProduct(Centroid, AvgNormal) + StandoffCm;
+
+	const FRotator Rotation(0.0, static_cast<double>(Plan.YawDeg), 0.0);
+	double PrevT = 0.0;
+	for (int32 i = 0; i < Order.Num(); ++i)
+	{
+		const FAIDAManifoldPortPoint& Port = Ports[Order[i]];
+		const double T = FVector::DotProduct(Port.PosCm, Plan.RowAxis);
+		if (i > 0)
+		{
+			const double Spacing = T - PrevT;
+			if (Spacing < FootprintCm)
+			{
+				Plan.Error = FString::Printf(TEXT("machine ports %d and %d are %.1f m apart — closer than the %.0f m attachment footprint"),
+					i - 1, i, Spacing / AIDAMetersToCm, FootprintM);
+				return Plan;
+			}
+			if (Spacing > MaxRunCm)
+			{
+				Plan.Error = FString::Printf(TEXT("machine ports %d and %d are %.0f m apart — beyond the %.0f m maximum run length"),
+					i - 1, i, Spacing / AIDAMetersToCm, MaxRunM);
+				return Plan;
+			}
+		}
+		PrevT = T;
+
+		// Axis coordinate from the port, normal coordinate from the shared trunk line (axis and
+		// normal are orthonormal in XY, so this reconstructs the world point directly). Z carries
+		// the port height — the seam re-probes the ground under each center.
+		FVector Center = Plan.RowAxis * T + AvgNormal * TrunkN;
+		Center.Z = Port.PosCm.Z;
+		Plan.Attachments.Emplace(Rotation, Center);
+		Plan.PortOrder.Add(Order[i]);
+	}
+
+	return Plan;
+}
+
+FString AIDAActionSpec::CompassName(const FVector& Dir)
+{
+	// Game convention (AIDAChatCommands): north = -Y, east = +X. 8-way, 45° sectors.
+	static const TCHAR* Names[8] = { TEXT("north"), TEXT("northeast"), TEXT("east"), TEXT("southeast"),
+		TEXT("south"), TEXT("southwest"), TEXT("west"), TEXT("northwest") };
+	const double Deg = FMath::RadiansToDegrees(FMath::Atan2(Dir.X, -Dir.Y)); // 0 = north, 90 = east
+	const int32 Sector = ((FMath::RoundToInt32(Deg / 45.0) % 8) + 8) % 8;
+	return Names[Sector];
+}
+
+FString AIDAActionSpec::SummarizeManifold(const FAIDAManifoldSpec& Spec, const FString& AttachmentName, const FString& TransportName,
+	int32 MachineCount, int32 RunCount, const FString& OpenEndCompass)
+{
+	const FString Verb = Spec.bOutput
+		? FString::Printf(TEXT("collecting from %d x %s (output at the %s end)"), MachineCount, *Spec.Machines.Buildable, *OpenEndCompass)
+		: FString::Printf(TEXT("feeding %d x %s (feed at the %s end)"), MachineCount, *Spec.Machines.Buildable, *OpenEndCompass);
+	return FString::Printf(TEXT("manifold: %d x %s + %d x %s runs %s"),
+		MachineCount, *AttachmentName, RunCount, *TransportName, *Verb);
+}
+
 TArray<FTransform> AIDAActionSpec::ExpandGrid(const FAIDABuildSpec& Spec, double DefaultStepXM, double DefaultStepYM)
 {
 	// Steps smaller than the footprint stack tiles on top of each other — never what a player wants
@@ -224,6 +428,13 @@ FString AIDAActionSpec::BuildDryRunJson(const FAIDAProposal& Proposal, int32 Exp
 	Root->SetNumberField(TEXT("count"), Proposal.bDismantle ? Proposal.TargetCount : Proposal.Placements.Num());
 	Root->SetArrayField(Proposal.bDismantle ? TEXT("refund") : TEXT("cost"), Cost);
 	if (!Proposal.bDismantle) { Root->SetBoolField(TEXT("affordable"), bAffordable); }
+	if (Proposal.bManifold)
+	{
+		const int32 N = Proposal.Placements.Num();
+		Root->SetNumberField(TEXT("runs"), N > 0 ? (2 * N - 1) : 0);
+		Root->SetStringField(TEXT("costNote"),
+			TEXT("cost covers the attachments; belt/pipe runs are length-priced and charged from central storage as they build"));
+	}
 	if (PowerDrawMW > 0.0) { Root->SetField(TEXT("powerDrawMW"), AIDANumber(PowerDrawMW)); }
 	Root->SetStringField(TEXT("status"), TEXT("awaiting approval"));
 	Root->SetNumberField(TEXT("expiresInSec"), ExpiresInSec);

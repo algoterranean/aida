@@ -16,6 +16,9 @@
 
 #include "FGBuildableSubsystem.h"
 #include "FGCentralStorageSubsystem.h"
+#include "FGFactoryConnectionComponent.h"
+#include "FGPipeConnectionComponent.h"
+#include "Hologram/FGSplineHologram.h"
 #include "FGClearanceInterface.h"
 #include "FGConstructDisqualifier.h"
 #include "FGDismantleInterface.h"
@@ -821,9 +824,16 @@ void FAIDAActionSeam::RefundToPlayer(UObject* WorldContext, const FString& Playe
 
 int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& RecipeClassPath,
 	const TArray<FTransform>& Placements, int32 Cursor, int32 BatchSize,
-	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, int32& OutSkipped)
+	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, int32& OutSkipped,
+	TArray<TWeakObjectPtr<AActor>>* OutPerIndexActors)
 {
 	OutSkipped = 0;
+
+	// Index-aligned callers (manifolds) get one slot per consumed index no matter how it ends.
+	const auto RecordIndex = [OutPerIndexActors](AActor* Actor)
+	{
+		if (OutPerIndexActors) { OutPerIndexActors->Add(Actor); }
+	};
 
 	UWorld* World = ResolveWorld(WorldContext);
 	UClass* RecipeClass = World ? FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>() : nullptr;
@@ -831,6 +841,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 	{
 		// Consume everything so the executor terminates instead of spinning on a dead recipe.
 		OutSkipped = Placements.Num() - Cursor;
+		for (int32 i = 0; i < OutSkipped; ++i) { RecordIndex(nullptr); }
 		return OutSkipped;
 	}
 
@@ -838,6 +849,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 	if (!Inventory)
 	{
 		OutSkipped = Placements.Num() - Cursor; // nobody connected to validate against — terminate
+		for (int32 i = 0; i < OutSkipped; ++i) { RecordIndex(nullptr); }
 		return OutSkipped;
 	}
 
@@ -847,7 +859,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 	{
 		// Fresh hologram per construct — Construct() consumes the hologram's configured state.
 		AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, Placements[Index].GetLocation());
-		if (!Hologram) { ++OutSkipped; continue; }
+		if (!Hologram) { ++OutSkipped; RecordIndex(nullptr); continue; }
 
 		// Re-validate: the world may have changed since the dry-run (players build/walk around).
 		// The temp floor (lightweight-instance tiles) must outlive Construct — the hologram caches
@@ -858,6 +870,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 			Hologram->Destroy();
 			if (TempFloor) { TempFloor->Destroy(); }
 			++OutSkipped;
+			RecordIndex(nullptr);
 			continue;
 		}
 
@@ -865,7 +878,7 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		AActor* Built = Hologram->Construct(Children, FNetConstructionID());
 		Hologram->Destroy();
 		if (TempFloor) { TempFloor->Destroy(); }
-		if (!Built) { ++OutSkipped; continue; }
+		if (!Built) { ++OutSkipped; RecordIndex(nullptr); continue; }
 
 		// Capture the undo handle (docs/PHASE4.md §2d). Lightweight-bound buildables are destroyed
 		// and migrated to the instance subsystem right after Construct — journal class+transform
@@ -882,12 +895,14 @@ int32 FAIDAActionSeam::ExecuteBuildBatch(UObject* WorldContext, const FString& R
 		{
 			Entity.Type = TEXT("lw");
 			Entity.Index = INDEX_NONE;
+			RecordIndex(nullptr); // the actor dies on conversion — index-aligned callers see a miss
 		}
 		else
 		{
 			Entity.Type = TEXT("actor");
 			Entity.RecipePath = RecipeClassPath;
 			OutActors.Add(Built);
+			RecordIndex(Built);
 		}
 		OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
 
@@ -1209,4 +1224,318 @@ bool FAIDAActionSeam::UndoRebuildEntity(UObject* WorldContext, const FAIDAEntity
 	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
 	Hologram->Destroy();
 	return Built != nullptr;
+}
+
+namespace
+{
+	/** Buildable's canonical display name via its built-with recipe (the dismantle walk's convention). */
+	FString BuildableDisplayName(AFGBuildable* Buildable)
+	{
+		const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
+		const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
+		return Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Buildable->GetClass());
+	}
+
+	/** Best unconnected factory (belt) port on a live actor: direction + best normal-dot with
+	 *  WantDir, at least 60° aligned — a run must never leave from the far side of an attachment. */
+	UFGFactoryConnectionComponent* FindFactoryPort(AActor* Actor, bool bWantOutput, const FVector& WantDir)
+	{
+		const FVector Wanted = FVector(WantDir.X, WantDir.Y, 0.0).GetSafeNormal();
+		UFGFactoryConnectionComponent* Best = nullptr;
+		double BestDot = 0.5;
+		TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
+		Actor->GetComponents(Connections);
+		for (UFGFactoryConnectionComponent* Conn : Connections)
+		{
+			if (!Conn || Conn->IsConnected()) { continue; }
+			const EFactoryConnectionDirection Dir = Conn->GetDirection();
+			const bool bMatches = bWantOutput
+				? (Dir == EFactoryConnectionDirection::FCD_OUTPUT || Dir == EFactoryConnectionDirection::FCD_ANY)
+				: (Dir == EFactoryConnectionDirection::FCD_INPUT || Dir == EFactoryConnectionDirection::FCD_ANY);
+			if (!bMatches) { continue; }
+			const FVector Normal = Conn->GetConnectorNormal();
+			const double Dot = FVector::DotProduct(FVector(Normal.X, Normal.Y, 0.0).GetSafeNormal(), Wanted);
+			if (Dot > BestDot)
+			{
+				BestDot = Dot;
+				Best = Conn;
+			}
+		}
+		return Best;
+	}
+
+	/** Pipe twin of FindFactoryPort. Pipes are direction-agnostic (PCT_ANY junctions ↔ typed machine
+	 *  ports); only snap-only ports are excluded. */
+	UFGPipeConnectionComponent* FindPipePort(AActor* Actor, const FVector& WantDir)
+	{
+		const FVector Wanted = FVector(WantDir.X, WantDir.Y, 0.0).GetSafeNormal();
+		UFGPipeConnectionComponent* Best = nullptr;
+		double BestDot = 0.5;
+		TInlineComponentArray<UFGPipeConnectionComponent*> Connections;
+		Actor->GetComponents(Connections);
+		for (UFGPipeConnectionComponent* Conn : Connections)
+		{
+			if (!Conn || Conn->IsConnected()) { continue; }
+			if (Conn->GetPipeConnectionType() == EPipeConnectionType::PCT_SNAP_ONLY) { continue; }
+			const FVector Normal = Conn->GetConnectorNormal();
+			const double Dot = FVector::DotProduct(FVector(Normal.X, Normal.Y, 0.0).GetSafeNormal(), Wanted);
+			if (Dot > BestDot)
+			{
+				BestDot = Dot;
+				Best = Conn;
+			}
+		}
+		return Best;
+	}
+
+	/** Synthetic build-gun hit AT a connector, so a spline hologram's TrySnapToActor finds the port. */
+	FHitResult MakePortHit(AActor* Actor, const FVector& ConnectorLoc)
+	{
+		FHitResult Hit(ForceInit);
+		Hit.bBlockingHit = true;
+		Hit.HitObjectHandle = FActorInstanceHandle(Actor);
+		if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(Actor->GetRootComponent()))
+		{
+			Hit.Component = Root;
+		}
+		Hit.Location = ConnectorLoc;
+		Hit.ImpactPoint = ConnectorLoc;
+		Hit.Normal = FVector::UpVector;
+		Hit.ImpactNormal = FVector::UpVector;
+		return Hit;
+	}
+}
+
+bool FAIDAActionSeam::ResolveMachinePorts(UObject* WorldContext, const FAIDADismantleSpec& Selector,
+	bool bPipe, bool bOutput, int32 PortIndex,
+	TArray<FAIDAManifoldPort>& OutPorts, int32& OutSkippedConnected, FString& OutMachineName)
+{
+	OutPorts.Reset();
+	OutSkippedConnected = 0;
+	OutMachineName.Reset();
+
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	const FString WantedName = NormalizeName(Selector.Buildable);
+	if (!Subsystem || WantedName.IsEmpty()) { return false; }
+
+	const FVector CenterCm = Selector.CenterM * AIDAMetersToCm;
+	const double RadiusSq = FMath::Square(Selector.RadiusM * AIDAMetersToCm);
+	const int32 MaxCount = Selector.MaxCount > 0 ? Selector.MaxCount : MAX_int32;
+
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (OutPorts.Num() >= MaxCount) { break; }
+		if (!IsValid(Buildable)) { continue; }
+		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+
+		const FString Name = BuildableDisplayName(Buildable);
+		if (!NormalizeName(Name).Contains(WantedName)) { continue; }
+
+		// The PortIndex-th UNCONNECTED port of the wanted kind/direction, in stable name order.
+		// A machine with matching ports that are all taken counts as skipped-connected; a machine
+		// with no ports of this kind at all (pipe manifold onto a smelter) is silently not a match.
+		FAIDAManifoldPort Port;
+		bool bFound = false;
+		bool bAnyOfKind = false;
+		int32 Unconnected = 0;
+		if (!bPipe)
+		{
+			TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
+			Buildable->GetComponents(Connections);
+			UFGFactoryConnectionComponent::SortComponentList(Connections);
+			for (UFGFactoryConnectionComponent* Conn : Connections)
+			{
+				if (!Conn) { continue; }
+				const EFactoryConnectionDirection Dir = Conn->GetDirection();
+				if (Dir != (bOutput ? EFactoryConnectionDirection::FCD_OUTPUT : EFactoryConnectionDirection::FCD_INPUT))
+				{
+					continue;
+				}
+				bAnyOfKind = true;
+				if (Conn->IsConnected()) { continue; }
+				if (Unconnected++ < PortIndex) { continue; }
+				Port.PosCm = Conn->GetConnectorLocation();
+				Port.NormalCm = Conn->GetConnectorNormal();
+				bFound = true;
+				break;
+			}
+		}
+		else
+		{
+			TInlineComponentArray<UFGPipeConnectionComponent*> Connections;
+			Buildable->GetComponents(Connections);
+			Connections.Sort([](const UFGPipeConnectionComponent& A, const UFGPipeConnectionComponent& B)
+			{
+				return A.GetName() < B.GetName();
+			});
+			for (UFGPipeConnectionComponent* Conn : Connections)
+			{
+				if (!Conn) { continue; }
+				const EPipeConnectionType Type = Conn->GetPipeConnectionType();
+				if (Type != (bOutput ? EPipeConnectionType::PCT_PRODUCER : EPipeConnectionType::PCT_CONSUMER))
+				{
+					continue;
+				}
+				bAnyOfKind = true;
+				if (Conn->IsConnected()) { continue; }
+				if (Unconnected++ < PortIndex) { continue; }
+				Port.PosCm = Conn->GetConnectorLocation();
+				Port.NormalCm = Conn->GetConnectorNormal();
+				bFound = true;
+				break;
+			}
+		}
+
+		if (!bAnyOfKind) { continue; }
+		if (!bFound)
+		{
+			++OutSkippedConnected;
+			continue;
+		}
+		if (OutMachineName.IsEmpty()) { OutMachineName = Name; }
+		Port.Machine = Buildable;
+		Port.MachineName = Name;
+		OutPorts.Add(MoveTemp(Port));
+	}
+	return true;
+}
+
+bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
+	AActor* FromActor, const FVector& FromWantDir, AActor* ToActor, const FVector& ToWantDir,
+	bool bChargeCost, TArray<FAIDACostItem>& OutCost,
+	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError)
+{
+	OutCost.Reset();
+	OutError.Reset();
+
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(TransportRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass) { OutError = TEXT("transport recipe no longer resolvable"); return false; }
+	if (!IsValid(FromActor) || !IsValid(ToActor)) { OutError = TEXT("endpoint no longer exists"); return false; }
+
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory) { OutError = TEXT("no player inventory available to validate against"); return false; }
+
+	// Pick the endpoint ports on the LIVE actors (belts: from = output, to = input; pipes any↔any).
+	FVector FromLoc, ToLoc;
+	if (!bPipe)
+	{
+		UFGFactoryConnectionComponent* FromConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
+		UFGFactoryConnectionComponent* ToConn = FindFactoryPort(ToActor, /*bWantOutput*/ false, ToWantDir);
+		if (!FromConn) { OutError = FString::Printf(TEXT("no free output port on %s facing the run"), *GetNameSafe(FromActor)); return false; }
+		if (!ToConn) { OutError = FString::Printf(TEXT("no free input port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
+		FromLoc = FromConn->GetConnectorLocation();
+		ToLoc = ToConn->GetConnectorLocation();
+	}
+	else
+	{
+		UFGPipeConnectionComponent* FromConn = FindPipePort(FromActor, FromWantDir);
+		UFGPipeConnectionComponent* ToConn = FindPipePort(ToActor, ToWantDir);
+		if (!FromConn) { OutError = FString::Printf(TEXT("no free pipe port on %s facing the run"), *GetNameSafe(FromActor)); return false; }
+		if (!ToConn) { OutError = FString::Printf(TEXT("no free pipe port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
+		FromLoc = FromConn->GetConnectorLocation();
+		ToLoc = ToConn->GetConnectorLocation();
+	}
+
+	// Drive the spline hologram through the build gun's own two-step flow: place + snap the start,
+	// advance the build step, place + snap the end. BOTH snaps are load-bearing — an unsnapped end
+	// silently constructs a support pole instead of a connection (docs/PHASE4-MANIFOLDS.md §5).
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, FromLoc);
+	if (!Hologram) { OutError = TEXT("could not spawn a run hologram"); return false; }
+	AFGSplineHologram* Spline = Cast<AFGSplineHologram>(Hologram);
+	if (!Spline)
+	{
+		// A non-spline transport (the model resolved a wall as a "belt") must fail loudly here —
+		// the two-step drive below would otherwise construct nonsense at the port.
+		OutError = TEXT("the transport recipe is not a belt or pipe");
+		Hologram->Destroy();
+		return false;
+	}
+
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(MakePortHit(FromActor, FromLoc));
+	if (Spline && !Spline->IsConnectionSnapped(false))
+	{
+		OutError = FString::Printf(TEXT("run start did not snap to %s's port"), *GetNameSafe(FromActor));
+		Hologram->Destroy();
+		return false;
+	}
+	Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false); // start placed; expect "more steps"
+
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(MakePortHit(ToActor, ToLoc));
+	if (Spline && !Spline->IsConnectionSnapped(true))
+	{
+		OutError = FString::Printf(TEXT("run end did not snap to %s's port"), *GetNameSafe(ToActor));
+		Hologram->Destroy();
+		return false;
+	}
+
+	Hologram->ValidatePlacementAndCost(Inventory);
+	TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
+	Hologram->GetConstructDisqualifiers(Disqualifiers);
+	for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+	{
+		if (IsBlockingDisqualifier(Disqualifier))
+		{
+			OutError = UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString();
+			Hologram->Destroy();
+			return false;
+		}
+	}
+
+	// The run's ACTUAL length-scaled cost (docs/PHASE4-MANIFOLDS.md §4) — charged before Construct.
+	for (const FItemAmount& Entry : Hologram->GetCost(/*includeChildren*/ true))
+	{
+		AddCost(OutCost, Entry.ItemClass, Entry.Amount);
+	}
+	if (bChargeCost && !DeductCost(WorldContext, OutCost))
+	{
+		OutError = TEXT("central storage cannot afford this run");
+		Hologram->Destroy();
+		return false;
+	}
+
+	if (!Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false))
+	{
+		// Snapped ends should finish the multi-step flow; if the hologram still wants steps
+		// (pole-adjust), log and construct anyway — both ends verified snapped above.
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] run hologram still multi-stepping after end snap (%s) — constructing anyway."),
+			*GetNameSafe(Hologram->GetClass()));
+	}
+
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	if (!Built)
+	{
+		OutError = TEXT("run Construct() returned nothing");
+		if (bChargeCost)
+		{
+			UE_LOG(LogAIDA, Error, TEXT("[actions] run failed AFTER cost deduction — items lost to the void."));
+		}
+		return false;
+	}
+
+	FAIDAEntityId Entity;
+	Entity.Type = TEXT("actor");
+	Entity.ClassPath = Built->GetClass()->GetPathName();
+	Entity.RecipePath = TransportRecipePath;
+	Entity.Pos = Built->GetActorLocation();
+	Entity.YawDeg = FMath::RoundToInt32(Built->GetActorRotation().Yaw);
+	OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
+	OutActors.Add(Built);
+	for (AActor* Child : Children)
+	{
+		if (!Child) { continue; }
+		FAIDAEntityId ChildEntity;
+		ChildEntity.Type = TEXT("actor");
+		ChildEntity.ClassPath = Child->GetClass()->GetPathName();
+		ChildEntity.Pos = Child->GetActorLocation();
+		ChildEntity.YawDeg = FMath::RoundToInt32(Child->GetActorRotation().Yaw);
+		OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(ChildEntity));
+		OutActors.Add(Child);
+	}
+	return true;
 }

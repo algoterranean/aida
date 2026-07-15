@@ -1539,6 +1539,110 @@ bool FAIDAActionsGridExpandTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsManifoldTest, "AIDA.Actions.Manifold",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsManifoldTest::RunTest(const FString&)
+{
+	FString Error;
+
+	// Spec parse: defaults (belt/in, radius 30, maxCount 0=all→cap, standoff 4).
+	{
+		FAIDAManifoldSpec Spec;
+		const TSharedPtr<FJsonObject> Json = AIDATestParseJson(TEXT(
+			R"({ "version": 1, "transport": "Conveyor Belt Mk.2", "machines": { "buildable": "Smelter" } })"));
+		TestTrue(FString::Printf(TEXT("parses (%s)"), *Error), AIDAActionSpec::ParseManifoldSpec(Json, 200, Spec, Error));
+		TestFalse(TEXT("defaults to belt"), Spec.bPipe);
+		TestFalse(TEXT("defaults to in"), Spec.bOutput);
+		TestEqual(TEXT("default radius"), Spec.Machines.RadiusM, 30.0);
+		TestEqual(TEXT("maxCount 0 clamps to cap"), Spec.Machines.MaxCount, 200);
+		TestEqual(TEXT("default standoff"), Spec.StandoffM, 4.0);
+		TestFalse(TEXT("omitted center flagged"), Spec.Machines.bHasCenter);
+	}
+
+	// Spec parse: explicit pipe/out + rejections.
+	{
+		FAIDAManifoldSpec Spec;
+		TestTrue(TEXT("pipe/out parses"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "kind": "pipe", "direction": "out", "transport": "Pipeline",
+			     "machines": { "buildable": "Refinery", "center": { "x": 1, "y": 2 }, "radiusM": 50 }, "port": 1 })")),
+			200, Spec, Error));
+		TestTrue(TEXT("pipe set"), Spec.bPipe);
+		TestTrue(TEXT("out set"), Spec.bOutput);
+		TestTrue(TEXT("center kept"), Spec.Machines.bHasCenter);
+		TestEqual(TEXT("port index"), Spec.PortIndex, 1);
+
+		TestFalse(TEXT("rejects missing transport"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects missing machines"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "transport": "Belt" })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects bad kind"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "kind": "train", "transport": "Belt", "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects bad direction"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "direction": "sideways", "transport": "Belt", "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
+	}
+
+	// Planner: three machines facing +X, ports fed SHUFFLED — sorted along the row axis (+Y), one
+	// straight trunk line at standoff, splitter yaw along the axis, drop direction back at the machines.
+	{
+		TArray<FAIDAManifoldPortPoint> Ports;
+		Ports.Add({ FVector(0.0, 1600.0, 100.0), FVector(1.0, 0.0, 0.0) });
+		Ports.Add({ FVector(0.0, 0.0, 100.0), FVector(1.0, 0.0, 0.0) });
+		Ports.Add({ FVector(0.0, 800.0, 100.0), FVector(1.0, 0.0, 0.0) });
+
+		const FAIDAManifoldPlan Plan = AIDAActionSpec::PlanManifold(Ports, /*bOutput*/ false, /*bPipe*/ false,
+			/*StandoffM*/ 4.0, /*FootprintM*/ 4.0, /*MaxRunM*/ 56.0);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		if (!TestEqual(TEXT("attachment count"), Plan.Attachments.Num(), 3)) { return false; }
+		TestTrue(TEXT("row axis +Y"), Plan.RowAxis.Equals(FVector(0.0, 1.0, 0.0), 0.01));
+		TestTrue(TEXT("drop dir -X (back at the machines)"), Plan.DropDir.Equals(FVector(-1.0, 0.0, 0.0), 0.01));
+		TestEqual(TEXT("sorted: first is port 1"), Plan.PortOrder[0], 1);
+		TestEqual(TEXT("sorted: last is port 0"), Plan.PortOrder[2], 0);
+		TestTrue(TEXT("first attachment on the trunk line"), Plan.Attachments[0].GetLocation().Equals(FVector(400.0, 0.0, 100.0), 0.1));
+		TestTrue(TEXT("straight trunk (same X)"), Plan.Attachments[2].GetLocation().Equals(FVector(400.0, 1600.0, 100.0), 0.1));
+		TestEqual(TEXT("splitter yaw along axis"), Plan.YawDeg, 90);
+		TestEqual(TEXT("open end faces north (-Y)"), AIDAActionSpec::CompassName(-Plan.RowAxis), TEXT("north"));
+
+		// Mergers flip 180° so the collection end stays at index 0.
+		const FAIDAManifoldPlan Mergers = AIDAActionSpec::PlanManifold(Ports, /*bOutput*/ true, /*bPipe*/ false, 4.0, 4.0, 56.0);
+		TestEqual(TEXT("merger yaw flipped"), Mergers.YawDeg, 270);
+	}
+
+	// Planner rejections: mixed facing, too close, hop too long.
+	{
+		TArray<FAIDAManifoldPortPoint> Opposed;
+		Opposed.Add({ FVector(0.0, 0.0, 0.0), FVector(1.0, 0.0, 0.0) });
+		Opposed.Add({ FVector(0.0, 800.0, 0.0), FVector(-1.0, 0.0, 0.0) });
+		TestTrue(TEXT("rejects opposing normals"),
+			!AIDAActionSpec::PlanManifold(Opposed, false, false, 4.0, 4.0, 56.0).Error.IsEmpty());
+
+		TArray<FAIDAManifoldPortPoint> Cramped;
+		Cramped.Add({ FVector(0.0, 0.0, 0.0), FVector(1.0, 0.0, 0.0) });
+		Cramped.Add({ FVector(0.0, 200.0, 0.0), FVector(1.0, 0.0, 0.0) });
+		TestTrue(TEXT("rejects sub-footprint spacing"),
+			!AIDAActionSpec::PlanManifold(Cramped, false, false, 4.0, 4.0, 56.0).Error.IsEmpty());
+
+		TArray<FAIDAManifoldPortPoint> Sparse;
+		Sparse.Add({ FVector(0.0, 0.0, 0.0), FVector(1.0, 0.0, 0.0) });
+		Sparse.Add({ FVector(0.0, 6000.0, 0.0), FVector(1.0, 0.0, 0.0) });
+		TestTrue(TEXT("rejects over-long trunk hop"),
+			!AIDAActionSpec::PlanManifold(Sparse, false, false, 4.0, 4.0, 56.0).Error.IsEmpty());
+
+		TestTrue(TEXT("single machine plans (drop only)"),
+			AIDAActionSpec::PlanManifold({ { FVector::ZeroVector, FVector(1.0, 0.0, 0.0) } }, false, false, 4.0, 4.0, 56.0).Error.IsEmpty());
+	}
+
+	// Summary line carries the counts and the open end.
+	{
+		FAIDAManifoldSpec Spec;
+		Spec.Machines.Buildable = TEXT("Smelter");
+		const FString Summary = AIDAActionSpec::SummarizeManifold(Spec, TEXT("Conveyor Splitter"), TEXT("Conveyor Belt Mk.2"), 10, 19, TEXT("west"));
+		TestTrue(TEXT("summary names attachments"), Summary.Contains(TEXT("10 x Conveyor Splitter")));
+		TestTrue(TEXT("summary names runs"), Summary.Contains(TEXT("19 x Conveyor Belt Mk.2")));
+		TestTrue(TEXT("summary names the open end"), Summary.Contains(TEXT("west end")));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsProposalStoreTest, "AIDA.Actions.ProposalStore",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAActionsProposalStoreTest::RunTest(const FString&)

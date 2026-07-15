@@ -59,6 +59,52 @@ struct FAIDADismantleSpec
 	int32 MaxCount = 20;
 };
 
+/** propose_manifold spec v1 (docs/PHASE4-MANIFOLDS.md §2): splitter/merger (or pipe-junction) rows
+ *  + the connecting belt/pipe runs, derived from live machine ports — the model never supplies
+ *  transforms, only the selector and the tiers. */
+struct FAIDAManifoldSpec
+{
+	int32 Version = 1;
+	bool bPipe = false;                    // kind: "belt" (default) | "pipe"
+	bool bOutput = false;                  // direction: "in" (feed inputs, default) | "out" (collect outputs)
+	FString Transport;                     // belt/pipe display name, fuzzy-resolved, unlocked only
+	FString Attachment;                    // optional override; "" = the kind/direction default
+	FAIDADismantleSpec Machines;           // selector reuse (buildable required, center optional = aim)
+	double StandoffM = 4.0;                // trunk-line distance in front of the ports
+	int32 PortIndex = 0;                   // which matching unconnected machine port (0 = first)
+};
+
+/** One machine-port point for the pure planner (world units; the seam resolves these live). */
+struct FAIDAManifoldPortPoint
+{
+	FVector PosCm = FVector::ZeroVector;
+	FVector NormalCm = FVector::XAxisVector; // outward connector normal (XY significant)
+};
+
+/**
+ * PlanManifold output: one attachment per port, sorted along the fitted row axis. Attachments[i]
+ * serves the caller's Ports[PortOrder[i]] — callers reorder their parallel arrays by PortOrder so
+ * everything downstream is index-aligned. Z is carried from each port; callers re-probe ground.
+ */
+struct FAIDAManifoldPlan
+{
+	TArray<FTransform> Attachments;
+	TArray<int32> PortOrder;
+	FVector RowAxis = FVector::XAxisVector; // unit; +axis = ascending sort order (open end at index 0)
+	FVector DropDir = FVector::ZeroVector;  // unit, from the trunk line toward the machines (-avg normal)
+	int32 YawDeg = 0;                       // attachment yaw (pass-through along the axis; mergers flipped 180°)
+	FString Error;                          // non-empty = plan failed (model-facing reason)
+};
+
+/** One machine port a manifold proposal holds between propose and execute (world units). */
+struct FAIDAManifoldPort
+{
+	TWeakObjectPtr<AActor> Machine;        // re-verified at execute; a dead machine = one failed drop
+	FString MachineName;                   // display name for failure reports
+	FVector PosCm = FVector::ZeroVector;
+	FVector NormalCm = FVector::XAxisVector;
+};
+
 /** One line of a cost/refund tally. ClassPath (the item descriptor) is what deduction/refund acts
  *  on; Item is the display name the model and players see. */
 struct FAIDACostItem
@@ -153,4 +199,17 @@ struct FAIDAProposal
 	FString Summary;                       // human diff line ("place 100 x Foundation …")
 	int32 Cursor = 0;                      // executor progress into Placements/targets
 	TArray<FString> AffectedEntityIds;     // encoded FAIDAEntityIds, filled during execute
+
+	//~ Manifold extensions (docs/PHASE4-MANIFOLDS.md). Defaults = a plain build/dismantle proposal.
+	//  For manifolds, Placements/RecipeClassPath/Cost describe the ATTACHMENTS (so ghosts, upfront
+	//  deduction and the pending cap all reuse the existing paths); runs are charged as built.
+	bool bManifold = false;
+	bool bManifoldPipe = false;
+	bool bManifoldOutput = false;
+	FString TransportRecipePath;           // belt/pipe recipe, resolved at dry-run
+	FString TransportName;                 // display name for summaries/reports
+	TArray<FAIDAManifoldPort> Ports;       // index-aligned with Placements (plan-sorted)
+	FVector RowAxis = FVector::XAxisVector;
+	FVector DropDir = FVector::ZeroVector; // unit, from each attachment toward its machine
+	int32 Phase = 0;                       // executor: 0 = attachments, 1 = trunk runs, 2 = drop runs
 };

@@ -24,6 +24,31 @@ namespace AIDAActionSpec
 	bool ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDADismantleSpec& Out, FString& OutError);
 
 	/**
+	 * Parse + validate a propose_manifold spec (docs/PHASE4-MANIFOLDS.md §2): version 1, kind
+	 * belt/pipe, direction in/out, transport + machines.buildable required. Machine selector
+	 * defaults: radiusM 30, maxCount 0 (= all matches, clamped to MaxItems when capped).
+	 */
+	bool ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError);
+
+	/**
+	 * Fit the manifold row (docs/PHASE4-MANIFOLDS.md §3, pure geometry): all port normals must agree
+	 * within ~45°, row axis = Up × avgNormal, one attachment per port at its projection onto the
+	 * trunk line standoff in front of the ports, sorted along the axis. Attachment yaw points the
+	 * pass-through along the axis (mergers flipped 180° so the collection end is index 0, matching
+	 * the splitters' feed end). Fails (Out.Error) on mixed facing, attachments closer than the
+	 * footprint, or trunk hops beyond MaxRunM.
+	 */
+	FAIDAManifoldPlan PlanManifold(const TArray<FAIDAManifoldPortPoint>& Ports, bool bOutput, bool bPipe,
+		double StandoffM, double FootprintM, double MaxRunM);
+
+	/** 8-way compass name for a world direction (game convention: north = -Y, east = +X). */
+	FString CompassName(const FVector& Dir);
+
+	/** Human diff line: "manifold: 10 x Conveyor Splitter + 19 x Belt runs feeding 10 x Smelter (feed at the west end)". */
+	FString SummarizeManifold(const FAIDAManifoldSpec& Spec, const FString& AttachmentName, const FString& TransportName,
+		int32 MachineCount, int32 RunCount, const FString& OpenEndCompass);
+
+	/**
 	 * Expand the grid into world-unit (cm) transforms, row-major from the origin. Steps default to the
 	 * caller-supplied footprint (metres — the seam knows the buildable's size) when the spec left them 0.
 	 * The step axes rotate with YawDeg so a rotated grid stays coherent.

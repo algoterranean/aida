@@ -11,6 +11,29 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
+namespace
+{
+	/** Merge one tally into another by item name (run costs accrue onto the proposal's tally so the
+	 *  journaled refund covers the whole manifold). */
+	void MergeCost(TArray<FAIDACostItem>& Into, const TArray<FAIDACostItem>& Add)
+	{
+		for (const FAIDACostItem& Item : Add)
+		{
+			bool bMerged = false;
+			for (FAIDACostItem& Existing : Into)
+			{
+				if (Existing.Item == Item.Item)
+				{
+					Existing.Amount += Item.Amount;
+					bMerged = true;
+					break;
+				}
+			}
+			if (!bMerged) { Into.Add(Item); }
+		}
+	}
+}
+
 bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig& Config, const FGuid& Id, const FString& ApproverId, FString& OutMessage)
 {
 	ProposalStore.SweepExpired(FDateTime::UtcNow().ToUnixTimestamp(), Config.TtlSeconds);
@@ -81,8 +104,11 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 	ExecutingId = Id;
 	BuiltActors.Reset();
 	AccruedRefund.Reset();
-	SkippedCount = RemovedCount = MissingCount = 0;
+	AttachmentActors.Reset();
+	RunFailures.Reset();
+	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 	Proposal->Cursor = 0;
+	Proposal->Phase = 0;
 
 	const int32 Total = Proposal->bDismantle ? DismantleQueue.Num() : Proposal->Placements.Num();
 	OutMessage = FString::Printf(TEXT("approved — %s (%d item(s), batched)"), *Proposal->Summary, Total);
@@ -117,6 +143,11 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 	if (Proposal->bDismantle)
 	{
 		OutMessage = TEXT("only build proposals can be nudged/rotated");
+		return false;
+	}
+	if (Proposal->bManifold)
+	{
+		OutMessage = TEXT("manifolds are anchored to machine ports and can't be nudged — reject and re-propose instead");
 		return false;
 	}
 
@@ -180,6 +211,11 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 		return false;
 	}
 
+	if (Proposal->bManifold)
+	{
+		return TickManifold(WorldContext, Config, Memory, *Proposal);
+	}
+
 	if (Proposal->bDismantle)
 	{
 		int32 Removed = 0, Missing = 0;
@@ -200,6 +236,103 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 	}
 
 	FinishExecution(WorldContext, Config, Memory, *Proposal);
+	return false;
+}
+
+bool FAIDAActionEngine::TickManifold(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
+{
+	const int32 N = Proposal.Placements.Num();
+
+	// Phase 0 — the attachment row, batched like any build, with per-index actor capture.
+	if (Proposal.Phase == 0)
+	{
+		int32 Skipped = 0;
+		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.RecipeClassPath,
+			Proposal.Placements, Proposal.Cursor, FMath::Max(1, Config.BatchPerTick),
+			Proposal.AffectedEntityIds, BuiltActors, Skipped, &AttachmentActors);
+		SkippedCount += Skipped;
+		if (Proposal.Cursor < N) { return true; }
+		Proposal.Phase = 1;
+		Proposal.Cursor = 0;
+		return true;
+	}
+
+	// Phases 1-2 — ONE run per tick (spawn spline hologram → two-step place → validate → construct).
+	const auto RunOne = [&](AActor* From, const FVector& FromDir, AActor* To, const FVector& ToDir,
+		const TCHAR* What, int32 Index)
+	{
+		if (!From || !To)
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("%s run %d: endpoint missing (attachment skipped or machine gone)"), What, Index));
+			}
+			return;
+		}
+		TArray<FAIDACostItem> Cost;
+		FString Error;
+		if (FAIDAActionSeam::BuildConnectingRun(WorldContext, Proposal.TransportRecipePath, Proposal.bManifoldPipe,
+			From, FromDir, To, ToDir, Config.CostMode == TEXT("central"), Cost,
+			Proposal.AffectedEntityIds, BuiltActors, Error))
+		{
+			MergeCost(Proposal.Cost, Cost); // the journaled refund covers the whole manifold
+			++RunBuiltCount;
+		}
+		else
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("%s run %d: %s"), What, Index, *Error));
+			}
+			UE_LOG(LogAIDA, Warning, TEXT("[actions] manifold %s run %d failed: %s"), What, Index, *Error);
+		}
+	};
+
+	const auto AttachmentAt = [&](int32 Index) -> AActor*
+	{
+		return AttachmentActors.IsValidIndex(Index) ? AttachmentActors[Index].Get() : nullptr;
+	};
+
+	if (Proposal.Phase == 1)
+	{
+		if (Proposal.Cursor >= N - 1) // single machine: no trunk at all
+		{
+			Proposal.Phase = 2;
+			Proposal.Cursor = 0;
+			return true;
+		}
+		const int32 Index = Proposal.Cursor++;
+		// Splitter trunks flow ascending (feed at index 0); merger trunks flow descending (collection
+		// at index 0). Pipes are direction-agnostic — the splitter arrangement serves them fine.
+		const bool bReverse = Proposal.bManifoldOutput && !Proposal.bManifoldPipe;
+		AActor* From = AttachmentAt(bReverse ? Index + 1 : Index);
+		AActor* To = AttachmentAt(bReverse ? Index : Index + 1);
+		const FVector FromDir = bReverse ? -Proposal.RowAxis : Proposal.RowAxis;
+		RunOne(From, FromDir, To, -FromDir, TEXT("trunk"), Index);
+		return true;
+	}
+
+	if (Proposal.Cursor < N)
+	{
+		const int32 Index = Proposal.Cursor++;
+		AActor* Attachment = AttachmentAt(Index);
+		AActor* Machine = Proposal.Ports.IsValidIndex(Index) ? Proposal.Ports[Index].Machine.Get() : nullptr;
+		const FVector MachineDir = Proposal.Ports.IsValidIndex(Index)
+			? Proposal.Ports[Index].NormalCm : -Proposal.DropDir;
+		if (Proposal.bManifoldOutput) // machine output → attachment (merger/junction) input
+		{
+			RunOne(Machine, MachineDir, Attachment, Proposal.DropDir, TEXT("drop"), Index);
+		}
+		else                          // attachment (splitter/junction) output → machine input
+		{
+			RunOne(Attachment, Proposal.DropDir, Machine, MachineDir, TEXT("drop"), Index);
+		}
+		if (Proposal.Cursor < N) { return true; }
+	}
+
+	FinishExecution(WorldContext, Config, Memory, Proposal);
 	return false;
 }
 
@@ -234,7 +367,20 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed, NowUtc);
 
 	const int32 Affected = Proposal.AffectedEntityIds.Num();
-	if (Proposal.bDismantle)
+	if (Proposal.bManifold)
+	{
+		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (manifold): %d attachment(s) (%d skipped), %d run(s) built, %d run(s) failed (journal %s)."),
+			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens),
+			Proposal.Placements.Num() - SkippedCount, SkippedCount, RunBuiltCount, RunFailCount,
+			*JournalId.ToString(EGuidFormats::DigitsWithHyphens));
+		if (SkippedCount > 0 || RunFailCount > 0)
+		{
+			RunReport.Add(FString::Printf(TEXT("manifold: %d attachment(s) skipped, %d of %d run(s) failed to connect"),
+				SkippedCount, RunFailCount, RunBuiltCount + RunFailCount));
+			RunReport.Append(RunFailures);
+		}
+	}
+	else if (Proposal.bDismantle)
 	{
 		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE: removed %d, missing %d (journal %s)."),
 			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), RemovedCount, MissingCount,
@@ -256,7 +402,9 @@ void FAIDAActionEngine::ResetScratch()
 	DismantleQueue.Reset();
 	BuiltActors.Reset();
 	AccruedRefund.Reset();
-	SkippedCount = RemovedCount = MissingCount = 0;
+	AttachmentActors.Reset();
+	RunFailures.Reset();
+	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 }
 
 bool FAIDAActionEngine::StartUndo(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory,
@@ -404,5 +552,12 @@ TArray<FString> FAIDAActionEngine::TakeUndoReport()
 {
 	TArray<FString> Out = MoveTemp(UndoReport);
 	UndoReport.Reset();
+	return Out;
+}
+
+TArray<FString> FAIDAActionEngine::TakeRunReport()
+{
+	TArray<FString> Out = MoveTemp(RunReport);
+	RunReport.Reset();
 	return Out;
 }
