@@ -12,6 +12,7 @@
 #include "Tools/AIDAToolJson.h"
 #include "Actions/AIDAActionSpec.h"
 #include "Actions/AIDAActionSeam.h"
+#include "Actions/AIDAChatCommands.h"
 #include "Memory/AIDAMemoryStore.h"
 #include "Net/AIDAChatRelay.h"
 #include "Net/AIDAProposalRelay.h"
@@ -97,7 +98,9 @@ namespace
 		"approval; on a tool error (invalid placement, cost, cap), revise the spec or explain the reason. "
 		"Never claim something was built until get_proposal_status says executed.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
-		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n\n"
+		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
+		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
+		"/aida undo (or /aida undo N) in this chat.\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -188,6 +191,11 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(RejectCommand);
 		RejectCommand = nullptr;
+	}
+	if (UndoCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(UndoCommand);
+		UndoCommand = nullptr;
 	}
 	LLMClient.Reset();
 	Session.Reset();
@@ -318,6 +326,37 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 	GetRelay();
 
 	UE_LOG(LogAIDA, Log, TEXT("Chat from %s [%s]: \"%s\""), *Requester.Author, *Requester.PlayerId, *Trimmed);
+
+	// `/aida ...` commands short-circuit the LLM entirely (docs/PHASE4.md §4d) — undo in particular
+	// must never depend on a model round-trip. The player's line still echoes into the transcript.
+	FAIDAChatCommand Command;
+	FString CommandError;
+	if (AIDAChatCommands::TryParse(Trimmed, Command, CommandError))
+	{
+		Session->PostPlayerMessage(Requester.Author, Trimmed, ConversationId);
+
+		if (Command.Kind == FAIDAChatCommand::EKind::None)
+		{
+			Session->PostSystemMessage(CommandError, ConversationId);
+			return;
+		}
+
+		// Undo reverses world actions — the same act tier the propose tools require.
+		if (!Permissions.IsAllowed(EAIDATier::Act, Requester.PlayerId))
+		{
+			UE_LOG(LogAIDA, Warning, TEXT("Undo DENIED (act tier) for %s [%s]"), *Requester.Author, *Requester.PlayerId);
+			Session->PostSystemMessage(TEXT("You don't have act permission to undo AIDA's actions."), ConversationId);
+			return;
+		}
+
+		FString Message;
+		if (Actions.StartUndo(this, Config.Actions, Memory, Command.Count, Requester.PlayerId, Message))
+		{
+			StartActionTimer();
+		}
+		Session->PostSystemMessage(Message, ConversationId);
+		return;
+	}
 
 	// Permission (chat tier) — denials are logged with the player id and answered privately.
 	if (!Permissions.IsAllowed(EAIDATier::Chat, Requester.PlayerId))
@@ -1181,6 +1220,29 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Reject a pending proposal. Run on server/host. Usage: AIDA.Reject <proposalId>"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::RejectCmd),
 		ECVF_Default);
+
+	UndoCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Undo"),
+		TEXT("Reverse the last n executed AIDA actions (console mirror of /aida undo). Run on server/host. Usage: AIDA.Undo [n]"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::UndoCmd),
+		ECVF_Default);
+}
+
+void UAIDAOrchestrator::UndoCmd(const TArray<FString>& Args)
+{
+	int32 Count = 1;
+	if (Args.Num() >= 1)
+	{
+		Count = FMath::Max(1, FCString::Atoi(*Args[0]));
+	}
+
+	FString Message;
+	if (Actions.StartUndo(this, Config.Actions, Memory, Count, TEXT("console"), Message))
+	{
+		StartActionTimer();
+	}
+	AnnounceSystem(Message);
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Undo: %s"), *Message);
 }
 
 void UAIDAOrchestrator::ApproveCmd(const TArray<FString>& Args)
@@ -1255,6 +1317,12 @@ void UAIDAOrchestrator::OnActionTimer()
 			Proposal->State == EAIDAProposalState::Executed ? TEXT("finished") : TEXT("stopped"),
 			*Proposal->Summary, Proposal->AffectedEntityIds.Num(),
 			Proposal->AffectedEntityIds.Num() == 1 ? TEXT("y") : TEXT("ies")));
+	}
+
+	// A finished undo run reports per-entry results ("undid 97 of 100 …") the same way.
+	for (const FString& Line : Actions.TakeUndoReport())
+	{
+		AnnounceSystem(Line);
 	}
 }
 

@@ -39,15 +39,47 @@ public:
 	bool Reject(const FGuid& Id, const FString& ApproverId, FString& OutMessage);
 
 	/**
-	 * One executor tick: advance the executing proposal by batchPerTick items. On completion,
-	 * journals the action (in-save), pays out dismantle refunds, and caches built actors for undo.
-	 * Returns true while more work remains (keep the timer running).
+	 * One executor tick: advance the executing proposal (or the undo queue) by batchPerTick items.
+	 * On completion, journals the action (in-save), pays out dismantle refunds, and caches built
+	 * actors for undo. Returns true while more work remains (keep the timer running).
 	 */
 	bool Tick(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory);
+
+	/**
+	 * Queue the last Count non-undone journal entries (within actions.undoWindow) for reversal
+	 * (docs/PHASE4.md §4d): built entities get dismantled (cost refunded to the instigator),
+	 * dismantled entities get rebuilt (refund re-deducted, best-effort). Time-sliced through the
+	 * same Tick. True = work queued (start the timer). Refused while anything else is executing.
+	 */
+	bool StartUndo(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory,
+		int32 Count, const FString& InstigatorId, FString& OutMessage);
+
+	/**
+	 * Per-entry human report lines from the last completed undo run ("undid 97 of 100 …"),
+	 * cleared on read — the orchestrator announces them when Tick runs dry.
+	 */
+	TArray<FString> TakeUndoReport();
 
 private:
 	void FinishExecution(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 	void ResetScratch();
+
+	/** One journal entry queued for reversal. */
+	struct FUndoJob
+	{
+		FGuid JournalId;
+		bool bDismantle = false;                       // the ORIGINAL action's direction
+		TArray<FAIDAEntityId> Entities;
+		TArray<TWeakObjectPtr<AActor>> CachedActors;   // in-session fast path (builds only)
+		TArray<FAIDACostItem> Refund;                  // journaled RefundJson (cost to refund / re-deduct)
+		int32 Cursor = 0;
+		int32 Done = 0;
+		int32 Missing = 0;
+	};
+
+	/** Advance the undo queue by one batch; true while jobs remain. */
+	bool TickUndo(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory);
+	void FinishUndoJob(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FUndoJob& Job);
 
 	FAIDAProposalStore ProposalStore;
 
@@ -62,4 +94,9 @@ private:
 
 	/** Journal id → live actors built this session (undo's fast path; transform re-resolve after reload). */
 	TMap<FGuid, TArray<TWeakObjectPtr<AActor>>> SessionActors;
+
+	//~ Undo scratch (mutually exclusive with a proposal executing).
+	TArray<FUndoJob> UndoQueue;
+	FString UndoInstigatorId;
+	TArray<FString> UndoReport;
 };

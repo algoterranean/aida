@@ -5,6 +5,7 @@
 
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
@@ -664,4 +665,104 @@ int32 FAIDAActionSeam::DismantleHandleBatch(UObject* WorldContext, const TArray<
 		}
 	}
 	return End - Cursor;
+}
+
+bool FAIDAActionSeam::UndoRemoveEntity(UObject* WorldContext, const FAIDAEntityId& Entity, AActor* CachedActor)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World) { return false; }
+
+	// In-session fast path: the actor we built is still the actor we hold.
+	if (IsValid(CachedActor))
+	{
+		if (IFGDismantleInterface::Execute_CanDismantle(CachedActor))
+		{
+			IFGDismantleInterface::Execute_Dismantle(CachedActor);
+			return true;
+		}
+		return false;
+	}
+
+	if (Entity.Type == TEXT("lw"))
+	{
+		AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
+		const TSubclassOf<AFGBuildable> BuildableClass(FSoftClassPath(Entity.ClassPath).TryLoadClass<AFGBuildable>());
+		if (!Lightweights || !BuildableClass) { return false; }
+
+		// Try the journaled index first (transform-verified — indices are recycled), else scan the
+		// class's instances by transform (the post-reload / index-unknown path, docs/PHASE4.md §2d).
+		int32 Index = Entity.Index;
+		const FRuntimeBuildableInstanceData* Instance = Index != INDEX_NONE
+			? Lightweights->GetRuntimeDataForBuildableClassAndIndex(BuildableClass, Index) : nullptr;
+		if (!Instance || !Instance->IsValid() || !Instance->Transform.GetLocation().Equals(Entity.Pos, 5.0))
+		{
+			Index = INDEX_NONE;
+			if (const TArray<FRuntimeBuildableInstanceData>* Instances =
+				Lightweights->GetAllLightweightBuildableInstances().Find(BuildableClass))
+			{
+				for (int32 i = 0; i < Instances->Num(); ++i)
+				{
+					if ((*Instances)[i].IsValid() && (*Instances)[i].Transform.GetLocation().Equals(Entity.Pos, 5.0))
+					{
+						Index = i;
+						break;
+					}
+				}
+			}
+		}
+		if (Index == INDEX_NONE) { return false; }
+
+		FLightweightBuildableInstanceRef Ref;
+		Ref.Initialize(Lightweights, BuildableClass, Index);
+		return Ref.Remove();
+	}
+
+	// Full actor: re-resolve by class + transform epsilon (the save gives us no persistent id).
+	UClass* ActorClass = FSoftClassPath(Entity.ClassPath).TryLoadClass<AActor>();
+	if (!ActorClass) { return false; }
+	for (TActorIterator<AActor> It(World, ActorClass); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor) || !Actor->GetActorLocation().Equals(Entity.Pos, 5.0)) { continue; }
+		if (Actor->Implements<UFGDismantleInterface>() &&
+			IFGDismantleInterface::Execute_CanDismantle(Actor))
+		{
+			IFGDismantleInterface::Execute_Dismantle(Actor);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool FAIDAActionSeam::UndoRebuildEntity(UObject* WorldContext, const FAIDAEntityId& Entity)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World) { return false; }
+
+	// The recipe: journaled for actors; recovered from the class for lightweights.
+	FString RecipePath = Entity.RecipePath;
+	if (RecipePath.IsEmpty() && Entity.Type == TEXT("lw"))
+	{
+		AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
+		const TSubclassOf<AFGBuildable> BuildableClass(FSoftClassPath(Entity.ClassPath).TryLoadClass<AFGBuildable>());
+		const TSubclassOf<UFGRecipe> Recipe = (Lightweights && BuildableClass)
+			? Lightweights->GetBuiltWithRecipeForBuildableClass(BuildableClass) : nullptr;
+		if (Recipe) { RecipePath = Recipe->GetPathName(); }
+	}
+	UClass* RecipeClass = RecipePath.IsEmpty() ? nullptr : FSoftClassPath(RecipePath).TryLoadClass<UFGRecipe>();
+	if (!RecipeClass) { return false; }
+
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, Entity.Pos);
+	if (!Hologram) { return false; }
+
+	const FTransform Placement(FRotator(0.0, static_cast<double>(Entity.YawDeg), 0.0), Entity.Pos);
+	if (!PlaceAndValidate(Hologram, Placement))
+	{
+		Hologram->Destroy(); // something occupies the spot now — a reported partial-undo, not fatal
+		return false;
+	}
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	return Built != nullptr;
 }

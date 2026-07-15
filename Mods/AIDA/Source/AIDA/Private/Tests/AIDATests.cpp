@@ -19,6 +19,7 @@
 #include "Tools/AIDASnapshotTools.h"
 #include "Tools/AIDAToolJson.h"
 #include "Actions/AIDAActionSpec.h"
+#include "Actions/AIDAChatCommands.h"
 #include "Actions/AIDAProposalStore.h"
 #include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
@@ -1672,6 +1673,15 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		TestTrue(TEXT("refund json has item"), Json.Contains(TEXT("\"Concrete\"")));
 		TestTrue(TEXT("refund json has amount"), Json.Contains(TEXT("300")));
 		TestTrue(TEXT("refund json has class"), Json.Contains(TEXT("Desc_Cement_C")));
+
+		const TArray<FAIDACostItem> Back = AIDAActionSpec::ParseCostItems(Json);
+		if (TestEqual(TEXT("refund json parses back"), Back.Num(), 1))
+		{
+			TestEqual(TEXT("round-trip item"), Back[0].Item, TEXT("Concrete"));
+			TestEqual(TEXT("round-trip amount"), Back[0].Amount, 300);
+			TestEqual(TEXT("round-trip class"), Back[0].ClassPath, Items[0].ClassPath);
+		}
+		TestEqual(TEXT("garbage refund json -> empty"), AIDAActionSpec::ParseCostItems(TEXT("not json")).Num(), 0);
 	}
 
 	// Summaries read like the doc examples.
@@ -1682,6 +1692,39 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 	FAIDADismantleSpec Sel;
 	Sel.Buildable = TEXT("Smelter"); Sel.CenterM = FVector(-120.0, 45.0, 0.0); Sel.RadiusM = 50.0; Sel.MaxCount = 20;
 	TestEqual(TEXT("dismantle summary"), AIDAActionSpec::SummarizeDismantle(Sel), TEXT("dismantle up to 20 x Smelter within 50 m of (-120, 45)"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAChatCommandsTest, "AIDA.Actions.ChatCommands",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAChatCommandsTest::RunTest(const FString&)
+{
+	FAIDAChatCommand Cmd;
+	FString Error;
+
+	// Plain chat passes through untouched.
+	TestFalse(TEXT("plain chat"), AIDAChatCommands::TryParse(TEXT("build me a smelter"), Cmd, Error));
+	TestFalse(TEXT("aida mid-sentence"), AIDAChatCommands::TryParse(TEXT("hey /aida undo"), Cmd, Error));
+	TestFalse(TEXT("prefix but different token"), AIDAChatCommands::TryParse(TEXT("/aidafoo undo"), Cmd, Error));
+
+	// /aida undo variants.
+	TestTrue(TEXT("undo default"), AIDAChatCommands::TryParse(TEXT("/aida undo"), Cmd, Error));
+	TestTrue(TEXT("undo kind"), Cmd.Kind == FAIDAChatCommand::EKind::Undo);
+	TestEqual(TEXT("undo default count"), Cmd.Count, 1);
+
+	TestTrue(TEXT("undo n"), AIDAChatCommands::TryParse(TEXT("  /AIDA UNDO 3  "), Cmd, Error));
+	TestTrue(TEXT("undo n kind"), Cmd.Kind == FAIDAChatCommand::EKind::Undo);
+	TestEqual(TEXT("undo n count"), Cmd.Count, 3);
+
+	// Malformed/unknown commands still short-circuit, carrying usage text.
+	TestTrue(TEXT("bad count intercepts"), AIDAChatCommands::TryParse(TEXT("/aida undo zero"), Cmd, Error));
+	TestTrue(TEXT("bad count -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
+	TestFalse(TEXT("bad count has usage"), Error.IsEmpty());
+
+	TestTrue(TEXT("unknown subcommand intercepts"), AIDAChatCommands::TryParse(TEXT("/aida dance"), Cmd, Error));
+	TestTrue(TEXT("unknown -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
+	TestTrue(TEXT("bare /aida intercepts"), AIDAChatCommands::TryParse(TEXT("/aida"), Cmd, Error));
+	TestFalse(TEXT("bare /aida has usage"), Error.IsEmpty());
 	return true;
 }
 

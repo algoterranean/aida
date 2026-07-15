@@ -82,4 +82,18 @@ public:
 	static int32 DismantleHandleBatch(UObject* WorldContext, const TArray<FAIDADismantleHandle>& Handles,
 		int32 Cursor, int32 BatchSize, TArray<FAIDACostItem>& InOutRefund, TArray<FString>& OutRemovedIds,
 		int32& OutRemoved, int32& OutMissing);
+
+	/**
+	 * Undo of a BUILD: remove one journaled entity (docs/PHASE4.md §2d). CachedActor is the
+	 * in-session fast path; otherwise re-resolves — "lw" by class+index (transform-verified;
+	 * transform scan when the index is unknown/recycled), "actor" by class + transform epsilon.
+	 * No refund here — the caller refunds the journaled cost once. False = already gone.
+	 */
+	static bool UndoRemoveEntity(UObject* WorldContext, const FAIDAEntityId& Entity, AActor* CachedActor);
+
+	/**
+	 * Undo of a DISMANTLE: rebuild one journaled entity at its recorded transform via the hologram
+	 * path (re-validated — something may occupy the spot now; that's a reported failure, not fatal).
+	 */
+	static bool UndoRebuildEntity(UObject* WorldContext, const FAIDAEntityId& Entity);
 };

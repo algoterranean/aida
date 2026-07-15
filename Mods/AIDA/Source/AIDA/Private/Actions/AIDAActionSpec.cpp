@@ -283,6 +283,28 @@ FString AIDAActionSpec::CostItemsToJson(const TArray<FAIDACostItem>& Items)
 	return Out;
 }
 
+TArray<FAIDACostItem> AIDAActionSpec::ParseCostItems(const FString& Json)
+{
+	TArray<FAIDACostItem> Out;
+	TArray<TSharedPtr<FJsonValue>> List;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, List))
+	{
+		return Out;
+	}
+	for (const TSharedPtr<FJsonValue>& Value : List)
+	{
+		const TSharedPtr<FJsonObject> Obj = Value.IsValid() ? Value->AsObject() : nullptr;
+		if (!Obj.IsValid()) { continue; }
+		FAIDACostItem Item;
+		Obj->TryGetStringField(TEXT("item"), Item.Item);
+		Obj->TryGetNumberField(TEXT("amount"), Item.Amount);
+		Obj->TryGetStringField(TEXT("class"), Item.ClassPath);
+		if (!Item.Item.IsEmpty() && Item.Amount > 0) { Out.Add(MoveTemp(Item)); }
+	}
+	return Out;
+}
+
 FString AIDAActionSpec::EncodeEntityId(const FAIDAEntityId& Entity)
 {
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();

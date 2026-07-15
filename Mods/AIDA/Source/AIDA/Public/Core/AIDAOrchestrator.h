@@ -163,6 +163,9 @@ private:
 	void ApproveCmd(const TArray<FString>& Args);
 	void RejectCmd(const TArray<FString>& Args);
 
+	/** `AIDA.Undo [n]` — console mirror of `/aida undo [n]` (reverse the last n AI actions). */
+	void UndoCmd(const TArray<FString>& Args);
+
 	/** Start the 10 Hz executor timer if it isn't running (docs/PHASE4.md §3 time-slicer). */
 	void StartActionTimer();
 
@@ -201,6 +204,7 @@ private:
 	IConsoleCommand* ProposeCommand = nullptr;
 	IConsoleCommand* ApproveCommand = nullptr;
 	IConsoleCommand* RejectCommand = nullptr;
+	IConsoleCommand* UndoCommand = nullptr;
 
 	//~ Periodic history snapshots (Phase 3). Defaults; config wiring lands in Slice 3.
 	UFUNCTION()

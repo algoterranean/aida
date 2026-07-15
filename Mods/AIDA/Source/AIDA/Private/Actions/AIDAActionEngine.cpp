@@ -5,6 +5,7 @@
 #include "Actions/AIDAActionSpec.h"
 #include "Core/AIDAConfig.h"
 #include "Memory/AIDAMemory.h"
+#include "Memory/AIDAMemoryStore.h"
 #include "Memory/AIDAMemoryTypes.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -25,9 +26,9 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 		OutMessage = FString::Printf(TEXT("proposal is %s, not pending"), *AIDAActionSpec::StateToString(Proposal->State));
 		return false;
 	}
-	if (IsExecuting())
+	if (IsExecuting() || UndoQueue.Num() > 0)
 	{
-		OutMessage = TEXT("another proposal is executing — wait for it to finish");
+		OutMessage = TEXT("another action is executing — wait for it to finish");
 		return false;
 	}
 
@@ -105,6 +106,12 @@ bool FAIDAActionEngine::Reject(const FGuid& Id, const FString& ApproverId, FStri
 
 bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory)
 {
+	// Undo shares the 10 Hz slicer and is mutually exclusive with proposal execution.
+	if (UndoQueue.Num() > 0)
+	{
+		return TickUndo(WorldContext, Config, Memory);
+	}
+
 	FAIDAProposal* Proposal = ProposalStore.Find(ExecutingId);
 	if (!Proposal || Proposal->State != EAIDAProposalState::Executing)
 	{
@@ -189,4 +196,152 @@ void FAIDAActionEngine::ResetScratch()
 	BuiltActors.Reset();
 	AccruedRefund.Reset();
 	SkippedCount = RemovedCount = MissingCount = 0;
+}
+
+bool FAIDAActionEngine::StartUndo(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory,
+	int32 Count, const FString& InstigatorId, FString& OutMessage)
+{
+	if (IsExecuting() || UndoQueue.Num() > 0)
+	{
+		OutMessage = TEXT("another action is executing — wait for it to finish");
+		return false;
+	}
+	AAIDAMemoryStore* Store = Memory.Store(WorldContext);
+	if (!Store)
+	{
+		OutMessage = TEXT("the action journal is unavailable (server only)");
+		return false;
+	}
+
+	// Only the last undoWindow journal entries are reachable; skip already-undone; newest first.
+	const TArray<FAIDAJournalEntry>& Journal = Store->GetJournal();
+	const int32 Oldest = FMath::Max(0, Journal.Num() - FMath::Max(1, Config.UndoWindow));
+	int32 TotalEntities = 0;
+	for (int32 i = Journal.Num() - 1; i >= Oldest && UndoQueue.Num() < Count; --i)
+	{
+		const FAIDAJournalEntry& Entry = Journal[i];
+		if (Entry.bUndone) { continue; }
+
+		FUndoJob Job;
+		Job.JournalId = Entry.Id;
+		Job.bDismantle = Entry.bDismantle;
+		for (const FString& Encoded : Entry.AffectedEntityIds)
+		{
+			FAIDAEntityId Entity;
+			if (AIDAActionSpec::DecodeEntityId(Encoded, Entity)) { Job.Entities.Add(MoveTemp(Entity)); }
+		}
+		if (const TArray<TWeakObjectPtr<AActor>>* Cached = SessionActors.Find(Entry.Id))
+		{
+			Job.CachedActors = *Cached;
+		}
+		Job.Refund = AIDAActionSpec::ParseCostItems(Entry.RefundJson);
+		TotalEntities += Job.Entities.Num();
+		UndoQueue.Add(MoveTemp(Job));
+	}
+	if (UndoQueue.Num() == 0)
+	{
+		OutMessage = FString::Printf(TEXT("nothing to undo — no reversible AIDA action in the last %d journal entries"), Config.UndoWindow);
+		return false;
+	}
+
+	UndoInstigatorId = InstigatorId;
+	OutMessage = FString::Printf(TEXT("undoing %d action(s), %d entit%s…"),
+		UndoQueue.Num(), TotalEntities, TotalEntities == 1 ? TEXT("y") : TEXT("ies"));
+	UE_LOG(LogAIDA, Log, TEXT("[actions] %s"), *OutMessage);
+	return true;
+}
+
+bool FAIDAActionEngine::TickUndo(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory)
+{
+	if (UndoQueue.Num() == 0) { return false; }
+
+	FUndoJob& Job = UndoQueue[0];
+	const int32 End = FMath::Min(Job.Cursor + FMath::Max(1, Config.BatchPerTick), Job.Entities.Num());
+	for (int32 i = Job.Cursor; i < End; ++i)
+	{
+		const FAIDAEntityId& Entity = Job.Entities[i];
+		bool bOk = false;
+		if (Job.bDismantle)
+		{
+			bOk = FAIDAActionSeam::UndoRebuildEntity(WorldContext, Entity);
+		}
+		else
+		{
+			// The in-session fast path: a still-live cached actor at this entity's position.
+			AActor* Cached = nullptr;
+			for (const TWeakObjectPtr<AActor>& Weak : Job.CachedActors)
+			{
+				AActor* Actor = Weak.Get();
+				if (Actor && Actor->GetActorLocation().Equals(Entity.Pos, 5.0))
+				{
+					Cached = Actor;
+					break;
+				}
+			}
+			bOk = FAIDAActionSeam::UndoRemoveEntity(WorldContext, Entity, Cached);
+		}
+		bOk ? ++Job.Done : ++Job.Missing;
+	}
+	Job.Cursor = End;
+
+	if (Job.Cursor >= Job.Entities.Num())
+	{
+		FinishUndoJob(WorldContext, Config, Memory, Job);
+		UndoQueue.RemoveAt(0);
+	}
+	return UndoQueue.Num() > 0;
+}
+
+void FAIDAActionEngine::FinishUndoJob(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FUndoJob& Job)
+{
+	// Consume the entry even on a partial undo — retrying the same entry would double-refund.
+	Memory.MarkUndone(WorldContext, Job.JournalId);
+	SessionActors.Remove(Job.JournalId);
+
+	const TCHAR* Verb = Job.bDismantle ? TEXT("rebuilt") : TEXT("removed");
+	const int32 Total = Job.Entities.Num();
+	FString Line = FString::Printf(TEXT("undo: %s %d of %d entit%s"), Verb, Job.Done, Total, Total == 1 ? TEXT("y") : TEXT("ies"));
+	if (Job.Missing > 0)
+	{
+		Line += FString::Printf(TEXT(" (%d already gone or blocked)"), Job.Missing);
+	}
+
+	// Money flows, scaled to what actually reversed (a player who manually dismantled AIDA's
+	// buildables already pocketed those refunds — never pay them twice).
+	if (Config.CostMode == TEXT("central") && Job.Refund.Num() > 0 && Job.Done > 0 && Total > 0)
+	{
+		TArray<FAIDACostItem> Scaled = Job.Refund;
+		for (FAIDACostItem& Item : Scaled)
+		{
+			Item.Amount = static_cast<int32>(static_cast<int64>(Item.Amount) * Job.Done / Total);
+		}
+		Scaled.RemoveAll([](const FAIDACostItem& Item) { return Item.Amount <= 0; });
+
+		if (Job.bDismantle)
+		{
+			// Undo of a dismantle: collect the earlier refund back. Best-effort — the items may
+			// have been spent; the rebuild still stands (report it, don't block).
+			if (Scaled.Num() > 0 && !FAIDAActionSeam::DeductCost(WorldContext, Scaled))
+			{
+				Line += TEXT("; the earlier refund could not be re-collected from central storage");
+			}
+		}
+		else
+		{
+			int32 Refunded = 0, Lost = 0;
+			FAIDAActionSeam::RefundToPlayer(WorldContext, UndoInstigatorId, Scaled, Refunded, Lost);
+			if (Refunded > 0) { Line += FString::Printf(TEXT("; refunded %d item(s)"), Refunded); }
+			if (Lost > 0) { Line += FString::Printf(TEXT(" (%d didn't fit)"), Lost); }
+		}
+	}
+
+	UE_LOG(LogAIDA, Log, TEXT("[actions] %s (journal %s)"), *Line, *Job.JournalId.ToString(EGuidFormats::DigitsWithHyphens));
+	UndoReport.Add(MoveTemp(Line));
+}
+
+TArray<FString> FAIDAActionEngine::TakeUndoReport()
+{
+	TArray<FString> Out = MoveTemp(UndoReport);
+	UndoReport.Reset();
+	return Out;
 }
