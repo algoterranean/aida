@@ -15,6 +15,7 @@
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
 #include "Memory/AIDASidecarStore.h"
+#include "Tools/AIDANotesTools.h"
 #include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -1156,6 +1157,52 @@ bool FAIDARecipeToolsBuildingTest::RunTest(const FString&)
 	{
 		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildBuildingJson(Buildings, FString()));
 		TestEqual(TEXT("all buildings"), Root->GetIntegerField(TEXT("matches")), 3);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDANotesSelectTest, "AIDA.Notes.Select",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDANotesSelectTest::RunTest(const FString&)
+{
+	TArray<FAIDANote> Notes;
+	auto Make = [](const FString& Text, const FString& Region, int64 Utc, const FVector& Loc, const TArray<FString>& Tags)
+	{
+		FAIDANote N; N.Text = Text; N.Region = Region; N.CreatedUtc = Utc; N.Location = Loc; N.Tags = Tags; return N;
+	};
+	Notes.Add(Make(TEXT("build more power at the hub"), TEXT("Rocky Desert"), 100, FVector(1000, 0, 0), { TEXT("power") }));
+	Notes.Add(Make(TEXT("expand steel here"), TEXT("Grass Fields"), 300, FVector(100, 0, 0), { TEXT("steel"), TEXT("todo") }));
+	Notes.Add(Make(TEXT("oil outpost plan"), TEXT("Grass Fields"), 200, FVector(5000, 0, 0), {}));
+
+	// Keyword matches text.
+	{
+		const TArray<const FAIDANote*> S = AIDANotesTools::SelectNotes(Notes, TEXT("power"), FString(), FVector::ZeroVector, false);
+		if (!TestEqual(TEXT("power keyword -> 1"), S.Num(), 1)) { return false; }
+		TestEqual(TEXT("matched note"), S[0]->Text, FString(TEXT("build more power at the hub")));
+	}
+	// Keyword matches a tag ("todo" is only a tag).
+	{
+		const TArray<const FAIDANote*> S = AIDANotesTools::SelectNotes(Notes, TEXT("todo"), FString(), FVector::ZeroVector, false);
+		TestEqual(TEXT("todo tag -> 1"), S.Num(), 1);
+	}
+	// Region filter.
+	{
+		const TArray<const FAIDANote*> S = AIDANotesTools::SelectNotes(Notes, FString(), TEXT("grass"), FVector::ZeroVector, false);
+		TestEqual(TEXT("grass fields -> 2"), S.Num(), 2);
+	}
+	// Default sort = newest first (Utc desc): 300, 200, 100.
+	{
+		const TArray<const FAIDANote*> S = AIDANotesTools::SelectNotes(Notes, FString(), FString(), FVector::ZeroVector, false);
+		if (!TestEqual(TEXT("all -> 3"), S.Num(), 3)) { return false; }
+		TestEqual(TEXT("newest first"), S[0]->CreatedUtc, (int64)300);
+		TestEqual(TEXT("oldest last"), S[2]->CreatedUtc, (int64)100);
+	}
+	// near sort = nearest to origin first: steel(100) < power(1000) < oil(5000).
+	{
+		const TArray<const FAIDANote*> S = AIDANotesTools::SelectNotes(Notes, FString(), FString(), FVector::ZeroVector, true);
+		if (!TestEqual(TEXT("all -> 3"), S.Num(), 3)) { return false; }
+		TestEqual(TEXT("nearest first"), S[0]->Location.X, 100.0);
+		TestEqual(TEXT("farthest last"), S[2]->Location.X, 5000.0);
 	}
 	return true;
 }

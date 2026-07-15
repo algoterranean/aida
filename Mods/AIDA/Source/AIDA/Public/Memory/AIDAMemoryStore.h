@@ -29,6 +29,12 @@ public:
 	/** The save's stable session id, minted on first access if unset. Keys the sidecar directory. */
 	const FGuid& GetSessionId();
 
+	/** Add a note (assigns a fresh Id, stamps nothing else — caller fills the rest). Returns the new Id. */
+	FGuid AddNote(FAIDANote Note);
+
+	/** Read-only access to the stored notes (server-side). */
+	const TArray<FAIDANote>& GetNotes() const { return Notes; }
+
 	//~ IFGSaveInterface — persist SaveGame properties; mint the session id on load.
 	virtual bool ShouldSave_Implementation() const override { return true; }
 	virtual void PreSaveGame_Implementation(int32 saveVersion, int32 gameVersion) override {}

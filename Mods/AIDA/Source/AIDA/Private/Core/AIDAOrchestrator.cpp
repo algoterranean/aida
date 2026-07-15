@@ -7,6 +7,7 @@
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
+#include "Tools/AIDANotesTools.h"
 #include "Tools/AIDAToolJson.h"
 #include "Memory/AIDAMemoryStore.h"
 #include "Net/AIDAChatRelay.h"
@@ -74,7 +75,11 @@ namespace
 		"generators, power output).\n"
 		"- tag_node(resource, purity?, label?): drop a labeled marker on the map at the nearest untapped "
 		"node of a resource to the player. This WRITES a shared map marker — only use it when the player "
-		"asks you to mark/tag/find-and-mark a node.\n\n"
+		"asks you to mark/tag/find-and-mark a node.\n"
+		"- add_note(text, tags?): save a persistent note for the player (survives sessions), tagged with "
+		"their location/region. Use when they ask you to remember/note something.\n"
+		"- get_notes(keyword?, region?, near?): recall the player's saved notes. Check these when the "
+		"player asks what they wanted to do, or refers to something they told you earlier.\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -529,6 +534,72 @@ void UAIDAOrchestrator::RegisterTools()
 			UWorld* World = GetWorld();
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			return FAIDAToolResult::Ok(AIDARecipeTools::BuildBuildingJson(RecipeCatalog.GetBuildings(World, Now), Name));
+		}
+	});
+
+	// Phase 3 note tools (docs/PHASE3.md) — persistent player annotations in the in-save memory store.
+	Tools.Register({
+		TEXT("add_note"),
+		TEXT("Save a persistent note for the player (survives across sessions), tagged with their current location and region. Use when the player asks you to remember/note something. Pass 'text' and optional 'tags'."),
+		TEXT(R"({"type":"object","properties":{"text":{"type":"string","description":"The note to remember."},"tags":{"type":"array","items":{"type":"string"},"description":"Optional short tags (e.g. \"power\", \"todo\")."}},"required":["text"]})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			FString Text;
+			Args->TryGetStringField(TEXT("text"), Text);
+			if (Text.TrimStartAndEnd().IsEmpty()) { return FAIDAToolResult::Error(TEXT("add_note needs non-empty 'text'.")); }
+
+			AAIDAMemoryStore* Store = Memory.Store(this);
+			if (!Store) { return FAIDAToolResult::Error(TEXT("Memory store unavailable (run on the server/host).")); }
+
+			FAIDANote Note;
+			Note.Text = Text;
+			Note.Author = Ctx.Author;
+			Note.AuthorId = Ctx.PlayerId;
+			Note.CreatedUtc = FDateTime::UtcNow().ToUnixTimestamp();
+			if (Ctx.bHasLocation)
+			{
+				Note.Location = Ctx.Location;
+				Note.Region = FAIDAMapService::RegionNameForLocation(GetWorld(), Ctx.Location);
+			}
+			const TArray<TSharedPtr<FJsonValue>>* Tags = nullptr;
+			if (Args->TryGetArrayField(TEXT("tags"), Tags) && Tags)
+			{
+				for (const TSharedPtr<FJsonValue>& V : *Tags)
+				{
+					FString T;
+					if (V.IsValid() && V->TryGetString(T) && !T.IsEmpty()) { Note.Tags.Add(T); }
+				}
+			}
+			const FString Region = Note.Region;
+			Store->AddNote(MoveTemp(Note));
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetBoolField(TEXT("saved"), true);
+			if (!Region.IsEmpty()) { Root->SetStringField(TEXT("region"), Region); }
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+		}
+	});
+
+	Tools.Register({
+		TEXT("get_notes"),
+		TEXT("Recall the player's saved notes. Filter with 'keyword' (matches text or a tag) and/or 'region'; set 'near' true to sort by distance to the player. Omit all for the most recent notes."),
+		TEXT(R"({"type":"object","properties":{"keyword":{"type":"string","description":"Case-insensitive text/tag filter."},"region":{"type":"string","description":"Map-area name filter."},"near":{"type":"boolean","description":"Sort by distance to the player instead of most-recent."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			FString Keyword, Region;
+			Args->TryGetStringField(TEXT("keyword"), Keyword);
+			Args->TryGetStringField(TEXT("region"), Region);
+			bool bNear = false;
+			Args->TryGetBoolField(TEXT("near"), bNear);
+
+			AAIDAMemoryStore* Store = Memory.Store(this);
+			if (!Store) { return FAIDAToolResult::Error(TEXT("Memory store unavailable (run on the server/host).")); }
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			return FAIDAToolResult::Ok(AIDANotesTools::BuildNotesJson(
+				Store->GetNotes(), Keyword, Region, Ctx.Location, bNear && Ctx.bHasLocation, Now));
 		}
 	});
 

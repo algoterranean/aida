@@ -39,6 +39,15 @@ const FGuid& AAIDAMemoryStore::GetSessionId()
 	return SessionId;
 }
 
+FGuid AAIDAMemoryStore::AddNote(FAIDANote Note)
+{
+	if (!Note.Id.IsValid()) { Note.Id = FGuid::NewGuid(); }
+	const FGuid Id = Note.Id;
+	Notes.Add(MoveTemp(Note));
+	UE_LOG(LogAIDA, Log, TEXT("[memory] note added (%s); %d total."), *Id.ToString(EGuidFormats::DigitsWithHyphens), Notes.Num());
+	return Id;
+}
+
 void AAIDAMemoryStore::PostLoadGame_Implementation(int32 /*saveVersion*/, int32 /*gameVersion*/)
 {
 	// A save that predates AIDA (or a brand-new one) has no session id yet — mint one so the sidecar has
