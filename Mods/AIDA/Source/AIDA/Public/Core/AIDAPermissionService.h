@@ -13,8 +13,9 @@ enum class EAIDATier : uint8
 
 /**
  * Config-driven permission checks, evaluated server-side on every request (client UI hiding is
- * cosmetic, never security — coding rule 1). "everyone" opens a tier to all players; any other
- * value restricts it to the `act` allowlist of Epic account ids.
+ * cosmetic, never security — coding rule 1). For chat/query, "everyone" opens the tier; any other
+ * value restricts it to the `act` allowlist of Epic account ids. The act tier is an explicit
+ * allowlist, but a literal "everyone" entry in that list opens it to all (opt-in for solo hosts).
  */
 class FAIDAPermissionService
 {
