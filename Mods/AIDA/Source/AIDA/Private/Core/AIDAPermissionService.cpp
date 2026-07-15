@@ -31,12 +31,15 @@ bool FAIDAPermissionService::IsAllowed(EAIDATier Tier, const FString& PlayerId) 
 	case EAIDATier::Query:
 		return Evaluate(QueryRule, ActAllowlist, PlayerId);
 	case EAIDATier::Act:
+	{
 		// The act tier is an explicit allowlist of Epic account IDs, with one opt-in wildcard: a literal
-		// "everyone" entry opens it to all *identified* players (handy for a solo/trusting host). An
-		// unidentified (empty id) requester is always denied.
-		return !PlayerId.IsEmpty()
-			&& (ActAllowlist.ContainsByPredicate([](const FString& Entry) { return Entry.Equals(TEXT("everyone"), ESearchCase::IgnoreCase); })
-				|| ActAllowlist.Contains(PlayerId));
+		// "everyone" entry opens it to ALL players — including an unidentified host, whose net id is
+		// empty on a listen-server/offline session. Without the wildcard, the id must be listed
+		// (empty ids never match a specific-id allowlist).
+		const bool bEveryone = ActAllowlist.ContainsByPredicate(
+			[](const FString& Entry) { return Entry.Equals(TEXT("everyone"), ESearchCase::IgnoreCase); });
+		return bEveryone || (!PlayerId.IsEmpty() && ActAllowlist.Contains(PlayerId));
+	}
 	default:
 		return false;
 	}

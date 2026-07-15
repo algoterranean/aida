@@ -310,12 +310,13 @@ bool FAIDAPermissionTest::RunTest(const FString&)
 	TestTrue(TEXT("restricted chat allows admin"), RestrictedService.IsAllowed(EAIDATier::Chat, TEXT("admin-1")));
 	TestFalse(TEXT("restricted chat denies non-admin"), RestrictedService.IsAllowed(EAIDATier::Chat, TEXT("rando")));
 
-	// An "everyone" entry in the act allowlist opens the act tier to all players (solo/trusting host).
+	// An "everyone" entry in the act allowlist opens the act tier to ALL players — including an
+	// unidentified host (empty net id on a listen-server/offline session).
 	FAIDAPermissionsConfig OpenAct;
 	OpenAct.Act = { TEXT("everyone") };
 	FAIDAPermissionService OpenActService(OpenAct);
 	TestTrue(TEXT("act 'everyone' allows any id"), OpenActService.IsAllowed(EAIDATier::Act, TEXT("rando")));
-	TestFalse(TEXT("act 'everyone' still denies empty id"), OpenActService.IsAllowed(EAIDATier::Act, FString()));
+	TestTrue(TEXT("act 'everyone' allows empty host id"), OpenActService.IsAllowed(EAIDATier::Act, FString()));
 	return true;
 }
 
