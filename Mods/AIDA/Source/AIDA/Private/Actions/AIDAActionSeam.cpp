@@ -138,12 +138,14 @@ namespace
 	}
 
 	/** The dry-run/execute disqualifier filter: Unaffordable is ours to judge (central storage /
-	 *  costMode), Initializing is a first-tick readiness flag, not a placement verdict. */
+	 *  costMode), Initializing is a first-tick readiness flag, and soft clearance ("clipping may
+	 *  occur") is the build gun's yellow WARNING state — it never blocks a player build either. */
 	bool IsBlockingDisqualifier(const TSubclassOf<UFGConstructDisqualifier>& Disqualifier)
 	{
 		return Disqualifier
 			&& !Disqualifier->IsChildOf(UFGCDUnaffordable::StaticClass())
-			&& !Disqualifier->IsChildOf(UFGCDInitializing::StaticClass());
+			&& !Disqualifier->IsChildOf(UFGCDInitializing::StaticClass())
+			&& !Disqualifier->IsChildOf(UFGCDEncroachingSoftClearance::StaticClass());
 	}
 
 	/**
