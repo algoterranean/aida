@@ -9,6 +9,7 @@
 class AAIDAChatRelay;
 class UButton;
 class UEditableTextBox;
+class URichTextBlock;
 class UScrollBox;
 class UTextBlock;
 
@@ -86,6 +87,13 @@ protected:
 	TObjectPtr<UScrollBox> TranscriptScroll;
 
 private:
+	/** Rich-text transcript, constructed in C++ under TranscriptScroll to render AIDA's markdown. */
+	UPROPERTY(Transient)
+	TObjectPtr<URichTextBlock> TranscriptRich;
+
+	/** Build a transient rich-text style set (Default/Bold/Italic/Code/Header) from the given font. */
+	void BuildTranscriptRich(class UFont* GameFont, float FontSize);
+
 	UPROPERTY(Transient)
 	TWeakObjectPtr<AAIDAChatRelay> Relay;
 

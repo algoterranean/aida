@@ -6,11 +6,15 @@
 #include "Components/Button.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/EditableTextBox.h"
+#include "Components/RichTextBlock.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
+#include "Blueprint/WidgetTree.h"
+#include "Engine/DataTable.h"
 #include "Engine/Font.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
+#include "UI/AIDAMarkdown.h"
 
 void UAIDAChatWidget::NativeConstruct()
 {
@@ -97,6 +101,10 @@ void UAIDAChatWidget::NativeConstruct()
 		}
 	}
 
+	// Rich-text transcript for markdown rendering, constructed in C++ under the scroll box so the BP
+	// needs no RichTextBlock. Falls back to the plain TranscriptText if the scroll box is missing.
+	BuildTranscriptRich(GameFont, FontSize);
+
 	// The relay is a replicated actor and may not have arrived on this client yet — retry until it has.
 	if (!TryBindRelay())
 	{
@@ -171,6 +179,52 @@ void UAIDAChatWidget::FocusInput()
 	if (InputBox)
 	{
 		InputBox->SetKeyboardFocus();
+	}
+}
+
+void UAIDAChatWidget::BuildTranscriptRich(UFont* GameFont, float FontSize)
+{
+	if (!TranscriptScroll || !WidgetTree)
+	{
+		return; // no scroll box → keep the plain TranscriptText path
+	}
+
+	// Open Sans + dark outline, with typeface variants for bold/italic (fall back to regular if the font
+	// lacks them). Code is tinted rather than mono'd since the game font has no monospace face.
+	auto MakeFont = [GameFont](const FName& Typeface, float Size) -> FSlateFontInfo
+	{
+		FSlateFontInfo F = GameFont ? FSlateFontInfo(GameFont, static_cast<int32>(Size), Typeface) : FSlateFontInfo();
+		F.OutlineSettings.OutlineSize = 1;
+		F.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 1.f);
+		return F;
+	};
+
+	UDataTable* StyleSet = NewObject<UDataTable>(this);
+	StyleSet->RowStruct = FRichTextStyleRow::StaticStruct();
+	auto AddStyle = [StyleSet](const FName& Name, const FSlateFontInfo& F, const FLinearColor& Color)
+	{
+		FRichTextStyleRow Row;
+		Row.TextStyle.SetFont(F);
+		Row.TextStyle.SetColorAndOpacity(FSlateColor(Color));
+		StyleSet->AddRow(Name, Row);
+	};
+	AddStyle(TEXT("Default"), MakeFont(NAME_None, FontSize), FLinearColor::White);
+	AddStyle(TEXT("Bold"), MakeFont(TEXT("Bold"), FontSize), FLinearColor::White);
+	AddStyle(TEXT("Italic"), MakeFont(TEXT("Italic"), FontSize), FLinearColor::White);
+	AddStyle(TEXT("Code"), MakeFont(NAME_None, FontSize), FLinearColor(0.70f, 0.88f, 1.0f, 1.0f));
+	AddStyle(TEXT("Header"), MakeFont(TEXT("Bold"), FontSize + 3.f), FLinearColor::White);
+
+	TranscriptRich = WidgetTree->ConstructWidget<URichTextBlock>();
+	TranscriptRich->SetTextStyleSet(StyleSet);
+	TranscriptRich->SetDefaultFont(MakeFont(NAME_None, FontSize));
+	TranscriptRich->SetAutoWrapText(true);
+	TranscriptRich->SetVisibility(ESlateVisibility::HitTestInvisible);
+	TranscriptScroll->AddChild(TranscriptRich);
+
+	// The rich block replaces the plain one.
+	if (TranscriptText)
+	{
+		TranscriptText->SetVisibility(ESlateVisibility::Collapsed);
 	}
 }
 
@@ -266,7 +320,11 @@ void UAIDAChatWidget::RebuildRenderedTranscript()
 	}
 	RenderedTranscript = MoveTemp(Out);
 
-	if (TranscriptText)
+	if (TranscriptRich)
+	{
+		TranscriptRich->SetText(FText::FromString(AIDAMarkdownToRichText(RenderedTranscript)));
+	}
+	else if (TranscriptText)
 	{
 		TranscriptText->SetText(FText::FromString(RenderedTranscript));
 	}

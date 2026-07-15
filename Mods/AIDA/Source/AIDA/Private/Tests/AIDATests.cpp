@@ -13,6 +13,7 @@
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
+#include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -1006,6 +1007,23 @@ bool FAIDAMapToolsNodesTest::RunTest(const FString&)
 		TestTrue(TEXT("freeNodes listed"), Root->HasField(TEXT("freeNodes")));
 		TestEqual(TEXT("freeNodes length"), Root->GetArrayField(TEXT("freeNodes")).Num(), 3);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAMarkdownTest, "AIDA.Markdown.Convert",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAMarkdownTest::RunTest(const FString&)
+{
+	TestEqual(TEXT("bold"), AIDAMarkdownToRichText(TEXT("a **b** c")), FString(TEXT("a <Bold>b</> c")));
+	TestEqual(TEXT("italic"), AIDAMarkdownToRichText(TEXT("a *b* c")), FString(TEXT("a <Italic>b</> c")));
+	TestEqual(TEXT("code span"), AIDAMarkdownToRichText(TEXT("run `x` now")), FString(TEXT("run <Code>x</> now")));
+	TestEqual(TEXT("header strips hashes"), AIDAMarkdownToRichText(TEXT("## Title")), FString(TEXT("<Header>Title</>")));
+	TestEqual(TEXT("bullet"), AIDAMarkdownToRichText(TEXT("- item")), FString(TEXT("  • item")));
+	TestEqual(TEXT("unbalanced left as-is"), AIDAMarkdownToRichText(TEXT("2 ** 3")), FString(TEXT("2 ** 3")));
+	// Code before bold: markers inside a code span are not treated as formatting.
+	TestEqual(TEXT("code protects markers"), AIDAMarkdownToRichText(TEXT("`a**b`")), FString(TEXT("<Code>a**b</>")));
+	// Two lines preserved.
+	TestEqual(TEXT("newline preserved"), AIDAMarkdownToRichText(TEXT("a\nb")), FString(TEXT("a\nb")));
 	return true;
 }
 
