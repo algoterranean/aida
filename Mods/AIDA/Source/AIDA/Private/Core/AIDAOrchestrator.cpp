@@ -40,17 +40,23 @@ namespace
 		}
 	}
 
-	/** Resolve a requesting player's pawn location by their net-id string (as set in the RCO). */
+	/**
+	 * Resolve a requesting player's pawn location by their net-id string (as set in the RCO).
+	 * The listen-server host's FUniqueNetIdRepl resolves to null → an EMPTY PlayerId (same quirk
+	 * the act allowlist handles), so an empty id matches the controller whose net id is also
+	 * empty — i.e. the host. Remote clients always carry real ids, so they can't false-match.
+	 */
 	bool AIDAResolvePlayerLocation(UWorld* World, const FString& PlayerId, FVector& OutLocation)
 	{
-		if (!World || PlayerId.IsEmpty() || PlayerId == TEXT("debug")) { return false; }
+		if (!World || PlayerId == TEXT("debug")) { return false; }
 		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
 		{
 			APlayerController* PC = It->Get();
 			APlayerState* PS = PC ? PC->PlayerState : nullptr;
 			if (!PS) { continue; }
 			const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
-			if (NetId.IsValid() && NetId->ToString() == PlayerId)
+			const FString Id = NetId.IsValid() ? NetId->ToString() : FString();
+			if (Id == PlayerId)
 			{
 				if (const APawn* Pawn = PC->GetPawn())
 				{
