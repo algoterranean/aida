@@ -10,6 +10,7 @@
 #include "Factory/AIDAFactoryIndex.h" // TTL-cached factory extractor + FAIDAFactoryAggregates
 #include "Map/AIDAMapService.h"       // TTL-cached resource-node scan
 #include "Recipes/AIDARecipeService.h" // TTL-cached static recipe + building catalog
+#include "Memory/AIDAMemory.h"          // Phase 3 persistence facade (in-save + sidecar)
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
 #include "AIDAOrchestrator.generated.h"
@@ -121,6 +122,9 @@ private:
 	/** `AIDA.Recipes` — dump the recipe/building catalog for a filter (static-catalog check, no LLM). */
 	void Recipes(const TArray<FString>& Args);
 
+	/** `AIDA.Memory` — dump the memory session id + note/marker/journal + sidecar snapshot counts. */
+	void MemoryStatus(const TArray<FString>& Args);
+
 	/** Extract (TTL-cached) + aggregate the current factory. Server/authoritative worlds only. */
 	FAIDAFactoryAggregates SnapshotAggregates();
 
@@ -139,10 +143,12 @@ private:
 	FAIDAFactoryIndex FactoryIndex;
 	FAIDAMapService MapService;
 	FAIDARecipeCatalog RecipeCatalog;
+	FAIDAMemory Memory;
 	IConsoleCommand* PingCommand = nullptr;
 	IConsoleCommand* SayCommand = nullptr;
 	IConsoleCommand* ToolPingCommand = nullptr;
 	IConsoleCommand* IndexCommand = nullptr;
 	IConsoleCommand* NodesCommand = nullptr;
 	IConsoleCommand* RecipesCommand = nullptr;
+	IConsoleCommand* MemoryCommand = nullptr;
 };

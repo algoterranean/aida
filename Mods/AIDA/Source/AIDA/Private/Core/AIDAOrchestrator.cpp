@@ -8,6 +8,7 @@
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
 #include "Tools/AIDAToolJson.h"
+#include "Memory/AIDAMemoryStore.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
@@ -175,6 +176,14 @@ void UAIDAOrchestrator::RegisterRelayClass()
 	// SpawnOnServer_Replicate: spawns immediately on the server, only registers the class on
 	// clients (so the manager records the replicated actor when it lands — see header note).
 	Mgr->RegisterSubsystemActor(AAIDAChatRelay::StaticClass());
+
+	// The in-save memory store (Phase 3). SpawnOnServer, not replicated — persists via IFGSaveInterface;
+	// only the server touches it. Bind the memory facade to it (mints/reads the session GUID).
+	if (World->GetNetMode() != NM_Client)
+	{
+		Mgr->RegisterSubsystemActor(AAIDAMemoryStore::StaticClass());
+		Memory.Init(this);
+	}
 
 	// Diagnostics: did the manager end up holding a findable actor, and does one actually exist in the world?
 	const bool bFoundInMgr = Mgr->GetSubsystemActor<AAIDAChatRelay>() != nullptr;
@@ -670,6 +679,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		TEXT("Log the static recipe + building catalog for a filter (checks Slice 3b lookup tools without the LLM). Run on server/host. Usage: AIDA.Recipes [item/name filter...]"),
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Recipes),
 		ECVF_Default);
+
+	MemoryCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.Memory"),
+		TEXT("Log the memory session id + note/marker/journal counts + sidecar snapshot count (checks Phase 3 persistence). Run on server/host. Usage: AIDA.Memory"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::MemoryStatus),
+		ECVF_Default);
 }
 
 void UAIDAOrchestrator::ToolPing(const TArray<FString>& Args)
@@ -757,6 +772,28 @@ void UAIDAOrchestrator::Recipes(const TArray<FString>& Args)
 	const FString Filter = FString::Join(Args, TEXT(" "));
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Recipes recipes: %s"), *AIDARecipeTools::BuildRecipeJson(RecipeCatalog.GetRecipes(World, Now), Filter));
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Recipes buildings: %s"), *AIDARecipeTools::BuildBuildingJson(RecipeCatalog.GetBuildings(World, Now), Filter));
+}
+
+void UAIDAOrchestrator::MemoryStatus(const TArray<FString>& /*Args*/)
+{
+	// The in-save store is server-authoritative.
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Memory runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	Memory.Init(this); // resolve the store if it wasn't ready at RegisterRelayClass time
+	const AAIDAMemoryStore* MemStore = Memory.Store(this);
+	if (!MemStore)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.Memory: in-save store not spawned yet."));
+		return;
+	}
+
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.Memory: session=%s notes=%d markers=%d journal=%d snapshots=%d"),
+		*Memory.GetSessionId().ToString(EGuidFormats::DigitsWithHyphens),
+		MemStore->Notes.Num(), MemStore->Markers.Num(), MemStore->Journal.Num(), Memory.LoadSnapshots().Num());
 }
 
 void UAIDAOrchestrator::Say(const TArray<FString>& Args)

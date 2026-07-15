@@ -14,6 +14,7 @@
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
+#include "Memory/AIDASidecarStore.h"
 #include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -1156,6 +1157,61 @@ bool FAIDARecipeToolsBuildingTest::RunTest(const FString&)
 		const TSharedPtr<FJsonObject> Root = AIDAParseTestJson(AIDARecipeTools::BuildBuildingJson(Buildings, FString()));
 		TestEqual(TEXT("all buildings"), Root->GetIntegerField(TEXT("matches")), 3);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASidecarSnapshotTest, "AIDA.Memory.SidecarSnapshotRoundTrip",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASidecarSnapshotTest::RunTest(const FString&)
+{
+	FAIDASnapshot Snap;
+	Snap.TakenUtc = 1752600000;
+	Snap.Label = TEXT("before boss");
+	Snap.PowerConsumedMW = 2861.4;
+	Snap.PowerCapacityMW = 5700.0;
+	Snap.ItemBalance.Add({ TEXT("Iron Plate"), -90.0 });
+	Snap.ItemBalance.Add({ TEXT("Screw"), 40.0 });
+
+	const FString Json = FAIDASidecarStore::SnapshotToJson(Snap);
+	TestTrue(TEXT("json is one line (no newline)"), !Json.Contains(TEXT("\n")));
+
+	FAIDASnapshot Back;
+	if (!TestTrue(TEXT("parses back"), FAIDASidecarStore::SnapshotFromJson(Json, Back))) { return false; }
+	TestEqual(TEXT("t"), Back.TakenUtc, (int64)1752600000);
+	TestEqual(TEXT("label"), Back.Label, FString(TEXT("before boss")));
+	TestEqual(TEXT("power consumed"), Back.PowerConsumedMW, 2861.4);
+	TestEqual(TEXT("items count"), Back.ItemBalance.Num(), 2);
+	if (Back.ItemBalance.Num() == 2)
+	{
+		TestEqual(TEXT("item 0 name"), Back.ItemBalance[0].Item, FString(TEXT("Iron Plate")));
+		TestEqual(TEXT("item 0 net"), Back.ItemBalance[0].Net, -90.0);
+	}
+
+	// Malformed input is rejected, not crashed.
+	FAIDASnapshot Junk;
+	TestFalse(TEXT("empty line rejected"), FAIDASidecarStore::SnapshotFromJson(TEXT("   "), Junk));
+	TestFalse(TEXT("garbage rejected"), FAIDASidecarStore::SnapshotFromJson(TEXT("not json"), Junk));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASidecarRingBufferTest, "AIDA.Memory.SidecarRingBuffer",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASidecarRingBufferTest::RunTest(const FString&)
+{
+	TArray<FString> Lines;
+	for (int32 i = 1; i <= 5; ++i)
+	{
+		FAIDASidecarStore::AppendWithRingBuffer(Lines, FString::Printf(TEXT("line%d"), i), /*KeepMax*/ 3);
+	}
+	// Only the newest 3 survive, oldest-first.
+	if (!TestEqual(TEXT("kept 3"), Lines.Num(), 3)) { return false; }
+	TestEqual(TEXT("oldest kept is line3"), Lines[0], FString(TEXT("line3")));
+	TestEqual(TEXT("newest is line5"), Lines[2], FString(TEXT("line5")));
+
+	// KeepMax <= 0 is unbounded.
+	TArray<FString> Unbounded;
+	for (int32 i = 0; i < 10; ++i) { FAIDASidecarStore::AppendWithRingBuffer(Unbounded, TEXT("x"), 0); }
+	TestEqual(TEXT("unbounded keeps all"), Unbounded.Num(), 10);
 	return true;
 }
 
