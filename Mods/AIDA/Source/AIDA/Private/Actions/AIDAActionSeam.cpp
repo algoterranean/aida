@@ -212,15 +212,15 @@ namespace
 				*GetNameSafe(Hologram->GetClass()), Hologram->IsValidHitResult(Hit) ? 1 : 0, Hologram->IsDisabled() ? 1 : 0);
 		}
 
-		Hologram->SetScrollRotateValue(FMath::RoundToInt32(Placement.Rotator().Yaw));
-		Hologram->PreHologramPlacement(Hit);
-		Hologram->SetHologramLocationAndRotation(Hit);
-		Hologram->PostHologramPlacement(Hit);
-
 		// The disqualifier list only ever ACCUMULATES — the build gun resets it every frame before
 		// re-validating. Without this, the spawn-time defaults (Initializing + InvalidAimLocation)
 		// stick forever and every placement reports "Invalid aim location!" (live-verify round 4).
 		Hologram->ResetConstructDisqualifiers();
+
+		// Drive the hologram's own placement pipeline (what the build gun calls per frame) — it wraps
+		// Pre/SetLocationAndRotation/Post plus internal bookkeeping the raw calls skip.
+		Hologram->SetScrollRotateValue(FMath::RoundToInt32(Placement.Rotator().Yaw));
+		Hologram->UpdateHologramPlacement(Hit);
 
 		// Public validation entry (CheckValidPlacement/CheckClearance are protected). The inventory is
 		// only consumed by CheckCanAfford — which hard-asserts on null — and its Unaffordable verdict
@@ -257,9 +257,16 @@ namespace
 	AFGHologram* SpawnValidationHologram(UWorld* World, UClass* RecipeClass, const FVector& At)
 	{
 		// Non-replicated (clients never see a ghost); destroyed by the caller before returning.
-		return AFGHologram::SpawnHologramFromRecipe(RecipeClass, World->GetWorldSettings(), At,
+		AFGHologram* Hologram = AFGHologram::SpawnHologramFromRecipe(RecipeClass, World->GetWorldSettings(), At,
 			/*hologramInstigator*/ nullptr,
 			[](AFGHologram* PreSpawn) { PreSpawn->SetReplicates(false); });
+		if (Hologram)
+		{
+			// The build gun applies a build mode right after spawning; hologram placement logic
+			// (foundations especially) expects one. Force the hologram's own default.
+			Hologram->SetBuildModeOverride(Hologram->GetDefaultBuildGunMode());
+		}
+		return Hologram;
 	}
 
 	TSubclassOf<UFGItemDescriptor> LoadDescriptor(const FString& ClassPath)
