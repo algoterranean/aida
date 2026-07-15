@@ -11,6 +11,7 @@
 #include "GameFramework/PlayerState.h"
 #include "GameFramework/WorldSettings.h"
 
+#include "AbstractInstanceManager.h"
 #include "FGCharacterPlayer.h"
 
 #include "FGBuildableSubsystem.h"
@@ -407,7 +408,8 @@ bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& Play
 }
 
 bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
-	const FString& RecipeClassPath, int32& InOutYawDeg, FVector& OutOriginCm)
+	const FString& RecipeClassPath, int32& InOutYawDeg,
+	int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm)
 {
 	UWorld* World = ResolveWorld(WorldContext);
 	FHitResult Hit;
@@ -417,24 +419,74 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 	}
 	OutOriginCm = Hit.ImpactPoint;
 
+	// Lightweight foundations/walls are instanced — the hit actor is the AbstractInstanceManager,
+	// which hologram snapping can't snap to (live-verify: "snap" moved the origin ~1 cm). Resolve
+	// the instance and stand up a temporary buildable actor, exactly like the build gun does, so
+	// TrySnapToActor sees a real foundation.
+	AFGBuildable* TempBuildable = nullptr;
+	bool bAimedAtStructure = Cast<AFGBuildable>(Hit.GetActor()) != nullptr;
+	if (AAbstractInstanceManager* Manager = Cast<AAbstractInstanceManager>(Hit.GetActor()))
+	{
+		FInstanceHandle Handle;
+		FLightweightBuildableInstanceRef InstanceRef;
+		if (Manager->ResolveHit(Hit, Handle) &&
+			AFGLightweightBuildableSubsystem::ResolveLightweightInstance(Handle, InstanceRef))
+		{
+			TempBuildable = InstanceRef.SpawnTemporaryBuildable();
+			if (TempBuildable)
+			{
+				bAimedAtStructure = true;
+				Hit.HitObjectHandle = FActorInstanceHandle(TempBuildable);
+				if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(TempBuildable->GetRootComponent()))
+				{
+					Hit.Component = Root;
+				}
+			}
+		}
+	}
+
 	// Probe hologram at the REAL aim hit: UpdateHologramPlacement runs the game's snapping
 	// (TrySnapToActor against the aimed structure, world-grid alignment), and where the hologram
 	// lands — position AND rotation — is where the build gun would have put it. The snapped yaw
 	// becomes the grid's yaw so every row shares the aimed structure's lattice.
+	FVector Snapped = Hit.ImpactPoint;
 	UClass* RecipeClass = FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>();
 	AFGHologram* Hologram = RecipeClass ? SpawnValidationHologram(World, RecipeClass, Hit.ImpactPoint) : nullptr;
-	if (!Hologram)
+	if (Hologram)
 	{
-		return true; // raw aim point is still a usable origin
+		Hologram->SetScrollRotateValue(InOutYawDeg);
+		Hologram->UpdateHologramPlacement(Hit);
+		Snapped = Hologram->GetActorLocation();
+		InOutYawDeg = FMath::RoundToInt32(Hologram->GetActorRotation().Yaw);
+		Hologram->Destroy();
 	}
-	Hologram->SetScrollRotateValue(InOutYawDeg);
-	Hologram->UpdateHologramPlacement(Hit);
-	OutOriginCm = Hologram->GetActorLocation();
-	InOutYawDeg = FMath::RoundToInt32(Hologram->GetActorRotation().Yaw);
-	Hologram->Destroy();
+	if (TempBuildable)
+	{
+		TempBuildable->Destroy();
+	}
 
-	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s yaw=%d"),
-		*Hit.ImpactPoint.ToCompactString(), *OutOriginCm.ToCompactString(), InOutYawDeg);
+	// Anchor the grid around the snapped tile by where the player aimed WITHIN it: past an edge =
+	// grow outward on that side (skipping one cell when a structure was aimed at, so the grid
+	// extends it instead of stacking over it); centered when the aim is ambiguous on an axis.
+	const double YawRad = FMath::DegreesToRadians(static_cast<double>(InOutYawDeg));
+	const FVector AxisX(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.0);
+	const FVector AxisY(-FMath::Sin(YawRad), FMath::Cos(YawRad), 0.0);
+	const FVector AimOffset = Hit.ImpactPoint - Snapped;
+	constexpr double EdgeThresholdCm = 100.0; // >1 m off the tile centre = pointing at that edge
+
+	const auto AnchorShift = [&](double AimComponent, int32 Count, double StepCm) -> double
+	{
+		if (AimComponent > EdgeThresholdCm)  { return bAimedAtStructure ? StepCm : 0.0; }
+		if (AimComponent < -EdgeThresholdCm) { return -((Count - 1) * StepCm) - (bAimedAtStructure ? StepCm : 0.0); }
+		return -((Count - 1) / 2) * StepCm;  // ambiguous: centre the grid on the aimed tile
+	};
+	OutOriginCm = Snapped
+		+ AxisX * AnchorShift(AimOffset | AxisX, CountX, StepXCm)
+		+ AxisY * AnchorShift(AimOffset | AxisY, CountY, StepYCm);
+
+	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s (anchored %s) yaw=%d structure=%d"),
+		*Hit.ImpactPoint.ToCompactString(), *Snapped.ToCompactString(), *OutOriginCm.ToCompactString(),
+		InOutYawDeg, bAimedAtStructure ? 1 : 0);
 	return true;
 }
 

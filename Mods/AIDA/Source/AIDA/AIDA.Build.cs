@@ -43,7 +43,7 @@ public class AIDA : ModuleRules
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			// ... add private dependencies that you statically link with here ...
+			"AbstractInstance"             // resolve lightweight-instance aim hits to real buildables (Actions/)
 		});
 
 		DynamicallyLoadedModuleNames.AddRange(new string[] {

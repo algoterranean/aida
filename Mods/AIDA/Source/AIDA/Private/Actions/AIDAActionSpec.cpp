@@ -150,8 +150,11 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 
 TArray<FTransform> AIDAActionSpec::ExpandGrid(const FAIDABuildSpec& Spec, double DefaultStepXM, double DefaultStepYM)
 {
-	const double StepXCm = (Spec.Grid.StepXM > 0.0 ? Spec.Grid.StepXM : DefaultStepXM) * AIDAMetersToCm;
-	const double StepYCm = (Spec.Grid.StepYM > 0.0 ? Spec.Grid.StepYM : DefaultStepYM) * AIDAMetersToCm;
+	// Steps smaller than the footprint stack tiles on top of each other — never what a player wants
+	// (live-verify: the model kept assuming a "Foundation (1 m)" tile is 1 m wide and packed 100
+	// overlapping tiles). Clamp UP to the footprint; deliberate gaps (larger steps) stay allowed.
+	const double StepXCm = FMath::Max(Spec.Grid.StepXM, DefaultStepXM) * AIDAMetersToCm;
+	const double StepYCm = FMath::Max(Spec.Grid.StepYM, DefaultStepYM) * AIDAMetersToCm;
 
 	// Step axes rotate with the yaw so a rotated grid stays coherent (rows follow the buildable's X).
 	const double YawRad = FMath::DegreesToRadians(static_cast<double>(Spec.YawDeg));

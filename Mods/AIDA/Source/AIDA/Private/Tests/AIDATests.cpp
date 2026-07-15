@@ -1521,12 +1521,17 @@ bool FAIDAActionsGridExpandTest::RunTest(const FString&)
 		TestTrue(TEXT("rotation applied"), FMath::IsNearlyEqual(T[0].Rotator().Yaw, 90.0, 0.01));
 	}
 
-	// Explicit spec steps beat the footprint default.
+	// Explicit steps: gaps (larger than the footprint) are honored; sub-footprint steps clamp UP —
+	// they would stack tiles on top of each other (live-verify: "Foundation (1 m)" is 8 m wide).
 	{
 		Spec.YawDeg = 0;
-		Spec.Grid.StepXM = 4.0;
+		Spec.Grid.StepXM = 12.0;
 		const TArray<FTransform> T = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
-		TestEqual(TEXT("explicit stepX wins"), T[1].GetLocation().X, 1400.0);
+		TestEqual(TEXT("gap stepX honored"), T[1].GetLocation().X, 2200.0);
+
+		Spec.Grid.StepXM = 1.0;
+		const TArray<FTransform> Clamped = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
+		TestEqual(TEXT("sub-footprint stepX clamps to footprint"), Clamped[1].GetLocation().X, 1800.0);
 	}
 	return true;
 }

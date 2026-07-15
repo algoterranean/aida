@@ -34,14 +34,17 @@ public:
 
 	/**
 	 * The aim point, SNAPPED the way the build gun would place this recipe there: a probe hologram
-	 * is placed at the player's aim hit (running the game's TrySnapToActor / world-grid snapping)
-	 * and its resulting position becomes the grid origin — so building "there" while aiming at an
-	 * existing structure extends it tile-perfectly instead of overlapping it slightly askew.
-	 * InOutYawDeg goes in as the spec's yaw and comes back as the probe's SNAPPED yaw, so the whole
-	 * grid shares the aimed structure's lattice orientation. Falls back to the raw aim point.
+	 * is placed at the player's aim hit (running the game's TrySnapToActor / world-grid snapping —
+	 * lightweight-instance hits are first resolved to a temporary buildable so foundations actually
+	 * snap) and its resulting position anchors the grid. InOutYawDeg goes in as the spec's yaw and
+	 * comes back as the probe's SNAPPED yaw, so the whole grid shares the aimed structure's lattice.
+	 * The grid geometry (counts + effective steps, cm) chooses the anchor corner: aiming past a tile
+	 * edge grows the grid OUTWARD on that side (one cell clear of an aimed structure); an ambiguous
+	 * axis centers on the aim. Falls back to the raw aim point.
 	 */
 	static bool ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
-		const FString& RecipeClassPath, int32& InOutYawDeg, FVector& OutOriginCm);
+		const FString& RecipeClassPath, int32& InOutYawDeg,
+		int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm);
 
 	/**
 	 * Ground height (cm) under a point, via the same build-gun-channel trace placements use.

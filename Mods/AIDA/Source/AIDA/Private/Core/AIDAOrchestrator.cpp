@@ -962,8 +962,12 @@ void UAIDAOrchestrator::RegisterActionTools()
 			// position — players mean "build it THERE", and it keeps the grid off their feet.
 			if (!Spec.bHasOrigin)
 			{
+				// Effective steps (the same footprint clamp ExpandGrid applies) drive the anchor math.
+				const double StepXCm = FMath::Max(Spec.Grid.StepXM, Recipe.FootprintXM) * 100.0;
+				const double StepYCm = FMath::Max(Spec.Grid.StepYM, Recipe.FootprintYM) * 100.0;
 				FVector AimCm;
-				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, /*InOut*/ Spec.YawDeg, AimCm))
+				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, /*InOut*/ Spec.YawDeg,
+					Spec.Grid.CountX, Spec.Grid.CountY, StepXCm, StepYCm, AimCm))
 				{
 					Spec.OriginM = AimCm / 100.0; // world cm -> spec metres (yaw now carries the snapped orientation)
 				}
