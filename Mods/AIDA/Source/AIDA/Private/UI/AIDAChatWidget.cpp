@@ -109,6 +109,10 @@ void UAIDAChatWidget::NativeConstruct()
 		{
 			FSlateFontInfo InputFont = Font; // reuse the transcript's (known-valid) font family
 			InputBox->WidgetStyle.TextStyle.Font = InputFont;
+			// The input box keeps its default light background, so the text must be dark — the
+			// inherited white-on-white was unreadable. Both states: idle and focused-while-typing.
+			InputBox->WidgetStyle.SetForegroundColor(FSlateColor(FLinearColor::Black));
+			InputBox->WidgetStyle.SetFocusedForegroundColor(FSlateColor(FLinearColor::Black));
 			InputBox->SynchronizeProperties();
 		}
 	}
