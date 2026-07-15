@@ -163,9 +163,10 @@ namespace
 		return nullptr;
 	}
 
-	/** Position + validate the hologram at one placement; true when no blocking disqualifier remains. */
+	/** Position + validate the hologram at one placement; true when no blocking disqualifier remains.
+	 *  bVerboseLog dumps the full trace/hologram/disqualifier state (live-verify diagnostics). */
 	bool PlaceAndValidate(AFGHologram* Hologram, const FTransform& Placement, UFGInventoryComponent* Inventory,
-		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr)
+		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr, bool bVerboseLog = false)
 	{
 		const FVector Target = Placement.GetLocation();
 
@@ -201,6 +202,16 @@ namespace
 			Hit.ImpactNormal = FVector::UpVector;
 		}
 
+		if (bVerboseLog)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] target=%s traceHit=%d hitActor=%s (%s) hitComp=%s hitLoc=%s normal=%s"),
+				*Target.ToCompactString(), bHaveHit ? 1 : 0,
+				*GetNameSafe(Hit.GetActor()), Hit.GetActor() ? *GetNameSafe(Hit.GetActor()->GetClass()) : TEXT("-"),
+				*GetNameSafe(Hit.GetComponent()), *Hit.Location.ToCompactString(), *Hit.ImpactNormal.ToCompactString());
+			UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] hologram=%s IsValidHitResult=%d disabled=%d"),
+				*GetNameSafe(Hologram->GetClass()), Hologram->IsValidHitResult(Hit) ? 1 : 0, Hologram->IsDisabled() ? 1 : 0);
+		}
+
 		Hologram->SetScrollRotateValue(FMath::RoundToInt32(Placement.Rotator().Yaw));
 		Hologram->PreHologramPlacement(Hit);
 		Hologram->SetHologramLocationAndRotation(Hit);
@@ -213,6 +224,20 @@ namespace
 
 		TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
 		Hologram->GetConstructDisqualifiers(Disqualifiers);
+
+		if (bVerboseLog)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] hologram now at %s (target %s); %d disqualifier(s):"),
+				*Hologram->GetActorLocation().ToCompactString(), *Target.ToCompactString(), Disqualifiers.Num());
+			for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[actions][dbg]   - %s (%s)%s"),
+					*GetNameSafe(Disqualifier.Get()),
+					*UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString(),
+					IsBlockingDisqualifier(Disqualifier) ? TEXT(" [BLOCKING]") : TEXT(" [filtered]"));
+			}
+		}
+
 		for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
 		{
 			if (IsBlockingDisqualifier(Disqualifier))
@@ -314,8 +339,13 @@ bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& Play
 	FHitResult Hit;
 	if (!World->LineTraceSingleByChannel(Hit, ViewLocation, ViewLocation + ViewRotation.Vector() * 15000.0, AIDABuildGunChannel, Params))
 	{
+		UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim trace MISSED (view=%s dir=%s)"),
+			*ViewLocation.ToCompactString(), *ViewRotation.Vector().ToCompactString());
 		return false;
 	}
+	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim hit %s (%s) at %s"),
+		*GetNameSafe(Hit.GetActor()), Hit.GetActor() ? *GetNameSafe(Hit.GetActor()->GetClass()) : TEXT("-"),
+		*Hit.ImpactPoint.ToCompactString());
 	OutPointCm = Hit.ImpactPoint;
 	return true;
 }
@@ -358,7 +388,8 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 	for (int32 Index = 0; Index < Placements.Num(); ++Index)
 	{
 		TSubclassOf<UFGConstructDisqualifier> Blocking;
-		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking))
+		// Verbose diagnostics for the first placements only (a 200-tile grid must not spam the log).
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking, /*bVerboseLog*/ Index < 2))
 		{
 			FAIDAPlacementFailure Failure;
 			Failure.Index = Index;
