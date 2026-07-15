@@ -511,7 +511,8 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 	{
 		FVector GrowDir = Hit.ImpactNormal;
 		GrowDir.Z = 0.0;
-		if (GrowDir.SizeSquared() < 0.25) // top/bottom face: "coming toward me"
+		const bool bSideAim = GrowDir.SizeSquared() >= 0.25; // horizontal-ish normal = a side face
+		if (!bSideAim) // top/bottom face: rows run "coming toward me"
 		{
 			GrowDir = ViewLocation - Hit.ImpactPoint;
 			GrowDir.Z = 0.0;
@@ -527,10 +528,13 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 		const int32 CountAlong = bAlongX ? CountX : CountY;
 		const double StepAlong = bAlongX ? StepXCm : StepYCm;
 
-		// First tile = the cell adjacent to the aimed face — unless the snap already stepped out of
-		// the structure (holograms aimed at a side face snap to the neighbouring cell themselves).
+		// SIDE-face aims extend the structure: first tile = the cell adjacent to the aimed face —
+		// unless the snap already stepped out (holograms aimed at a side face snap to the
+		// neighbouring cell themselves). TOP-face aims mean "place it HERE on this surface"
+		// (machines on a platform, stacking) — no step-out; the aimed cell is tile 0 and the row
+		// runs toward the player (live-verify: assemblers got shoved 16 m off the platform).
 		FVector Anchor = Snapped;
-		if (((Snapped - Hit.ImpactPoint) | GrowthAxis) < StepAlong * 0.25)
+		if (bSideAim && ((Snapped - Hit.ImpactPoint) | GrowthAxis) < StepAlong * 0.25)
 		{
 			Anchor += GrowthAxis * StepAlong;
 		}
