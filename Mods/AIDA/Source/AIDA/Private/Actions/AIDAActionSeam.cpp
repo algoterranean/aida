@@ -182,15 +182,23 @@ namespace
 		bool bHaveHit = false;
 		if (UWorld* World = Hologram->GetWorld())
 		{
-			const FVector Start = Target + FVector(0.0, 0.0, 300.0);   // ~3 m above the intent
-			const FVector End = Target - FVector(0.0, 0.0, 10000.0);   // down to 100 m below
 			FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAPlacementTrace), /*bTraceComplex*/ false);
 			Params.AddIgnoredActor(Hologram);
 			for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
 			{
 				if (APawn* Pawn = It->Get() ? It->Get()->GetPawn() : nullptr) { Params.AddIgnoredActor(Pawn); }
 			}
-			bHaveHit = World->LineTraceSingleByChannel(Hit, Start, End, AIDABuildGunChannel, Params);
+
+			// First from just above the intended plane (so a roof over the area doesn't win) …
+			const FVector End = Target - FVector(0.0, 0.0, 10000.0);   // down to 100 m below
+			bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 300.0), End, AIDABuildGunChannel, Params);
+			if (!bHaveHit)
+			{
+				// … but on rising ground a far tile's terrain can sit ABOVE start+3 m — the ray then
+				// begins underground and misses (live-verify: one uphill corner of an otherwise valid
+				// grid). Retry from 50 m up before giving up.
+				bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 5000.0), End, AIDABuildGunChannel, Params);
+			}
 		}
 		if (!bHaveHit)
 		{
