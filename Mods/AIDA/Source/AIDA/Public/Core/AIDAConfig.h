@@ -64,6 +64,28 @@ struct FAIDASnapshotsConfig
 };
 
 USTRUCT()
+struct FAIDAActionsConfig
+{
+	GENERATED_BODY()
+
+	/** Master kill-switch: off ⇒ the propose_* tools are never registered. */
+	UPROPERTY() bool bEnabled = true;
+	UPROPERTY() int32 TtlSeconds = 600;
+	/** "any-act" | "requester" | "list" (set when the JSON value is an id array → ApprovalIds). */
+	UPROPERTY() FString ApprovalPolicy = TEXT("any-act");
+	UPROPERTY() TArray<FString> ApprovalIds;
+	/** Hard cap on expanded placements per proposal. */
+	UPROPERTY() int32 MaxProposalItems = 200;
+	UPROPERTY() int32 MaxPendingProposals = 3;
+	/** Executor slice size per 10 Hz tick. */
+	UPROPERTY() int32 BatchPerTick = 10;
+	/** How many journal entries back /aida undo may reach. */
+	UPROPERTY() int32 UndoWindow = 25;
+	/** "central" (tally + deduct vs central storage) | "free" (report only, never deduct). */
+	UPROPERTY() FString CostMode = TEXT("central");
+};
+
+USTRUCT()
 struct FAIDAPromptsConfig
 {
 	GENERATED_BODY()
@@ -82,5 +104,6 @@ struct FAIDAConfig
 	UPROPERTY() FAIDAPermissionsConfig Permissions;
 	UPROPERTY() FAIDAPrivacyConfig Privacy;
 	UPROPERTY() FAIDASnapshotsConfig Snapshots;
+	UPROPERTY() FAIDAActionsConfig Actions;
 	UPROPERTY() FAIDAPromptsConfig Prompts;
 };

@@ -12,6 +12,22 @@ AAIDAMemoryStore* FAIDAMemory::Store(UObject* WorldContext) const
 	return CachedStore.Get();
 }
 
+FGuid FAIDAMemory::AppendJournal(UObject* WorldContext, FAIDAJournalEntry Entry)
+{
+	if (AAIDAMemoryStore* MemStore = Store(WorldContext))
+	{
+		return MemStore->AppendJournal(MoveTemp(Entry));
+	}
+	UE_LOG(LogAIDA, Warning, TEXT("[memory] journal append dropped — no in-save store."));
+	return FGuid();
+}
+
+bool FAIDAMemory::MarkUndone(UObject* WorldContext, const FGuid& Id)
+{
+	AAIDAMemoryStore* MemStore = Store(WorldContext);
+	return MemStore ? MemStore->MarkUndone(Id) : false;
+}
+
 void FAIDAMemory::Init(UObject* WorldContext)
 {
 	AAIDAMemoryStore* MemStore = Store(WorldContext);

@@ -41,8 +41,9 @@ struct FAIDAMarkerRecord
 };
 
 /**
- * An executed AI action, for the undo journal. Schema is defined now (Phase 3) but only written in
- * Phase 4 "Hands" — the ActionEngine appends one per executed proposal. In-save.
+ * An executed AI action, for the undo journal — the ActionEngine appends one per executed proposal
+ * (docs/PHASE4.md §2d). AffectedEntityIds hold AIDAActionSpec-encoded entity handles; undo re-resolves
+ * them since the game has no persistent per-buildable ids. In-save.
  */
 USTRUCT()
 struct FAIDAJournalEntry
@@ -57,6 +58,9 @@ struct FAIDAJournalEntry
 	UPROPERTY(SaveGame) int64 ExecutedUtc = 0;
 	UPROPERTY(SaveGame) TArray<FString> AffectedEntityIds;
 	UPROPERTY(SaveGame) FString RefundJson;
+	// Phase 4 additions — tagged-property serialization defaults them on saves that predate the field.
+	UPROPERTY(SaveGame) bool bDismantle = false;
+	UPROPERTY(SaveGame) bool bUndone = false;
 };
 
 /** One item's net production−consumption at snapshot time. */

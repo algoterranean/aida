@@ -17,6 +17,9 @@
 #include "Memory/AIDASidecarStore.h"
 #include "Tools/AIDANotesTools.h"
 #include "Tools/AIDASnapshotTools.h"
+#include "Tools/AIDAToolJson.h"
+#include "Actions/AIDAActionSpec.h"
+#include "Actions/AIDAProposalStore.h"
 #include "UI/AIDAMarkdown.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
@@ -1339,6 +1342,325 @@ bool FAIDAMarkdownTest::RunTest(const FString&)
 		TestTrue(TEXT("bare table rows mono"), T.Contains(TEXT("<Mono>")));
 		TestFalse(TEXT("bare table has no header style"), T.Contains(TEXT("<MonoHeader>")));
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsConfigTest, "AIDA.Actions.ConfigParse",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsConfigTest::RunTest(const FString&)
+{
+	// String-mode approvalPolicy + overrides.
+	{
+		const FString Jsonc = TEXT(R"({
+  "provider": { "type": "anthropic", "baseUrl": "x", "model": "y" },
+  "actions": { "enabled": false, "ttlSeconds": 120, "approvalPolicy": "requester",
+               "maxProposalItems": 50, "maxPendingProposals": 2, "batchPerTick": 5,
+               "undoWindow": 10, "costMode": "free" }
+})");
+		FAIDAConfig Config;
+		FString Error;
+		TestTrue(FString::Printf(TEXT("parses (%s)"), *Error), FAIDAConfigLoader::LoadFromString(Jsonc, Config, Error));
+		TestFalse(TEXT("enabled"), Config.Actions.bEnabled);
+		TestEqual(TEXT("ttl"), Config.Actions.TtlSeconds, 120);
+		TestEqual(TEXT("approvalPolicy"), Config.Actions.ApprovalPolicy, TEXT("requester"));
+		TestEqual(TEXT("maxProposalItems"), Config.Actions.MaxProposalItems, 50);
+		TestEqual(TEXT("maxPendingProposals"), Config.Actions.MaxPendingProposals, 2);
+		TestEqual(TEXT("batchPerTick"), Config.Actions.BatchPerTick, 5);
+		TestEqual(TEXT("undoWindow"), Config.Actions.UndoWindow, 10);
+		TestEqual(TEXT("costMode"), Config.Actions.CostMode, TEXT("free"));
+	}
+
+	// Array-mode approvalPolicy becomes "list" + ids.
+	{
+		const FString Jsonc = TEXT(R"({
+  "provider": { "type": "anthropic", "baseUrl": "x", "model": "y" },
+  "actions": { "approvalPolicy": ["id-1", "id-2"] }
+})");
+		FAIDAConfig Config;
+		FString Error;
+		TestTrue(FString::Printf(TEXT("parses (%s)"), *Error), FAIDAConfigLoader::LoadFromString(Jsonc, Config, Error));
+		TestEqual(TEXT("list mode"), Config.Actions.ApprovalPolicy, TEXT("list"));
+		TestEqual(TEXT("two ids"), Config.Actions.ApprovalIds.Num(), 2);
+	}
+
+	// Absent block keeps documented defaults; bad values are rejected.
+	{
+		const FString Jsonc = TEXT(R"({ "provider": { "type": "anthropic", "baseUrl": "x", "model": "y" } })");
+		FAIDAConfig Config;
+		FString Error;
+		TestTrue(TEXT("defaults parse"), FAIDAConfigLoader::LoadFromString(Jsonc, Config, Error));
+		TestTrue(TEXT("default enabled"), Config.Actions.bEnabled);
+		TestEqual(TEXT("default ttl"), Config.Actions.TtlSeconds, 600);
+		TestEqual(TEXT("default policy"), Config.Actions.ApprovalPolicy, TEXT("any-act"));
+		TestEqual(TEXT("default costMode"), Config.Actions.CostMode, TEXT("central"));
+
+		const FString Bad = TEXT(R"({ "provider": { "type": "anthropic", "baseUrl": "x", "model": "y" },
+  "actions": { "costMode": "creative" } })");
+		TestFalse(TEXT("rejects unknown costMode"), FAIDAConfigLoader::LoadFromString(Bad, Config, Error));
+	}
+	return true;
+}
+
+namespace
+{
+	TSharedPtr<FJsonObject> AIDATestParseJson(const FString& Json)
+	{
+		TSharedPtr<FJsonObject> Obj;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+		FJsonSerializer::Deserialize(Reader, Obj);
+		return Obj;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsSpecParseTest, "AIDA.Actions.SpecParse",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsSpecParseTest::RunTest(const FString&)
+{
+	FString Error;
+
+	// A valid 10x10 build spec; yaw snaps to the nearest 90°.
+	{
+		FAIDABuildSpec Spec;
+		const TSharedPtr<FJsonObject> Json = AIDATestParseJson(TEXT(
+			R"({ "version": 1, "buildable": "Foundation 8m x 2m", "origin": { "x": -120, "y": 45, "z": 30 },
+			     "yawDeg": 93, "grid": { "countX": 10, "countY": 10, "stepX": 8, "stepY": 8 } })"));
+		TestTrue(FString::Printf(TEXT("parses (%s)"), *Error), AIDAActionSpec::ParseBuildSpec(Json, 200, Spec, Error));
+		TestEqual(TEXT("buildable"), Spec.Buildable, TEXT("Foundation 8m x 2m"));
+		TestEqual(TEXT("origin x (m)"), Spec.OriginM.X, -120.0);
+		TestEqual(TEXT("yaw snapped"), Spec.YawDeg, 90);
+		TestEqual(TEXT("countX"), Spec.Grid.CountX, 10);
+	}
+
+	// Negative yaw normalizes into [0, 270].
+	{
+		FAIDABuildSpec Spec;
+		const TSharedPtr<FJsonObject> Json = AIDATestParseJson(TEXT(
+			R"({ "version": 1, "buildable": "Smelter", "origin": { "x": 0, "y": 0 }, "yawDeg": -90 })"));
+		TestTrue(TEXT("parses default grid"), AIDAActionSpec::ParseBuildSpec(Json, 200, Spec, Error));
+		TestEqual(TEXT("yaw -90 -> 270"), Spec.YawDeg, 270);
+		TestEqual(TEXT("default count 1x1"), Spec.Grid.CountX * Spec.Grid.CountY, 1);
+	}
+
+	// Rejections: wrong version, missing buildable, missing origin, over-cap grid.
+	{
+		FAIDABuildSpec Spec;
+		TestFalse(TEXT("rejects version 2"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 2, "buildable": "x", "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects missing buildable"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects missing origin"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x" })")), 200, Spec, Error));
+		TestFalse(TEXT("rejects over-cap"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x", "origin": { "x": 0, "y": 0 },
+			                            "grid": { "countX": 20, "countY": 20 } })")), 200, Spec, Error));
+		TestTrue(TEXT("cap error names the cap"), Error.Contains(TEXT("200")));
+	}
+
+	// Dismantle selector: valid, maxCount clamped to the cap, radius required.
+	{
+		FAIDADismantleSpec Sel;
+		TestTrue(TEXT("selector parses"), AIDAActionSpec::ParseDismantleSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "Smelter", "center": { "x": 1, "y": 2 },
+			                            "radiusM": 50, "maxCount": 500 })")), 200, Sel, Error));
+		TestEqual(TEXT("maxCount clamped"), Sel.MaxCount, 200);
+		TestFalse(TEXT("rejects missing radius"), AIDAActionSpec::ParseDismantleSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "center": { "x": 1, "y": 2 } })")), 200, Sel, Error));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsGridExpandTest, "AIDA.Actions.GridExpand",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsGridExpandTest::RunTest(const FString&)
+{
+	FAIDABuildSpec Spec;
+	Spec.Buildable = TEXT("Foundation");
+	Spec.OriginM = FVector(10.0, 20.0, 0.0);
+	Spec.Grid.CountX = 3;
+	Spec.Grid.CountY = 2;
+	// Steps left 0 — the caller-supplied footprint (8 m) applies.
+
+	// Unrotated: row-major, metre steps become cm.
+	{
+		const TArray<FTransform> T = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
+		if (!TestEqual(TEXT("count"), T.Num(), 6)) { return false; }
+		TestEqual(TEXT("first at origin (cm)"), T[0].GetLocation(), FVector(1000.0, 2000.0, 0.0));
+		TestEqual(TEXT("second steps +X 8 m"), T[1].GetLocation(), FVector(1800.0, 2000.0, 0.0));
+		TestEqual(TEXT("second row steps +Y 8 m"), T[3].GetLocation(), FVector(1000.0, 2800.0, 0.0));
+	}
+
+	// Yaw 90: the step axes rotate with the grid (X becomes +Y).
+	{
+		Spec.YawDeg = 90;
+		const TArray<FTransform> T = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
+		if (!TestEqual(TEXT("rotated count"), T.Num(), 6)) { return false; }
+		TestTrue(TEXT("rotated step goes +Y"), T[1].GetLocation().Equals(FVector(1000.0, 2800.0, 0.0), 0.01));
+		TestTrue(TEXT("rotated row goes -X"), T[3].GetLocation().Equals(FVector(200.0, 2000.0, 0.0), 0.01));
+		TestTrue(TEXT("rotation applied"), FMath::IsNearlyEqual(T[0].Rotator().Yaw, 90.0, 0.01));
+	}
+
+	// Explicit spec steps beat the footprint default.
+	{
+		Spec.YawDeg = 0;
+		Spec.Grid.StepXM = 4.0;
+		const TArray<FTransform> T = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
+		TestEqual(TEXT("explicit stepX wins"), T[1].GetLocation().X, 1400.0);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsProposalStoreTest, "AIDA.Actions.ProposalStore",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsProposalStoreTest::RunTest(const FString&)
+{
+	FAIDAProposalStore Store;
+	FString Error;
+	const int64 T0 = 1000;
+
+	// Pending cap: a third Add at cap 2 is refused with a model-facing reason.
+	FAIDAProposal A; A.Summary = TEXT("a");
+	FAIDAProposal B; B.Summary = TEXT("b");
+	FAIDAProposal C; C.Summary = TEXT("c");
+	TestTrue(TEXT("add A"), Store.Add(A, T0, 2, Error));
+	TestTrue(TEXT("add B"), Store.Add(B, T0, 2, Error));
+	TestFalse(TEXT("cap refuses C"), Store.Add(C, T0, 2, Error));
+	TestTrue(TEXT("cap error is model-facing"), Error.Contains(TEXT("awaiting approval")));
+	TestEqual(TEXT("two pending"), Store.NumPending(), 2);
+
+	// The full legal path, and illegal jumps along the way.
+	const TArray<FAIDAProposal> All = Store.All();
+	if (!TestEqual(TEXT("stored two"), All.Num(), 2)) { return false; }
+	const FGuid Id = All[0].Id;
+	TestFalse(TEXT("Pending!->Executing"), Store.Transition(Id, EAIDAProposalState::Executing));
+	TestFalse(TEXT("Pending!->Undone"), Store.Transition(Id, EAIDAProposalState::Undone));
+	TestTrue(TEXT("Pending->Approved"), Store.Transition(Id, EAIDAProposalState::Approved));
+	TestFalse(TEXT("Approved!->Executed"), Store.Transition(Id, EAIDAProposalState::Executed));
+	TestTrue(TEXT("Approved->Executing"), Store.Transition(Id, EAIDAProposalState::Executing));
+	TestTrue(TEXT("Executing->Executed"), Store.Transition(Id, EAIDAProposalState::Executed));
+	TestTrue(TEXT("Executed->Undone"), Store.Transition(Id, EAIDAProposalState::Undone));
+	TestFalse(TEXT("Undone is terminal"), Store.Transition(Id, EAIDAProposalState::Pending));
+
+	// Approving A freed a pending slot; TTL sweep expires only stale Pending proposals.
+	TestTrue(TEXT("slot freed, add C"), Store.Add(C, T0 + 100, 2, Error));
+	const TArray<FGuid> Expired = Store.SweepExpired(T0 + 600, /*Ttl*/ 600);
+	TestEqual(TEXT("only B expired (C is younger)"), Expired.Num(), 1);
+	if (Expired.Num() == 1)
+	{
+		TestEqual(TEXT("expired state set"), static_cast<int32>(Store.Find(Expired[0])->State), static_cast<int32>(EAIDAProposalState::Expired));
+	}
+	TestEqual(TEXT("C still pending"), Store.NumPending(), 1);
+
+	// Terminal classification + retirement.
+	TestTrue(TEXT("Expired is terminal"), FAIDAProposalStore::IsTerminal(EAIDAProposalState::Expired));
+	TestFalse(TEXT("Executing is not terminal"), FAIDAProposalStore::IsTerminal(EAIDAProposalState::Executing));
+	Store.Remove(Id);
+	TestTrue(TEXT("removed"), Store.Find(Id) == nullptr);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsEntityIdCodecTest, "AIDA.Actions.EntityIdCodec",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsEntityIdCodecTest::RunTest(const FString&)
+{
+	// Lightweight round-trip.
+	{
+		FAIDAEntityId In;
+		In.Type = TEXT("lw");
+		In.ClassPath = TEXT("/Game/Buildable/Build_Foundation8x2_01.Build_Foundation8x2_01_C");
+		In.Index = 4127;
+		In.Pos = FVector(-12000.0, 4500.0, 3000.0);
+		In.YawDeg = 90;
+
+		FAIDAEntityId Out;
+		TestTrue(TEXT("lw decodes"), AIDAActionSpec::DecodeEntityId(AIDAActionSpec::EncodeEntityId(In), Out));
+		TestEqual(TEXT("lw type"), Out.Type, TEXT("lw"));
+		TestEqual(TEXT("lw class"), Out.ClassPath, In.ClassPath);
+		TestEqual(TEXT("lw index"), Out.Index, 4127);
+		TestTrue(TEXT("lw pos"), Out.Pos.Equals(In.Pos, 0.01));
+		TestEqual(TEXT("lw yaw"), Out.YawDeg, 90);
+	}
+
+	// Actor round-trip carries the recipe.
+	{
+		FAIDAEntityId In;
+		In.Type = TEXT("actor");
+		In.ClassPath = TEXT("/Game/Buildable/Build_SmelterMk1.Build_SmelterMk1_C");
+		In.RecipePath = TEXT("/Game/Recipes/Buildings/Recipe_SmelterMk1.Recipe_SmelterMk1_C");
+		In.Pos = FVector(100.0, 200.0, 300.0);
+
+		FAIDAEntityId Out;
+		TestTrue(TEXT("actor decodes"), AIDAActionSpec::DecodeEntityId(AIDAActionSpec::EncodeEntityId(In), Out));
+		TestEqual(TEXT("actor recipe"), Out.RecipePath, In.RecipePath);
+		TestEqual(TEXT("actor index unset"), Out.Index, static_cast<int32>(INDEX_NONE));
+	}
+
+	// Garbage and unknown kinds are refused.
+	{
+		FAIDAEntityId Out;
+		TestFalse(TEXT("rejects non-JSON"), AIDAActionSpec::DecodeEntityId(TEXT("not json"), Out));
+		TestFalse(TEXT("rejects unknown t"), AIDAActionSpec::DecodeEntityId(TEXT(R"({"t":"ghost","class":"x","pos":[0,0,0]})"), Out));
+		TestFalse(TEXT("rejects missing pos"), AIDAActionSpec::DecodeEntityId(TEXT(R"({"t":"lw","class":"x","idx":1})"), Out));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsReportJsonTest, "AIDA.Actions.ReportJson",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsReportJsonTest::RunTest(const FString&)
+{
+	// Dry-run success report carries the §2b contract fields.
+	FAIDAProposal P;
+	P.Id = FGuid::NewGuid();
+	P.Summary = TEXT("place 100 x Foundation 8m x 2m in a 10x10 grid");
+	P.Placements.SetNum(100);
+	P.Cost.Add({ TEXT("Concrete"), 300 });
+	{
+		const TSharedPtr<FJsonObject> O = AIDATestParseJson(AIDAActionSpec::BuildDryRunJson(P, 600, true, 0.0));
+		if (!TestTrue(TEXT("dry-run is JSON"), O.IsValid())) { return false; }
+		TestEqual(TEXT("count"), static_cast<int32>(O->GetNumberField(TEXT("count"))), 100);
+		TestEqual(TEXT("status"), O->GetStringField(TEXT("status")), TEXT("awaiting approval"));
+		TestTrue(TEXT("affordable present"), O->GetBoolField(TEXT("affordable")));
+		TestEqual(TEXT("cost items"), O->GetArrayField(TEXT("cost")).Num(), 1);
+		TestEqual(TEXT("expiresInSec"), static_cast<int32>(O->GetNumberField(TEXT("expiresInSec"))), 600);
+	}
+
+	// Error report bounds the failure list and counts the omitted rest.
+	{
+		TArray<FAIDAPlacementFailure> Failures;
+		for (int32 i = 0; i < 12; ++i) { Failures.Add({ i, FVector(i, 0.0, 0.0), TEXT("Encroaching other building") }); }
+		const TSharedPtr<FJsonObject> O = AIDATestParseJson(AIDAActionSpec::BuildErrorJson(TEXT("12 of 100 placements invalid"), Failures));
+		if (!TestTrue(TEXT("error is JSON"), O.IsValid())) { return false; }
+		TestEqual(TEXT("bounded to 5"), O->GetArrayField(TEXT("firstFailures")).Num(), 5);
+		TestEqual(TEXT("omitted counted"), static_cast<int32>(O->GetNumberField(TEXT("omitted"))), 7);
+		TestTrue(TEXT("reason preserved"), AIDAToCompactJson(O.ToSharedRef()).Contains(TEXT("Encroaching")));
+	}
+
+	// Status report: filter narrows to one; pending entries carry a countdown.
+	{
+		FAIDAProposal Q;
+		Q.Id = FGuid::NewGuid();
+		Q.Summary = TEXT("q");
+		Q.State = EAIDAProposalState::Pending;
+		Q.ProposedUtc = 1000;
+		const TSharedPtr<FJsonObject> All = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P, Q }, FGuid(), /*Now*/ 1100, /*Ttl*/ 600));
+		TestEqual(TEXT("status lists both"), static_cast<int32>(All->GetNumberField(TEXT("count"))), 2);
+		const TSharedPtr<FJsonObject> One = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P, Q }, Q.Id, 1100, 600));
+		TestEqual(TEXT("filter narrows"), static_cast<int32>(One->GetNumberField(TEXT("count"))), 1);
+		const TArray<TSharedPtr<FJsonValue>>& List = One->GetArrayField(TEXT("proposals"));
+		if (TestEqual(TEXT("one entry"), List.Num(), 1))
+		{
+			TestEqual(TEXT("pending countdown"), static_cast<int32>(List[0]->AsObject()->GetNumberField(TEXT("expiresInSec"))), 500);
+		}
+	}
+
+	// Summaries read like the doc examples.
+	FAIDABuildSpec Spec;
+	Spec.Buildable = TEXT("Foundation 8m x 2m");
+	Spec.Grid.CountX = 10; Spec.Grid.CountY = 10;
+	TestEqual(TEXT("build summary"), AIDAActionSpec::SummarizeBuild(Spec), TEXT("place 100 x Foundation 8m x 2m in a 10x10 grid"));
+	FAIDADismantleSpec Sel;
+	Sel.Buildable = TEXT("Smelter"); Sel.CenterM = FVector(-120.0, 45.0, 0.0); Sel.RadiusM = 50.0; Sel.MaxCount = 20;
+	TestEqual(TEXT("dismantle summary"), AIDAActionSpec::SummarizeDismantle(Sel), TEXT("dismantle up to 20 x Smelter within 50 m of (-120, 45)"));
 	return true;
 }
 

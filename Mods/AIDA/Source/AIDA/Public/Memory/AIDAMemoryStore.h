@@ -35,6 +35,15 @@ public:
 	/** Read-only access to the stored notes (server-side). */
 	const TArray<FAIDANote>& GetNotes() const { return Notes; }
 
+	/** Append an executed action to the undo journal (mints an Id if unset). Returns the entry Id. */
+	FGuid AppendJournal(FAIDAJournalEntry Entry);
+
+	/** Read-only access to the journal, oldest-first (server-side). */
+	const TArray<FAIDAJournalEntry>& GetJournal() const { return Journal; }
+
+	/** Flag a journal entry as undone (so /aida undo skips past it). False if the Id is unknown. */
+	bool MarkUndone(const FGuid& Id);
+
 	//~ IFGSaveInterface — persist SaveGame properties; mint the session id on load.
 	virtual bool ShouldSave_Implementation() const override { return true; }
 	virtual void PreSaveGame_Implementation(int32 saveVersion, int32 gameVersion) override {}
@@ -44,7 +53,7 @@ public:
 	virtual void GatherDependencies_Implementation(TArray<UObject*>& out_dependentObjects) override {}
 	virtual bool NeedTransform_Implementation() override { return false; }
 
-	//~ Persisted state (SaveGame). Note/marker/journal accessors land in later slices.
+	//~ Persisted state (SaveGame). Marker accessors land with P4's marker cleanup.
 	UPROPERTY(SaveGame) FGuid SessionId;
 	UPROPERTY(SaveGame) TArray<FAIDANote> Notes;
 	UPROPERTY(SaveGame) TArray<FAIDAJournalEntry> Journal;

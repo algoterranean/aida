@@ -134,6 +134,36 @@ bool FAIDAConfigLoader::LoadFromString(const FString& Jsonc, FAIDAConfig& OutCon
 		if ((*Snapshots)->TryGetNumberField(TEXT("keep"), I)) { Parsed.Snapshots.Keep = I; }
 	}
 
+	const TSharedPtr<FJsonObject>* Actions = nullptr;
+	if (Root->TryGetObjectField(TEXT("actions"), Actions) && Actions)
+	{
+		int32 I;
+		(*Actions)->TryGetBoolField(TEXT("enabled"), Parsed.Actions.bEnabled);
+		if ((*Actions)->TryGetNumberField(TEXT("ttlSeconds"), I)) { Parsed.Actions.TtlSeconds = I; }
+		if ((*Actions)->TryGetNumberField(TEXT("maxProposalItems"), I)) { Parsed.Actions.MaxProposalItems = I; }
+		if ((*Actions)->TryGetNumberField(TEXT("maxPendingProposals"), I)) { Parsed.Actions.MaxPendingProposals = I; }
+		if ((*Actions)->TryGetNumberField(TEXT("batchPerTick"), I)) { Parsed.Actions.BatchPerTick = I; }
+		if ((*Actions)->TryGetNumberField(TEXT("undoWindow"), I)) { Parsed.Actions.UndoWindow = I; }
+		(*Actions)->TryGetStringField(TEXT("costMode"), Parsed.Actions.CostMode);
+
+		// approvalPolicy is either a mode string ("any-act" | "requester") or an explicit id array.
+		FString Policy;
+		const TArray<TSharedPtr<FJsonValue>>* PolicyIds = nullptr;
+		if ((*Actions)->TryGetStringField(TEXT("approvalPolicy"), Policy))
+		{
+			Parsed.Actions.ApprovalPolicy = Policy;
+		}
+		else if ((*Actions)->TryGetArrayField(TEXT("approvalPolicy"), PolicyIds) && PolicyIds)
+		{
+			Parsed.Actions.ApprovalPolicy = TEXT("list");
+			for (const TSharedPtr<FJsonValue>& Value : *PolicyIds)
+			{
+				FString Id;
+				if (Value.IsValid() && Value->TryGetString(Id)) { Parsed.Actions.ApprovalIds.Add(Id); }
+			}
+		}
+	}
+
 	const TSharedPtr<FJsonObject>* Prompts = nullptr;
 	if (Root->TryGetObjectField(TEXT("prompts"), Prompts) && Prompts)
 	{
@@ -189,6 +219,24 @@ bool FAIDAConfigLoader::Validate(const FAIDAConfig& Config, FString& OutError)
 	if (Config.Limits.MaxToolRoundTrips < 0)
 	{
 		OutError = TEXT("limits.maxToolRoundTrips must be >= 0");
+		return false;
+	}
+
+	const FString& CostMode = Config.Actions.CostMode;
+	if (CostMode != TEXT("central") && CostMode != TEXT("free"))
+	{
+		OutError = FString::Printf(TEXT("actions.costMode must be 'central' or 'free', got '%s'"), *CostMode);
+		return false;
+	}
+	const FString& Approval = Config.Actions.ApprovalPolicy;
+	if (Approval != TEXT("any-act") && Approval != TEXT("requester") && Approval != TEXT("list"))
+	{
+		OutError = FString::Printf(TEXT("actions.approvalPolicy must be 'any-act', 'requester', or an id array, got '%s'"), *Approval);
+		return false;
+	}
+	if (Config.Actions.MaxProposalItems < 1 || Config.Actions.BatchPerTick < 1 || Config.Actions.MaxPendingProposals < 1)
+	{
+		OutError = TEXT("actions.maxProposalItems, batchPerTick, and maxPendingProposals must be >= 1");
 		return false;
 	}
 

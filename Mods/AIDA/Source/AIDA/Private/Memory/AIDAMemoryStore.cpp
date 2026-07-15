@@ -48,6 +48,28 @@ FGuid AAIDAMemoryStore::AddNote(FAIDANote Note)
 	return Id;
 }
 
+FGuid AAIDAMemoryStore::AppendJournal(FAIDAJournalEntry Entry)
+{
+	if (!Entry.Id.IsValid()) { Entry.Id = FGuid::NewGuid(); }
+	const FGuid Id = Entry.Id;
+	Journal.Add(MoveTemp(Entry));
+	UE_LOG(LogAIDA, Log, TEXT("[memory] journal entry added (%s); %d total."), *Id.ToString(EGuidFormats::DigitsWithHyphens), Journal.Num());
+	return Id;
+}
+
+bool AAIDAMemoryStore::MarkUndone(const FGuid& Id)
+{
+	for (FAIDAJournalEntry& Entry : Journal)
+	{
+		if (Entry.Id == Id)
+		{
+			Entry.bUndone = true;
+			return true;
+		}
+	}
+	return false;
+}
+
 void AAIDAMemoryStore::PostLoadGame_Implementation(int32 /*saveVersion*/, int32 /*gameVersion*/)
 {
 	// A save that predates AIDA (or a brand-new one) has no session id yet — mint one so the sidecar has

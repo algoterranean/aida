@@ -33,6 +33,10 @@ public:
 	bool AppendSnapshot(const FAIDASnapshot& Snapshot, int32 KeepMax) { return Sidecar.AppendSnapshot(Snapshot, KeepMax); }
 	TArray<FAIDASnapshot> LoadSnapshots() const { return Sidecar.LoadSnapshots(); }
 
+	//~ In-save-backed (undo journal, Phase 4). No-ops with invalid/false results when the store is absent.
+	FGuid AppendJournal(UObject* WorldContext, FAIDAJournalEntry Entry);
+	bool MarkUndone(UObject* WorldContext, const FGuid& Id);
+
 private:
 	mutable TWeakObjectPtr<AAIDAMemoryStore> CachedStore;
 	FAIDASidecarStore Sidecar;
