@@ -2,19 +2,47 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/Button.h"
 #include "Types/SlateEnums.h"
 #include "Net/AIDANetTypes.h"
 #include "AIDAChatWidget.generated.h"
 
 class AAIDAChatRelay;
-class UButton;
 class UEditableTextBox;
+class UHorizontalBox;
 class URichTextBlock;
 class UScrollBox;
 class UTextBlock;
 
 /** Broadcast whenever the rendered transcript string changes (for optional BP text bindings). */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnAIDATranscriptChanged, const FString&, Transcript);
+
+/** A tab button that carries its conversation id and reports clicks via a native delegate. */
+UCLASS()
+class UAIDATabButton : public UButton
+{
+	GENERATED_BODY()
+
+public:
+	FGuid ConversationId;
+
+	DECLARE_MULTICAST_DELEGATE_OneParam(FAIDAOnTabClicked, const FGuid&);
+	FAIDAOnTabClicked OnTabClickedNative;
+
+	/** Bind the conversation this tab selects. */
+	void InitTab(const FGuid& InConv)
+	{
+		ConversationId = InConv;
+		if (!OnClicked.IsAlreadyBound(this, &UAIDATabButton::Forward))
+		{
+			OnClicked.AddDynamic(this, &UAIDATabButton::Forward);
+		}
+	}
+
+private:
+	UFUNCTION()
+	void Forward() { OnTabClickedNative.Broadcast(ConversationId); }
+};
 
 /**
  * Client-only base for the ChatWidget (docs/ARCHITECTURE.md §3.1). Owns all the wiring — finds the
@@ -119,14 +147,35 @@ private:
 	UFUNCTION()
 	void HandleInputCommitted(const FText& Text, ETextCommit::Type CommitMethod);
 
-	//~ Native default rendering: one string assembled from ordered messages, pushed to TranscriptText.
+	//~ Per-conversation transcript state (one per tab). Each conversation is independent.
 	struct FRenderedMessage
 	{
 		FGuid Id;
 		FString Prefix;
 		FString Body;
 	};
-	TArray<FRenderedMessage> RenderedMessages;
-	TMap<FGuid, int32> RenderedIndexById;
-	void RebuildRenderedTranscript();
+	struct FConversationView
+	{
+		TArray<FRenderedMessage> Messages;
+		TMap<FGuid, int32> IndexById;
+	};
+	TMap<FGuid, FConversationView> Conversations; // conversation id -> its ordered messages
+	TMap<FGuid, FGuid> ConversationOfMessage;     // message id -> conversation id (routes Chunk/End)
+	TArray<FGuid> TabOrder;                        // stable left-to-right tab order
+
+	/** Ensure a conversation (and its tab) exists; returns its view. New conversations rebuild the tab bar. */
+	FConversationView& EnsureConversation(const FGuid& ConvId);
+	/** Make ConvId the active tab and re-render its transcript. */
+	void SwitchToConversation(const FGuid& ConvId);
+	/** Render the active conversation's transcript (markdown) into TranscriptRich. */
+	void RenderActiveConversation();
+
+	//~ Tab bar (constructed in C++; a button per conversation plus a '+' new-tab button).
+	UPROPERTY(Transient)
+	TObjectPtr<UHorizontalBox> TabBar;
+
+	void RebuildTabBar();
+	void HandleTabClicked(const FGuid& ConvId);
+	UFUNCTION()
+	void HandleNewTabClicked();
 };

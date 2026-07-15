@@ -3,9 +3,14 @@
 #include "AIDA.h"
 #include "Net/AIDAChatRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
+#include "Components/Border.h"
 #include "Components/Button.h"
+#include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/EditableTextBox.h"
+#include "Components/HorizontalBox.h"
+#include "Components/HorizontalBoxSlot.h"
+#include "Components/PanelWidget.h"
 #include "Components/RichTextBlock.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
@@ -57,27 +62,30 @@ void UAIDAChatWidget::NativeConstruct()
 	constexpr float SendWidth       = 140.f; // width of the Send button
 	constexpr float RowGap          = 12.f;  // gap between transcript, input box, and Send button
 	constexpr float ToolbarClearance= 96.f;  // approx Satisfactory hotbar height to clear at the bottom
-	constexpr float FontSize        = 12.f;  // just above the console font; default UMG is 24
+	constexpr float FontSize        = 10.f;  // small, like the native chat
+	constexpr float TabBarHeight    = 26.f;  // tab strip along the top
+	constexpr float RightAnchor     = 0.5f;  // the window occupies the left half of the screen
 	// Input row's bottom edge sits this far above the screen bottom: toolbar height + a 20px margin.
 	const float BottomInset = ToolbarClearance + Margin;
+	const float TranscriptTop = Margin + TabBarHeight + RowGap; // leave room for the tab bar
 
-	// Transcript: stretch to fill from top+margin down to just above the input row.
+	// Transcript: fill the left half, from below the tab bar down to just above the input row.
 	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(TranscriptScroll ? TranscriptScroll->Slot : nullptr))
 	{
-		CanvasSlot->SetAnchors(FAnchors(0.f, 0.f, 1.f, 1.f)); // stretch both axes
-		CanvasSlot->SetOffsets(FMargin(Margin, Margin, Margin, BottomInset + InputHeight + RowGap));
+		CanvasSlot->SetAnchors(FAnchors(0.f, 0.f, RightAnchor, 1.f));
+		CanvasSlot->SetOffsets(FMargin(Margin, TranscriptTop, Margin, BottomInset + InputHeight + RowGap));
 	}
-	// Input box: bottom row, stretched horizontally but leaving room for the Send button on the right.
+	// Input box: bottom row of the left half, leaving room for the Send button on the right.
 	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(InputBox ? InputBox->Slot : nullptr))
 	{
-		CanvasSlot->SetAnchors(FAnchors(0.f, 1.f, 1.f, 1.f)); // stretch X, pin to bottom edge
+		CanvasSlot->SetAnchors(FAnchors(0.f, 1.f, RightAnchor, 1.f));
 		CanvasSlot->SetAlignment(FVector2D(0.f, 1.f));
 		CanvasSlot->SetOffsets(FMargin(Margin, -BottomInset, SendWidth + RowGap + Margin, InputHeight));
 	}
-	// Send button: bottom-right corner, fixed width, aligned with the input row.
+	// Send button: pinned to the right edge of the left half, aligned with the input row.
 	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(SendButton ? SendButton->Slot : nullptr))
 	{
-		CanvasSlot->SetAnchors(FAnchors(1.f, 1.f, 1.f, 1.f)); // pin to bottom-right corner
+		CanvasSlot->SetAnchors(FAnchors(RightAnchor, 1.f, RightAnchor, 1.f));
 		CanvasSlot->SetAlignment(FVector2D(1.f, 1.f));
 		CanvasSlot->SetOffsets(FMargin(-Margin, -BottomInset, SendWidth, InputHeight));
 	}
@@ -90,8 +98,8 @@ void UAIDAChatWidget::NativeConstruct()
 	{
 		FSlateFontInfo Font = GameFont ? FSlateFontInfo(GameFont, FontSize) : TranscriptText->GetFont();
 		Font.Size = FontSize;
-		Font.OutlineSettings.OutlineSize = 1;
-		Font.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 1.f);
+		Font.OutlineSettings.OutlineSize = 0; // strip the asset's default dark outline
+		Font.OutlineSettings.OutlineColor = FLinearColor::Transparent;
 		TranscriptText->SetFont(Font);
 
 		if (InputBox)
@@ -105,6 +113,33 @@ void UAIDAChatWidget::NativeConstruct()
 	// Rich-text transcript for markdown rendering, constructed in C++ under the scroll box so the BP
 	// needs no RichTextBlock. Falls back to the plain TranscriptText if the scroll box is missing.
 	BuildTranscriptRich(GameFont, FontSize);
+
+	if (UPanelWidget* RootPanel = Cast<UPanelWidget>(GetRootWidget()))
+	{
+		// Semi-transparent dark backdrop behind the chat (left half) so text reads over the game, like
+		// the native chat. Added first + given a low Z so it sits behind the tabs/transcript/input.
+		UBorder* Backdrop = WidgetTree->ConstructWidget<UBorder>();
+		Backdrop->SetBrushColor(FLinearColor(0.f, 0.f, 0.f, 0.4f));
+		Backdrop->SetVisibility(ESlateVisibility::HitTestInvisible);
+		if (UCanvasPanelSlot* BgSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(Backdrop)))
+		{
+			BgSlot->SetAnchors(FAnchors(0.f, 0.f, RightAnchor, 1.f));
+			BgSlot->SetOffsets(FMargin(Margin - 8.f, Margin - 8.f, Margin - 8.f, ToolbarClearance - 8.f));
+			BgSlot->SetZOrder(-10);
+		}
+
+		// Tab bar along the top of the left half.
+		TabBar = WidgetTree->ConstructWidget<UHorizontalBox>();
+		if (UCanvasPanelSlot* TabSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(TabBar)))
+		{
+			TabSlot->SetAnchors(FAnchors(0.f, 0.f, RightAnchor, 0.f));
+			TabSlot->SetOffsets(FMargin(Margin, Margin, Margin, TabBarHeight));
+		}
+	}
+
+	// Create the default conversation tab and render it (more tabs appear as conversations arrive).
+	EnsureConversation(CurrentConversationId);
+	RenderActiveConversation();
 
 	// The relay is a replicated actor and may not have arrived on this client yet — retry until it has.
 	if (!TryBindRelay())
@@ -195,8 +230,10 @@ void UAIDAChatWidget::BuildTranscriptRich(UFont* GameFont, float FontSize)
 	auto MakeFont = [GameFont](const FName& Typeface, float Size) -> FSlateFontInfo
 	{
 		FSlateFontInfo F = GameFont ? FSlateFontInfo(GameFont, static_cast<int32>(Size), Typeface) : FSlateFontInfo();
-		F.OutlineSettings.OutlineSize = 1;
-		F.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 1.f);
+		// Force no outline — the DescriptionText asset carries a dark default outline; strip it so the
+		// text reads flat over the backdrop (user: "remove the black border from the text").
+		F.OutlineSettings.OutlineSize = 0;
+		F.OutlineSettings.OutlineColor = FLinearColor::Transparent;
 		return F;
 	};
 
@@ -207,12 +244,13 @@ void UAIDAChatWidget::BuildTranscriptRich(UFont* GameFont, float FontSize)
 		FRichTextStyleRow Row;
 		Row.TextStyle.SetFont(F);
 		Row.TextStyle.SetColorAndOpacity(FSlateColor(Color));
+		Row.TextStyle.SetShadowOffset(FVector2D::ZeroVector); // no drop shadow (part of the "black border")
 		StyleSet->AddRow(Name, Row);
 	};
 	// Engine monospace font (DroidSansMono — what the console uses) so code + tables align by character.
 	FSlateFontInfo MonoFont = FCoreStyle::GetDefaultFontStyle(TEXT("Mono"), FontSize);
-	MonoFont.OutlineSettings.OutlineSize = 1;
-	MonoFont.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 1.f);
+	MonoFont.OutlineSettings.OutlineSize = 0;
+	MonoFont.OutlineSettings.OutlineColor = FLinearColor::Transparent;
 
 	AddStyle(TEXT("Default"), MakeFont(NAME_None, FontSize), FLinearColor::White);
 	AddStyle(TEXT("Bold"), MakeFont(TEXT("Bold"), FontSize), FLinearColor::White);
@@ -258,29 +296,36 @@ void UAIDAChatWidget::GetTranscript(TArray<FAIDATranscriptEntry>& OutEntries) co
 
 void UAIDAChatWidget::HandleMsgBegin(const FAIDAMessageHeader& Header)
 {
-	// Native default view: open (or upsert-RESET) the message block for this Id.
-	if (int32* Existing = RenderedIndexById.Find(Header.Id))
+	FConversationView& View = EnsureConversation(Header.ConversationId);
+	ConversationOfMessage.Add(Header.Id, Header.ConversationId);
+
+	// Open (or upsert-RESET) the message block for this Id within its conversation.
+	if (int32* Existing = View.IndexById.Find(Header.Id))
 	{
-		RenderedMessages[*Existing].Body.Reset();
+		View.Messages[*Existing].Body.Reset();
 	}
 	else
 	{
 		FRenderedMessage Msg;
 		Msg.Id = Header.Id;
-		Msg.Prefix = FString::Printf(TEXT("%s: "), *Header.Author);
-		RenderedIndexById.Add(Header.Id, RenderedMessages.Add(MoveTemp(Msg)));
+		Msg.Prefix = FString::Printf(TEXT("**%s:** "), *Header.Author); // bold author via markdown
+		View.IndexById.Add(Header.Id, View.Messages.Add(MoveTemp(Msg)));
 	}
-	RebuildRenderedTranscript();
+	if (Header.ConversationId == CurrentConversationId) { RenderActiveConversation(); }
 
 	OnMessageBegin(Header);
 }
 
 void UAIDAChatWidget::HandleMsgChunk(const FGuid& Id, const FString& Delta)
 {
-	if (int32* Idx = RenderedIndexById.Find(Id))
+	const FGuid ConvId = ConversationOfMessage.FindRef(Id);
+	if (FConversationView* View = Conversations.Find(ConvId))
 	{
-		RenderedMessages[*Idx].Body += Delta;
-		RebuildRenderedTranscript();
+		if (int32* Idx = View->IndexById.Find(Id))
+		{
+			View->Messages[*Idx].Body += Delta;
+			if (ConvId == CurrentConversationId) { RenderActiveConversation(); }
+		}
 	}
 
 	OnMessageDelta(Id, Delta);
@@ -289,6 +334,37 @@ void UAIDAChatWidget::HandleMsgChunk(const FGuid& Id, const FString& Delta)
 void UAIDAChatWidget::HandleMsgEnd(const FGuid& Id)
 {
 	OnMessageEnd(Id);
+}
+
+UAIDAChatWidget::FConversationView& UAIDAChatWidget::EnsureConversation(const FGuid& ConvId)
+{
+	if (FConversationView* Existing = Conversations.Find(ConvId))
+	{
+		return *Existing;
+	}
+	FConversationView& View = Conversations.Add(ConvId);
+	TabOrder.Add(ConvId);
+	RebuildTabBar();
+	return View;
+}
+
+void UAIDAChatWidget::SwitchToConversation(const FGuid& ConvId)
+{
+	CurrentConversationId = ConvId;
+	EnsureConversation(ConvId);
+	RebuildTabBar();
+	RenderActiveConversation();
+	FocusInput();
+}
+
+void UAIDAChatWidget::HandleTabClicked(const FGuid& ConvId)
+{
+	SwitchToConversation(ConvId);
+}
+
+void UAIDAChatWidget::HandleNewTabClicked()
+{
+	SwitchToConversation(FGuid::NewGuid());
 }
 
 void UAIDAChatWidget::HandleSendClicked()
@@ -314,17 +390,17 @@ void UAIDAChatWidget::HandleInputCommitted(const FText& Text, ETextCommit::Type 
 	}
 }
 
-void UAIDAChatWidget::RebuildRenderedTranscript()
+void UAIDAChatWidget::RenderActiveConversation()
 {
 	FString Out;
-	for (const FRenderedMessage& Msg : RenderedMessages)
+	if (const FConversationView* View = Conversations.Find(CurrentConversationId))
 	{
-		if (!Out.IsEmpty())
+		for (const FRenderedMessage& Msg : View->Messages)
 		{
-			Out += TEXT("\n\n");
+			if (!Out.IsEmpty()) { Out += TEXT("\n\n"); }
+			Out += Msg.Prefix;
+			Out += Msg.Body;
 		}
-		Out += Msg.Prefix;
-		Out += Msg.Body;
 	}
 	RenderedTranscript = MoveTemp(Out);
 
@@ -341,4 +417,53 @@ void UAIDAChatWidget::RebuildRenderedTranscript()
 		TranscriptScroll->ScrollToEnd();
 	}
 	OnTranscriptChanged.Broadcast(RenderedTranscript);
+}
+
+void UAIDAChatWidget::RebuildTabBar()
+{
+	if (!TabBar || !WidgetTree)
+	{
+		return;
+	}
+	TabBar->ClearChildren();
+
+	// Small label font so the tab buttons stay compact and align to the strip height.
+	auto MakeLabel = [this](const FString& Text, const FLinearColor& Color) -> UTextBlock*
+	{
+		UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>();
+		Label->SetText(FText::FromString(Text));
+		FSlateFontInfo LabelFont = Label->GetFont();
+		LabelFont.Size = 10;
+		Label->SetFont(LabelFont);
+		Label->SetColorAndOpacity(FSlateColor(Color));
+		return Label;
+	};
+
+	for (int32 i = 0; i < TabOrder.Num(); ++i)
+	{
+		const FGuid& ConvId = TabOrder[i];
+		const bool bActive = (ConvId == CurrentConversationId);
+
+		UAIDATabButton* Btn = WidgetTree->ConstructWidget<UAIDATabButton>();
+		Btn->InitTab(ConvId);
+		Btn->OnTabClickedNative.AddUObject(this, &UAIDAChatWidget::HandleTabClicked);
+		Btn->AddChild(MakeLabel(FString::Printf(TEXT("Chat %d"), i + 1),
+			bActive ? FLinearColor(1.0f, 0.85f, 0.4f, 1.0f) : FLinearColor(0.8f, 0.8f, 0.8f, 1.0f)));
+
+		if (UHorizontalBoxSlot* BSlot = TabBar->AddChildToHorizontalBox(Btn))
+		{
+			BSlot->SetPadding(FMargin(2.f, 0.f, 2.f, 0.f));
+			BSlot->SetVerticalAlignment(VAlign_Fill);
+		}
+	}
+
+	// "+" new-tab button.
+	UButton* Plus = WidgetTree->ConstructWidget<UButton>();
+	Plus->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleNewTabClicked);
+	Plus->AddChild(MakeLabel(TEXT("+"), FLinearColor(0.9f, 0.9f, 0.9f, 1.0f)));
+	if (UHorizontalBoxSlot* PSlot = TabBar->AddChildToHorizontalBox(Plus))
+	{
+		PSlot->SetPadding(FMargin(6.f, 0.f, 2.f, 0.f));
+		PSlot->SetVerticalAlignment(VAlign_Fill);
+	}
 }
