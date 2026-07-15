@@ -234,9 +234,9 @@ bool FAIDAConfigLoader::Validate(const FAIDAConfig& Config, FString& OutError)
 		OutError = FString::Printf(TEXT("actions.approvalPolicy must be 'any-act', 'requester', or an id array, got '%s'"), *Approval);
 		return false;
 	}
-	if (Config.Actions.MaxProposalItems < 1 || Config.Actions.BatchPerTick < 1 || Config.Actions.MaxPendingProposals < 1)
+	if (Config.Actions.MaxProposalItems < 0 || Config.Actions.BatchPerTick < 1 || Config.Actions.MaxPendingProposals < 1)
 	{
-		OutError = TEXT("actions.maxProposalItems, batchPerTick, and maxPendingProposals must be >= 1");
+		OutError = TEXT("actions.maxProposalItems must be >= 0 (0 = unlimited); batchPerTick and maxPendingProposals must be >= 1");
 		return false;
 	}
 

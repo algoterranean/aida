@@ -2,7 +2,7 @@
 
 namespace
 {
-	const TCHAR* kUsage = TEXT("AIDA commands: /aida undo [n] — reverse the last n AI actions (default 1).");
+	const TCHAR* kUsage = TEXT("AIDA commands: /aida undo [n] — reverse the last n AI actions; /aida approve [id] | /aida reject [id] — decide a pending proposal (no id = the newest one).");
 }
 
 bool AIDAChatCommands::TryParse(const FString& Text, FAIDAChatCommand& Out, FString& OutError)
@@ -38,6 +38,19 @@ bool AIDAChatCommands::TryParse(const FString& Text, FAIDAChatCommand& Out, FStr
 				return true;
 			}
 			Out.Count = Count;
+		}
+		return true;
+	}
+
+	if (Tokens.Num() >= 2 &&
+		(Tokens[1].Equals(TEXT("approve"), ESearchCase::IgnoreCase) || Tokens[1].Equals(TEXT("reject"), ESearchCase::IgnoreCase)))
+	{
+		Out.Kind = Tokens[1].Equals(TEXT("approve"), ESearchCase::IgnoreCase)
+			? FAIDAChatCommand::EKind::Approve : FAIDAChatCommand::EKind::Reject;
+		if (Tokens.Num() >= 3 && !FGuid::Parse(Tokens[2], Out.ProposalId))
+		{
+			Out.Kind = FAIDAChatCommand::EKind::None;
+			OutError = TEXT("usage: /aida approve [proposalId] — omit the id to decide the newest pending proposal.");
 		}
 		return true;
 	}

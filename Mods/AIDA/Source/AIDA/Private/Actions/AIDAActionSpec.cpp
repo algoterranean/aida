@@ -101,7 +101,7 @@ bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 M
 		return false;
 	}
 	const int64 Total = static_cast<int64>(Parsed.Grid.CountX) * Parsed.Grid.CountY;
-	if (Total > MaxItems)
+	if (MaxItems > 0 && Total > MaxItems) // MaxItems 0 = unlimited
 	{
 		OutError = FString::Printf(TEXT("%lld placements exceeds the per-proposal cap of %d"), Total, MaxItems);
 		return false;
@@ -142,7 +142,7 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 		if (MaxCount < 1) { OutError = TEXT("'maxCount' must be >= 1"); return false; }
 		Parsed.MaxCount = MaxCount;
 	}
-	Parsed.MaxCount = FMath::Min(Parsed.MaxCount, MaxItems);
+	if (MaxItems > 0) { Parsed.MaxCount = FMath::Min(Parsed.MaxCount, MaxItems); } // 0 = unlimited
 
 	Out = MoveTemp(Parsed);
 	return true;

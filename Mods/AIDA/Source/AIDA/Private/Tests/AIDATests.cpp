@@ -1455,6 +1455,9 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x", "origin": { "x": 0, "y": 0 },
 			                            "grid": { "countX": 20, "countY": 20 } })")), 200, Spec, Error));
 		TestTrue(TEXT("cap error names the cap"), Error.Contains(TEXT("200")));
+		TestTrue(TEXT("cap 0 = unlimited"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "x", "origin": { "x": 0, "y": 0 },
+			                            "grid": { "countX": 50, "countY": 50 } })")), 0, Spec, Error));
 	}
 
 	// Omitted origin/center = "at the player" (the tool fills it from the requester's location).
@@ -1733,6 +1736,21 @@ bool FAIDAChatCommandsTest::RunTest(const FString&)
 	TestTrue(TEXT("undo n"), AIDAChatCommands::TryParse(TEXT("  /AIDA UNDO 3  "), Cmd, Error));
 	TestTrue(TEXT("undo n kind"), Cmd.Kind == FAIDAChatCommand::EKind::Undo);
 	TestEqual(TEXT("undo n count"), Cmd.Count, 3);
+
+	// /aida approve / reject, with and without an explicit proposal id.
+	TestTrue(TEXT("approve"), AIDAChatCommands::TryParse(TEXT("/aida approve"), Cmd, Error));
+	TestTrue(TEXT("approve kind"), Cmd.Kind == FAIDAChatCommand::EKind::Approve);
+	TestFalse(TEXT("approve default id unset"), Cmd.ProposalId.IsValid());
+
+	const FGuid KnownId = FGuid::NewGuid();
+	TestTrue(TEXT("reject with id"), AIDAChatCommands::TryParse(
+		FString::Printf(TEXT("/aida reject %s"), *KnownId.ToString(EGuidFormats::DigitsWithHyphens)), Cmd, Error));
+	TestTrue(TEXT("reject kind"), Cmd.Kind == FAIDAChatCommand::EKind::Reject);
+	TestEqual(TEXT("reject id parsed"), Cmd.ProposalId, KnownId);
+
+	TestTrue(TEXT("approve bad id intercepts"), AIDAChatCommands::TryParse(TEXT("/aida approve nonsense"), Cmd, Error));
+	TestTrue(TEXT("approve bad id -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
+	TestFalse(TEXT("approve bad id has usage"), Error.IsEmpty());
 
 	// Malformed/unknown commands still short-circuit, carrying usage text.
 	TestTrue(TEXT("bad count intercepts"), AIDAChatCommands::TryParse(TEXT("/aida undo zero"), Cmd, Error));

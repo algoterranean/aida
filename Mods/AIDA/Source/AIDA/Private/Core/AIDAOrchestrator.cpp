@@ -108,7 +108,11 @@ namespace
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
-		"/aida undo (or /aida undo N) in this chat.\n\n"
+		"/aida undo (or /aida undo N) in this chat. Players decide proposals with the on-screen card or "
+		"/aida approve, /aida reject.\n"
+		"CRITICAL: a proposal exists ONLY when a propose_* call in THIS turn returned a proposalId. Never "
+		"announce a proposal, cost, or 'awaiting approval' without that tool result — if you did not call "
+		"the tool, or it returned an error, say exactly that instead. Never invent costs or ids.\n\n"
 		"Conventions: rates are items per minute (fluids in m3/min); coordinates are in metres; cluster ids "
 		"come from get_factory_overview. When a question is about production, shortages, bottlenecks, or "
 		"resources, call a tool first and answer from the real numbers it returns.\n\n"
@@ -346,6 +350,33 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 		if (Command.Kind == FAIDAChatCommand::EKind::None)
 		{
 			Session->PostSystemMessage(CommandError, ConversationId);
+			return;
+		}
+
+		// Approve/Reject a pending proposal from chat (the same double-gated path as the UI buttons).
+		if (Command.Kind == FAIDAChatCommand::EKind::Approve || Command.Kind == FAIDAChatCommand::EKind::Reject)
+		{
+			FGuid Target = Command.ProposalId;
+			if (!Target.IsValid())
+			{
+				// No id = the newest pending proposal.
+				SweepProposals();
+				int64 NewestUtc = -1;
+				for (const FAIDAProposal& Proposal : Actions.Store().All())
+				{
+					if (Proposal.State == EAIDAProposalState::Pending && Proposal.ProposedUtc > NewestUtc)
+					{
+						NewestUtc = Proposal.ProposedUtc;
+						Target = Proposal.Id;
+					}
+				}
+			}
+			if (!Target.IsValid())
+			{
+				Session->PostSystemMessage(TEXT("No pending proposal to decide."), ConversationId);
+				return;
+			}
+			HandleProposalDecision(Requester, Target, Command.Kind == FAIDAChatCommand::EKind::Approve);
 			return;
 		}
 

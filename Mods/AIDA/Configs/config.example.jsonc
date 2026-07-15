@@ -33,7 +33,7 @@
     "enabled": true,                              // master kill-switch; off => propose_* tools not registered
     "ttlSeconds": 600,                            // proposal time-to-live awaiting approval
     "approvalPolicy": "any-act",                  // "any-act" | "requester" | ["<epic-account-id>", ...]
-    "maxProposalItems": 200,                      // hard cap on placements per proposal
+    "maxProposalItems": 0,                        // cap on placements per proposal; 0 = unlimited
     "maxPendingProposals": 3,
     "batchPerTick": 10,                           // executor slice size (10 Hz)
     "undoWindow": 25,                             // how far back /aida undo may reach

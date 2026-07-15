@@ -74,8 +74,8 @@ struct FAIDAActionsConfig
 	/** "any-act" | "requester" | "list" (set when the JSON value is an id array → ApprovalIds). */
 	UPROPERTY() FString ApprovalPolicy = TEXT("any-act");
 	UPROPERTY() TArray<FString> ApprovalIds;
-	/** Hard cap on expanded placements per proposal. */
-	UPROPERTY() int32 MaxProposalItems = 200;
+	/** Cap on expanded placements per proposal; 0 = unlimited (the default). */
+	UPROPERTY() int32 MaxProposalItems = 0;
 	UPROPERTY() int32 MaxPendingProposals = 3;
 	/** Executor slice size per 10 Hz tick. */
 	UPROPERTY() int32 BatchPerTick = 10;
