@@ -46,6 +46,20 @@ struct FAIDABuildSpec
 	FAIDAGridSpec Grid;
 	/** Default false = a FLAT grid at the origin's height; true = each tile drops to its own terrain. */
 	bool bFollowTerrain = false;
+	/** Auto-power (docs/PHASE4-POWER.md): default true — powered buildables get poles + power lines
+	 *  + a grid tie-in as part of the proposal. "power": false opts out. */
+	bool bPower = true;
+	/** Optional pole display-name override; "" = the lowest unlocked mk. */
+	FString Pole;
+};
+
+/** PlanPower output (docs/PHASE4-POWER.md §3): pole transforms + wire index pairs, pure geometry. */
+struct FAIDAPowerPlan
+{
+	TArray<FTransform> Poles;
+	TArray<FIntPoint> MachineWires;  // X = machine placement index, Y = pole index
+	TArray<FIntPoint> ChainWires;    // pole index -> pole index (consecutive chain)
+	FString Error;                   // non-empty = plan failed (degenerate inputs)
 };
 
 /** propose_dismantle selector v1. */
@@ -214,5 +228,15 @@ struct FAIDAProposal
 	TArray<FAIDAManifoldPort> Ports;       // index-aligned with Placements (plan-sorted)
 	FVector RowAxis = FVector::XAxisVector;
 	FVector DropDir = FVector::ZeroVector; // unit, from each attachment toward its machine
-	int32 Phase = 0;                       // executor: 0 = attachments, 1 = trunk runs, 2 = drop runs
+	int32 Phase = 0;                       // executor: 0 = attachments/machines, then kind-specific
+
+	//~ Auto-power extensions (docs/PHASE4-POWER.md). Powered builds run phases 0 machines →
+	//  1 poles → 2 wires + grid tie. Empty/false = a plain (or manifold) proposal.
+	bool bAutoPower = false;
+	TArray<FTransform> PolePlacements;
+	FString PoleRecipePath;
+	FString PoleName;
+	FString WireRecipePath;
+	TArray<FIntPoint> MachineWires;        // (machine placement idx, pole idx)
+	TArray<FIntPoint> ChainWires;          // (pole idx, pole idx)
 };

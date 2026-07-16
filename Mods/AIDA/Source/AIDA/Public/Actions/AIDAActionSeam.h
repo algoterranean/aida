@@ -163,4 +163,49 @@ public:
 		AActor* FromActor, const FVector& FromWantDir, AActor* ToActor, const FVector& ToWantDir,
 		bool bChargeCost, TArray<FAIDACostItem>& OutCost,
 		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
+
+	//~ Auto-power (docs/PHASE4-POWER.md).
+
+	/** Resolved power kit for an auto-powered build: pole recipe (lowest unlocked mk or the
+	 *  override), its connection cap, and the Power Line recipe. */
+	struct FAIDAPowerInfo
+	{
+		bool bMachineNeedsPower = false;   // the machine CDO has a power connection
+		FString PoleRecipePath;
+		FString PoleName;
+		int32 PoleConnectionCap = 4;       // mk.1's cap = the conservative fallback
+		FString WireRecipePath;
+		FString WireName;
+	};
+
+	/**
+	 * Does this recipe's buildable need power, and what do we wire it with? Pole candidates resolve
+	 * lowest-unlocked-first ("Power Pole Mk.1" → Mk.2 → Mk.3), or just the override when given; the
+	 * cap comes from the pole CDO's power connection. False = machine needs no power OR no pole/
+	 * wire recipe is unlocked (OutError says which).
+	 */
+	static bool ResolveAutoPower(UObject* WorldContext, const FString& MachineRecipePath,
+		const FString& PoleOverrideName, FAIDAPowerInfo& Out, FString& OutError);
+
+	/** Can central storage cover this WHOLE tally right now? (Merged machine+pole affordability.) */
+	static bool CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost);
+
+	/**
+	 * Spawn one power line between two live actors' circuit connections and Connect() both ends —
+	 * wires never hologram-snap (the belt lesson, docs/PHASE4-MANIFOLDS.md §5). Endpoints pick the
+	 * first power connection WITH FREE CAPACITY on each actor (poles expose several); the wire is
+	 * recipe-stamped for dismantle refunds, length-priced, and charged from central storage when
+	 * bChargeCost. False = nothing spawned (capacity, endpoints gone, unaffordable — OutError).
+	 */
+	static bool BuildWire(UObject* WorldContext, const FString& WireRecipePath,
+		AActor* A, AActor* B, bool bChargeCost, TArray<FAIDACostItem>& OutCost,
+		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
+
+	/**
+	 * The nearest EXTERNAL circuit connection with a free slot within RangeCm of any given pole
+	 * (existing power poles preferred, then any powered buildable), excluding the poles themselves.
+	 * Returns the external actor + which of our poles to tie from; false = nothing in reach.
+	 */
+	static bool FindGridTie(UObject* WorldContext, const TArray<TWeakObjectPtr<AActor>>& OurPoles,
+		double RangeCm, AActor*& OutExternal, int32& OutPoleIndex);
 };

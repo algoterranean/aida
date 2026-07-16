@@ -80,6 +80,9 @@ bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 M
 	Parsed.YawDeg = SnapYaw(Yaw);
 
 	Spec->TryGetBoolField(TEXT("followTerrain"), Parsed.bFollowTerrain);
+	Spec->TryGetBoolField(TEXT("power"), Parsed.bPower); // default true (docs/PHASE4-POWER.md)
+	Spec->TryGetStringField(TEXT("pole"), Parsed.Pole);
+	Parsed.Pole = Parsed.Pole.TrimStartAndEnd();
 
 	const TSharedPtr<FJsonObject>* Grid = nullptr;
 	if (Spec->TryGetObjectField(TEXT("grid"), Grid) && Grid)
@@ -329,6 +332,51 @@ FAIDAManifoldPlan AIDAActionSpec::PlanManifold(const TArray<FAIDAManifoldPortPoi
 		Plan.PortOrder.Add(Order[i]);
 	}
 
+	return Plan;
+}
+
+FAIDAPowerPlan AIDAActionSpec::PlanPower(int32 CountX, int32 CountY, double StepXCm, double StepYCm, int32 YawDeg,
+	const FVector& OriginCm, int32 MachinesPerPole)
+{
+	FAIDAPowerPlan Plan;
+	if (CountX < 1 || CountY < 1 || StepXCm <= 0.0 || StepYCm <= 0.0)
+	{
+		Plan.Error = TEXT("degenerate grid for power planning");
+		return Plan;
+	}
+	const int32 PerPole = FMath::Max(1, MachinesPerPole);
+
+	// The grid's own axes (ExpandGrid's math) so the pole rows rotate with the build.
+	const double YawRad = FMath::DegreesToRadians(static_cast<double>(YawDeg));
+	const FVector AxisX(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.0);
+	const FVector AxisY(-FMath::Sin(YawRad), FMath::Cos(YawRad), 0.0);
+	const FRotator Rotation(0.0, static_cast<double>(YawDeg), 0.0);
+
+	for (int32 IY = 0; IY < CountY; ++IY)
+	{
+		// Poles sit half a step OFF the row line — between this row and the next, so one lane of
+		// poles serves the walkway; the last row of a multi-row grid folds back onto the previous
+		// gap instead of jutting past the grid's edge — STAGGERED half a step along the row, or its
+		// poles would land exactly on the previous row's (identical-overlap rejection).
+		const bool bFoldBack = CountY > 1 && IY == CountY - 1;
+		const double SideSign = bFoldBack ? -0.5 : 0.5;
+		const double XStagger = bFoldBack ? 0.5 : 0.0;
+		for (int32 IX0 = 0; IX0 < CountX; IX0 += PerPole)
+		{
+			const int32 IX1 = FMath::Min(IX0 + PerPole, CountX); // exclusive
+			const double MidX = (IX0 + IX1 - 1) * 0.5 + XStagger;
+			const FVector Center = OriginCm + AxisX * (MidX * StepXCm) + AxisY * ((IY + SideSign) * StepYCm);
+			const int32 PoleIdx = Plan.Poles.Emplace(Rotation, Center);
+			for (int32 IX = IX0; IX < IX1; ++IX)
+			{
+				Plan.MachineWires.Emplace(IY * CountX + IX, PoleIdx);
+			}
+		}
+	}
+	for (int32 i = 0; i + 1 < Plan.Poles.Num(); ++i)
+	{
+		Plan.ChainWires.Emplace(i, i + 1);
+	}
 	return Plan;
 }
 

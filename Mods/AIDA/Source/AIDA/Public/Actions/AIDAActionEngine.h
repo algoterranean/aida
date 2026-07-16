@@ -84,6 +84,13 @@ private:
 	 */
 	bool TickManifold(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 
+	/**
+	 * Advance an auto-powered build (docs/PHASE4-POWER.md): phase 0 machines, phase 1 poles (both
+	 * index-captured), phase 2 power lines (batched per tick) + one grid tie-in. Wire failures use
+	 * the same counted-and-announced report as manifold runs. True while more work remains.
+	 */
+	bool TickPowered(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
+
 	/** One journal entry queued for reversal. */
 	struct FUndoJob
 	{
@@ -112,9 +119,12 @@ private:
 	int32 RemovedCount = 0;
 	int32 MissingCount = 0;
 
-	//~ Manifold scratch: attachments captured PER PLACEMENT INDEX (null = skipped/lost — its runs
-	//  then fail loudly instead of silently re-mapping to a neighbor).
+	//~ Manifold/powered-build scratch: phase-0 actors captured PER PLACEMENT INDEX (null = skipped/
+	//  lost — dependent runs/wires then fail loudly instead of silently re-mapping to a neighbor).
+	//  Manifolds: the attachments. Powered builds: the machines.
 	TArray<TWeakObjectPtr<AActor>> AttachmentActors;
+	//~ Powered-build scratch: phase-1 poles, per placement index.
+	TArray<TWeakObjectPtr<AActor>> PoleActors;
 	int32 RunBuiltCount = 0;
 	int32 RunFailCount = 0;
 	TArray<FString> RunFailures; // first few human-readable reasons for the outcome announcement

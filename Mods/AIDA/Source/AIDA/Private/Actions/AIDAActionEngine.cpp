@@ -105,6 +105,7 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 	BuiltActors.Reset();
 	AccruedRefund.Reset();
 	AttachmentActors.Reset();
+	PoleActors.Reset();
 	RunFailures.Reset();
 	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 	Proposal->Cursor = 0;
@@ -151,8 +152,11 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		return false;
 	}
 
-	// Transform a copy; the original survives an invalid adjustment untouched.
+	// Transform a copy; the original survives an invalid adjustment untouched. Auto-power pole
+	// placements ride along with the SAME transform (same rotation centroid — the machines') so a
+	// nudged grid keeps its pole lanes; the wire pairs are index-based and move with them.
 	TArray<FTransform> Adjusted = Proposal->Placements;
+	TArray<FTransform> AdjustedPoles = Proposal->PolePlacements;
 	if (YawDeltaDeg != 0 && Adjusted.Num() > 0)
 	{
 		FVector Centroid = FVector::ZeroVector;
@@ -160,17 +164,23 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		Centroid /= Adjusted.Num();
 
 		const FRotator Delta(0.0, static_cast<double>(YawDeltaDeg), 0.0);
-		for (FTransform& Placement : Adjusted)
+		const auto Rotate = [&](FTransform& Placement)
 		{
 			Placement.SetLocation(Centroid + Delta.RotateVector(Placement.GetLocation() - Centroid));
 			FRotator Rotation = Placement.Rotator();
 			Rotation.Yaw += YawDeltaDeg;
 			Placement.SetRotation(FQuat(Rotation));
-		}
+		};
+		for (FTransform& Placement : Adjusted) { Rotate(Placement); }
+		for (FTransform& Placement : AdjustedPoles) { Rotate(Placement); }
 	}
 	if (!DeltaCm.IsNearlyZero())
 	{
 		for (FTransform& Placement : Adjusted)
+		{
+			Placement.SetLocation(Placement.GetLocation() + DeltaCm);
+		}
+		for (FTransform& Placement : AdjustedPoles)
 		{
 			Placement.SetLocation(Placement.GetLocation() + DeltaCm);
 		}
@@ -188,6 +198,7 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 	}
 
 	Proposal->Placements = MoveTemp(Adjusted);
+	Proposal->PolePlacements = MoveTemp(AdjustedPoles);
 	OutMessage = YawDeltaDeg != 0
 		? FString::Printf(TEXT("rotated %d° — %s"), YawDeltaDeg, *Proposal->Summary)
 		: FString::Printf(TEXT("nudged %.1f m — %s"), DeltaCm.Size() / 100.0, *Proposal->Summary);
@@ -214,6 +225,10 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 	if (Proposal->bManifold)
 	{
 		return TickManifold(WorldContext, Config, Memory, *Proposal);
+	}
+	if (Proposal->bAutoPower && !Proposal->bDismantle)
+	{
+		return TickPowered(WorldContext, Config, Memory, *Proposal);
 	}
 
 	if (Proposal->bDismantle)
@@ -336,6 +351,108 @@ bool FAIDAActionEngine::TickManifold(UObject* WorldContext, const FAIDAActionsCo
 	return false;
 }
 
+bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
+{
+	const int32 Batch = FMath::Max(1, Config.BatchPerTick);
+
+	// Phase 0 — the machines themselves, per-index captured for the wiring phase.
+	if (Proposal.Phase == 0)
+	{
+		int32 Skipped = 0;
+		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.RecipeClassPath,
+			Proposal.Placements, Proposal.Cursor, Batch,
+			Proposal.AffectedEntityIds, BuiltActors, Skipped, &AttachmentActors);
+		SkippedCount += Skipped;
+		if (Proposal.Cursor < Proposal.Placements.Num()) { return true; }
+		Proposal.Phase = 1;
+		Proposal.Cursor = 0;
+		return true;
+	}
+
+	// Phase 1 — the pole lane(s). A pole that fails re-validation is skipped; its machines' wires
+	// then fail loudly below instead of silently going nowhere.
+	if (Proposal.Phase == 1)
+	{
+		int32 Skipped = 0;
+		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.PoleRecipePath,
+			Proposal.PolePlacements, Proposal.Cursor, Batch,
+			Proposal.AffectedEntityIds, BuiltActors, Skipped, &PoleActors);
+		SkippedCount += Skipped;
+		if (Proposal.Cursor < Proposal.PolePlacements.Num()) { return true; }
+		Proposal.Phase = 2;
+		Proposal.Cursor = 0;
+		return true;
+	}
+
+	// Phase 2 — power lines (machine→pole, then the pole chain), batched; then ONE grid tie-in.
+	const auto ActorAt = [](const TArray<TWeakObjectPtr<AActor>>& Arr, int32 Index) -> AActor*
+	{
+		return Arr.IsValidIndex(Index) ? Arr[Index].Get() : nullptr;
+	};
+	const auto WireOne = [&](AActor* A, AActor* B, const TCHAR* What, int32 Index) -> bool
+	{
+		if (!A || !B)
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("%s wire %d: endpoint missing (machine or pole skipped)"), What, Index));
+			}
+			return false;
+		}
+		TArray<FAIDACostItem> Cost;
+		FString Error;
+		if (FAIDAActionSeam::BuildWire(WorldContext, Proposal.WireRecipePath, A, B,
+			Config.CostMode == TEXT("central"), Cost, Proposal.AffectedEntityIds, BuiltActors, Error))
+		{
+			MergeCost(Proposal.Cost, Cost);
+			++RunBuiltCount;
+			return true;
+		}
+		++RunFailCount;
+		if (RunFailures.Num() < 5)
+		{
+			RunFailures.Add(FString::Printf(TEXT("%s wire %d: %s"), What, Index, *Error));
+		}
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] %s wire %d failed: %s"), What, Index, *Error);
+		return false;
+	};
+
+	const int32 TotalWires = Proposal.MachineWires.Num() + Proposal.ChainWires.Num();
+	int32 DoneThisTick = 0;
+	while (Proposal.Cursor < TotalWires && DoneThisTick < Batch)
+	{
+		const int32 Index = Proposal.Cursor++;
+		++DoneThisTick;
+		if (Index < Proposal.MachineWires.Num())
+		{
+			const FIntPoint& Pair = Proposal.MachineWires[Index];
+			WireOne(ActorAt(AttachmentActors, Pair.X), ActorAt(PoleActors, Pair.Y), TEXT("machine"), Index);
+		}
+		else
+		{
+			const FIntPoint& Pair = Proposal.ChainWires[Index - Proposal.MachineWires.Num()];
+			WireOne(ActorAt(PoleActors, Pair.X), ActorAt(PoleActors, Pair.Y), TEXT("chain"), Index);
+		}
+	}
+	if (Proposal.Cursor < TotalWires) { return true; }
+
+	// The grid tie: one line from an end pole to the nearest external circuit with a free slot.
+	AActor* External = nullptr;
+	int32 FromPole = INDEX_NONE;
+	if (FAIDAActionSeam::FindGridTie(WorldContext, PoleActors, /*RangeCm*/ 10000.0, External, FromPole))
+	{
+		WireOne(ActorAt(PoleActors, FromPole), External, TEXT("grid tie"), 0);
+	}
+	else if (Proposal.PolePlacements.Num() > 0)
+	{
+		RunReport.Add(TEXT("no existing power grid within 100 m — connect the feed line manually"));
+	}
+
+	FinishExecution(WorldContext, Config, Memory, Proposal);
+	return false;
+}
+
 void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
 {
 	// Dismantle refunds pay out to the approver's inventory (central storage has no deposit API).
@@ -367,16 +484,19 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed, NowUtc);
 
 	const int32 Affected = Proposal.AffectedEntityIds.Num();
-	if (Proposal.bManifold)
+	if (Proposal.bManifold || Proposal.bAutoPower)
 	{
-		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (manifold): %d attachment(s) (%d skipped), %d run(s) built, %d run(s) failed (journal %s)."),
-			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens),
-			Proposal.Placements.Num() - SkippedCount, SkippedCount, RunBuiltCount, RunFailCount,
+		const TCHAR* Kind = Proposal.bManifold ? TEXT("manifold") : TEXT("power");
+		const TCHAR* Piece = Proposal.bManifold ? TEXT("run") : TEXT("wire");
+		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (%s): %d placement(s) (%d skipped), %d %s(s) built, %d %s(s) failed (journal %s)."),
+			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), Kind,
+			Proposal.Placements.Num() + Proposal.PolePlacements.Num() - SkippedCount, SkippedCount,
+			RunBuiltCount, Piece, RunFailCount, Piece,
 			*JournalId.ToString(EGuidFormats::DigitsWithHyphens));
 		if (SkippedCount > 0 || RunFailCount > 0)
 		{
-			RunReport.Add(FString::Printf(TEXT("manifold: %d attachment(s) skipped, %d of %d run(s) failed to connect"),
-				SkippedCount, RunFailCount, RunBuiltCount + RunFailCount));
+			RunReport.Add(FString::Printf(TEXT("%s: %d placement(s) skipped, %d of %d %s(s) failed to connect"),
+				Kind, SkippedCount, RunFailCount, RunBuiltCount + RunFailCount, Piece));
 			RunReport.Append(RunFailures);
 		}
 	}
@@ -403,6 +523,7 @@ void FAIDAActionEngine::ResetScratch()
 	BuiltActors.Reset();
 	AccruedRefund.Reset();
 	AttachmentActors.Reset();
+	PoleActors.Reset();
 	RunFailures.Reset();
 	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 }

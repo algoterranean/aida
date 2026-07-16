@@ -1071,7 +1071,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. Grids are FLAT at the origin's height by default; set followTerrain:true ONLY if the player asks to follow/trace the ground. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps."),
+		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. Grids are FLAT at the origin's height by default; set followTerrain:true ONLY if the player asks to follow/trace the ground. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps. Machines that need power are wired AUTOMATICALLY: power poles (lowest unlocked mk, or pole:'display name' to override) spread through the grid, power lines to every machine, and a tie-in to the nearest existing grid — set power:false only when the player says to skip power."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -1172,6 +1172,73 @@ void UAIDAOrchestrator::RegisterActionTools()
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
 
+			// Auto-power (docs/PHASE4-POWER.md): powered buildables get poles + power lines + a grid
+			// tie by default. Failure to assemble the kit NEVER fails the build — it's reported and
+			// the machines go up unwired.
+			FAIDAActionSeam::FAIDAPowerInfo Power;
+			FAIDAPowerPlan PowerPlan;
+			FAIDADryRunResult PoleDryRun;
+			FString PowerNote;
+			bool bAutoPower = false;
+			if (Spec.bPower && Placements.Num() > 0)
+			{
+				FString PowerError;
+				if (FAIDAActionSeam::ResolveAutoPower(this, Recipe.RecipeClassPath, Spec.Pole, Power, PowerError))
+				{
+					const double EffStepXCm = FMath::Max(Spec.Grid.StepXM, Recipe.FootprintXM) * 100.0;
+					const double EffStepYCm = FMath::Max(Spec.Grid.StepYM, Recipe.FootprintYM) * 100.0;
+					PowerPlan = AIDAActionSpec::PlanPower(Spec.Grid.CountX, Spec.Grid.CountY,
+						EffStepXCm, EffStepYCm, Spec.YawDeg, Placements[0].GetLocation(),
+						FMath::Max(1, Power.PoleConnectionCap - 2));
+					if (PowerPlan.Error.IsEmpty() && PowerPlan.Poles.Num() > 0)
+					{
+						for (FTransform& Pole : PowerPlan.Poles)
+						{
+							double GroundZ;
+							if (FAIDAActionSeam::ProbeGroundZ(this, Pole.GetLocation(), GroundZ))
+							{
+								FVector Location = Pole.GetLocation();
+								Location.Z = GroundZ;
+								Pole.SetLocation(Location);
+							}
+						}
+						// Pole dry-run: cost tally + validation. Hard-invalid poles are NOT fatal —
+						// they get skipped at execute and their wires report loudly.
+						FAIDAActionSeam::DryRunBuild(this, Power.PoleRecipePath, PowerPlan.Poles, PoleDryRun);
+						bAutoPower = true;
+					}
+				}
+				else if (Power.bMachineNeedsPower)
+				{
+					PowerNote = FString::Printf(TEXT(" [no power kit: %s — machines left unwired]"), *PowerError);
+				}
+			}
+
+			// Merged affordability (machines + poles) against central storage.
+			TArray<FAIDACostItem> TotalCost = DryRun.Cost;
+			if (bAutoPower)
+			{
+				for (const FAIDACostItem& Item : PoleDryRun.Cost)
+				{
+					bool bMerged = false;
+					for (FAIDACostItem& Existing : TotalCost)
+					{
+						if (Existing.Item == Item.Item) { Existing.Amount += Item.Amount; bMerged = true; break; }
+					}
+					if (!bMerged) { TotalCost.Add(Item); }
+				}
+				if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, TotalCost))
+				{
+					FString Msg = TEXT("not affordable from central storage with the power kit included: needs ");
+					for (int32 i = 0; i < TotalCost.Num(); ++i)
+					{
+						Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), TotalCost[i].Amount, *TotalCost[i].Item);
+					}
+					Msg += TEXT(" — or retry with power:false");
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+				}
+			}
+
 			FAIDAProposal Proposal;
 			Proposal.Id = FGuid::NewGuid(); // minted here so the report below carries the real id
 			Proposal.SpecJson = AIDAToCompactJson(SpecObj->ToSharedRef());
@@ -1179,8 +1246,21 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.RequesterName = Ctx.Author;
 			Proposal.Placements = Placements;
 			Proposal.RecipeClassPath = Recipe.RecipeClassPath;
-			Proposal.Cost = DryRun.Cost;
+			Proposal.Cost = MoveTemp(TotalCost);
 			Proposal.Summary = AIDAActionSpec::SummarizeBuild(Spec);
+			if (bAutoPower)
+			{
+				Proposal.bAutoPower = true;
+				Proposal.PolePlacements = MoveTemp(PowerPlan.Poles);
+				Proposal.PoleRecipePath = Power.PoleRecipePath;
+				Proposal.PoleName = Power.PoleName;
+				Proposal.WireRecipePath = Power.WireRecipePath;
+				Proposal.MachineWires = MoveTemp(PowerPlan.MachineWires);
+				Proposal.ChainWires = MoveTemp(PowerPlan.ChainWires);
+				Proposal.Summary += FString::Printf(TEXT(" + %d x %s + wiring"),
+					Proposal.PolePlacements.Num(), *Power.PoleName);
+			}
+			Proposal.Summary += PowerNote;
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))

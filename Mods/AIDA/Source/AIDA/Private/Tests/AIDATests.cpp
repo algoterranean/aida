@@ -1643,6 +1643,62 @@ bool FAIDAActionsManifoldTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsPowerPlanTest, "AIDA.Actions.PowerPlan",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsPowerPlanTest::RunTest(const FString&)
+{
+	// 4x2 grid, 8 m steps, 2 machines per pole (mk.1) → 2 poles per row, every machine wired,
+	// consecutive chain. Row 0 poles sit half a step BELOW+ (between the rows); the last row folds
+	// back onto the same gap, staggered half a step along X so nothing overlaps exactly.
+	{
+		const FAIDAPowerPlan Plan = AIDAActionSpec::PlanPower(4, 2, 800.0, 800.0, 0, FVector::ZeroVector, 2);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		if (!TestEqual(TEXT("pole count"), Plan.Poles.Num(), 4)) { return false; }
+		TestEqual(TEXT("every machine wired"), Plan.MachineWires.Num(), 8);
+		TestEqual(TEXT("chain links"), Plan.ChainWires.Num(), 3);
+		TestTrue(TEXT("row-0 pole between machines 0+1, off the row"),
+			Plan.Poles[0].GetLocation().Equals(FVector(400.0, 400.0, 0.0), 0.1));
+		TestTrue(TEXT("last row folds back staggered"),
+			Plan.Poles[2].GetLocation().Equals(FVector(800.0, 400.0, 0.0), 0.1));
+		TestEqual(TEXT("machine 0 -> pole 0"), Plan.MachineWires[0], FIntPoint(0, 0));
+		TestEqual(TEXT("machine 3 -> pole 1"), Plan.MachineWires[3], FIntPoint(3, 1));
+		TestEqual(TEXT("chain 0-1"), Plan.ChainWires[0], FIntPoint(0, 1));
+	}
+
+	// Single row, big group: one pole at the row's middle, offset to the side.
+	{
+		const FAIDAPowerPlan Plan = AIDAActionSpec::PlanPower(3, 1, 800.0, 800.0, 0, FVector::ZeroVector, 8);
+		if (!TestEqual(TEXT("single pole"), Plan.Poles.Num(), 1)) { return false; }
+		TestTrue(TEXT("pole at row middle, offset"),
+			Plan.Poles[0].GetLocation().Equals(FVector(800.0, 400.0, 0.0), 0.1));
+		TestEqual(TEXT("no chain"), Plan.ChainWires.Num(), 0);
+	}
+
+	// Yaw rotates the pole lane with the grid.
+	{
+		const FAIDAPowerPlan Plan = AIDAActionSpec::PlanPower(2, 1, 800.0, 800.0, 90, FVector::ZeroVector, 2);
+		if (!TestEqual(TEXT("rotated pole count"), Plan.Poles.Num(), 1)) { return false; }
+		TestTrue(TEXT("rotated pole position"),
+			Plan.Poles[0].GetLocation().Equals(FVector(-400.0, 400.0, 0.0), 0.1));
+	}
+
+	// Spec parse: power defaults true; explicit opt-out + pole override.
+	{
+		FAIDABuildSpec Spec;
+		FString Error;
+		TestTrue(TEXT("parses"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "Smelter" })")), 200, Spec, Error));
+		TestTrue(TEXT("power defaults on"), Spec.bPower);
+		TestTrue(TEXT("no pole override"), Spec.Pole.IsEmpty());
+
+		TestTrue(TEXT("opt-out parses"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "Smelter", "power": false, "pole": "Power Pole Mk.3" })")), 200, Spec, Error));
+		TestFalse(TEXT("power off"), Spec.bPower);
+		TestEqual(TEXT("pole override kept"), Spec.Pole, TEXT("Power Pole Mk.3"));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsProposalStoreTest, "AIDA.Actions.ProposalStore",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAActionsProposalStoreTest::RunTest(const FString&)

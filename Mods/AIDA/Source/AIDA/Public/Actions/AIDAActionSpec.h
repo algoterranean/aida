@@ -41,6 +41,15 @@ namespace AIDAActionSpec
 	FAIDAManifoldPlan PlanManifold(const TArray<FAIDAManifoldPortPoint>& Ports, bool bOutput, bool bPipe,
 		double StandoffM, double FootprintM, double MaxRunM);
 
+	/**
+	 * Plan the power layout for a row-major machine grid (docs/PHASE4-POWER.md, pure geometry):
+	 * chunks of MachinesPerPole per row get one pole at the chunk's midpoint, half a step off the
+	 * row line (between rows; the last row of a multi-row grid folds back), plus machine→pole wire
+	 * pairs and a consecutive pole chain. Yaw follows the grid.
+	 */
+	FAIDAPowerPlan PlanPower(int32 CountX, int32 CountY, double StepXCm, double StepYCm, int32 YawDeg,
+		const FVector& OriginCm, int32 MachinesPerPole);
+
 	/** 8-way compass name for a world direction (game convention: north = -Y, east = +X). */
 	FString CompassName(const FVector& Dir);
 

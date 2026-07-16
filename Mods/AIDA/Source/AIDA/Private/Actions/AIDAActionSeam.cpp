@@ -18,6 +18,9 @@
 #include "FGCentralStorageSubsystem.h"
 #include "FGFactoryConnectionComponent.h"
 #include "FGPipeConnectionComponent.h"
+#include "FGPowerConnectionComponent.h"
+#include "Buildables/FGBuildablePowerPole.h"
+#include "Buildables/FGBuildableWire.h"
 #include "Hologram/FGConveyorBeltHologram.h"
 #include "Hologram/FGSplineHologram.h"
 #include "FGClearanceInterface.h"
@@ -1764,4 +1767,237 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 		OutActors.Add(Child);
 	}
 	return true;
+}
+
+namespace
+{
+	/** Recipe class path -> the AFGBuildable class its first product builds. */
+	TSubclassOf<AFGBuildable> BuildableClassFromRecipe(const FString& RecipeClassPath)
+	{
+		UClass* RecipeClass = FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>();
+		const TArray<FItemAmount> Products = RecipeClass ? UFGRecipe::GetProducts(RecipeClass) : TArray<FItemAmount>();
+		if (Products.Num() == 0 || !Products[0].ItemClass ||
+			!Products[0].ItemClass->IsChildOf(UFGBuildingDescriptor::StaticClass()))
+		{
+			return nullptr;
+		}
+		return UFGBuildingDescriptor::GetBuildableClass(TSubclassOf<UFGBuildingDescriptor>(Products[0].ItemClass.Get()));
+	}
+
+	/** First power connection on a live actor with a free wire slot (poles expose several). */
+	UFGPowerConnectionComponent* FindFreePowerConn(AActor* Actor)
+	{
+		TInlineComponentArray<UFGPowerConnectionComponent*> Connections;
+		Actor->GetComponents(Connections);
+		for (UFGPowerConnectionComponent* Conn : Connections)
+		{
+			if (Conn && Conn->GetNumFreeConnections() > 0) { return Conn; }
+		}
+		return nullptr;
+	}
+}
+
+bool FAIDAActionSeam::ResolveAutoPower(UObject* WorldContext, const FString& MachineRecipePath,
+	const FString& PoleOverrideName, FAIDAPowerInfo& Out, FString& OutError)
+{
+	Out = FAIDAPowerInfo();
+	OutError.Reset();
+
+	// Does the machine even need power? The CDO carries the native power connection.
+	const TSubclassOf<AFGBuildable> MachineClass = BuildableClassFromRecipe(MachineRecipePath);
+	const AFGBuildable* MachineCDO = MachineClass ? MachineClass->GetDefaultObject<AFGBuildable>() : nullptr;
+	if (!MachineCDO || !MachineCDO->FindComponentByClass<UFGPowerConnectionComponent>())
+	{
+		return false; // no power connection = nothing to wire (bMachineNeedsPower stays false)
+	}
+	Out.bMachineNeedsPower = true;
+
+	// The pole: the override, or the lowest UNLOCKED mk.
+	TArray<FString> PoleNames;
+	if (!PoleOverrideName.IsEmpty())
+	{
+		PoleNames.Add(PoleOverrideName);
+	}
+	else
+	{
+		PoleNames = { TEXT("Power Pole Mk.1"), TEXT("Power Pole Mk.2"), TEXT("Power Pole Mk.3") };
+	}
+	FAIDARecipeResolution Pole;
+	for (const FString& Candidate : PoleNames)
+	{
+		if (ResolveBuildRecipe(WorldContext, Candidate, Pole))
+		{
+			Out.PoleRecipePath = Pole.RecipeClassPath;
+			Out.PoleName = Pole.DisplayName;
+			break;
+		}
+	}
+	if (Out.PoleRecipePath.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("no unlocked power pole matches '%s'"), *FString::Join(PoleNames, TEXT("' / '")));
+		return false;
+	}
+
+	// Connection cap from the pole CDO (how many machines each pole can serve).
+	const TSubclassOf<AFGBuildable> PoleClass = BuildableClassFromRecipe(Out.PoleRecipePath);
+	const AFGBuildable* PoleCDO = PoleClass ? PoleClass->GetDefaultObject<AFGBuildable>() : nullptr;
+	if (PoleCDO)
+	{
+		TInlineComponentArray<UFGPowerConnectionComponent*> Connections;
+		PoleCDO->GetComponents(Connections);
+		int32 Cap = 0;
+		for (const UFGPowerConnectionComponent* Conn : Connections)
+		{
+			if (Conn) { Cap = FMath::Max(Cap, Conn->GetMaxNumConnections()); }
+		}
+		if (Cap > 0) { Out.PoleConnectionCap = Cap; }
+	}
+
+	FAIDARecipeResolution Wire;
+	if (!ResolveBuildRecipe(WorldContext, TEXT("Power Line"), Wire))
+	{
+		OutError = TEXT("the Power Line recipe is not unlocked/resolvable");
+		return false;
+	}
+	Out.WireRecipePath = Wire.RecipeClassPath;
+	Out.WireName = Wire.DisplayName;
+	return true;
+}
+
+bool FAIDAActionSeam::CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGCentralStorageSubsystem* Central = World ? AFGCentralStorageSubsystem::Get(World) : nullptr;
+	if (!Central) { return false; }
+	for (const FAIDACostItem& Item : Cost)
+	{
+		const TSubclassOf<UFGItemDescriptor> Descriptor = LoadDescriptor(Item.ClassPath);
+		if (!Descriptor || Central->GetNumItemsFromCentralStorage(Descriptor) < Item.Amount)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+bool FAIDAActionSeam::BuildWire(UObject* WorldContext, const FString& WireRecipePath,
+	AActor* A, AActor* B, bool bChargeCost, TArray<FAIDACostItem>& OutCost,
+	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError)
+{
+	OutCost.Reset();
+	OutError.Reset();
+
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World || !IsValid(A) || !IsValid(B)) { OutError = TEXT("wire endpoint no longer exists"); return false; }
+
+	UClass* WireRecipeClass = FSoftClassPath(WireRecipePath).TryLoadClass<UFGRecipe>();
+	const TSubclassOf<AFGBuildable> WireBuildableClass = BuildableClassFromRecipe(WireRecipePath);
+	if (!WireRecipeClass || !WireBuildableClass || !WireBuildableClass->IsChildOf(AFGBuildableWire::StaticClass()))
+	{
+		OutError = TEXT("wire recipe no longer resolves to a power line");
+		return false;
+	}
+
+	UFGPowerConnectionComponent* ConnA = FindFreePowerConn(A);
+	UFGPowerConnectionComponent* ConnB = FindFreePowerConn(B);
+	if (!ConnA) { OutError = FString::Printf(TEXT("no free power connection on %s"), *GetNameSafe(A)); return false; }
+	if (!ConnB) { OutError = FString::Printf(TEXT("no free power connection on %s"), *GetNameSafe(B)); return false; }
+
+	// Length-priced like belts/pipes (charged as built): the recipe's cost per ~10 m of line.
+	const double LengthCm = FVector::Dist(ConnA->GetComponentLocation(), ConnB->GetComponentLocation());
+	const int32 Multiplier = FMath::Max(1, FMath::CeilToInt32(LengthCm / 1000.0));
+	for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(World, WireRecipeClass))
+	{
+		AddCost(OutCost, Ingredient.ItemClass, Ingredient.Amount * Multiplier);
+	}
+	if (bChargeCost && !DeductCost(WorldContext, OutCost))
+	{
+		OutError = TEXT("central storage cannot afford this power line");
+		return false;
+	}
+
+	const FVector Mid = (ConnA->GetComponentLocation() + ConnB->GetComponentLocation()) * 0.5;
+	AFGBuildableWire* Wire = World->SpawnActor<AFGBuildableWire>(WireBuildableClass, FTransform(Mid));
+	if (!Wire)
+	{
+		OutError = TEXT("wire actor failed to spawn");
+		if (bChargeCost) { UE_LOG(LogAIDA, Error, TEXT("[actions] wire failed AFTER cost deduction — items lost.")); }
+		return false;
+	}
+	Wire->SetBuiltWithRecipe(WireRecipeClass); // dismantle refunds + journal re-resolution
+	if (!Wire->Connect(ConnA, ConnB))
+	{
+		OutError = TEXT("wire Connect() refused the endpoints");
+		Wire->Destroy();
+		if (bChargeCost) { UE_LOG(LogAIDA, Error, TEXT("[actions] wire failed AFTER cost deduction — items lost.")); }
+		return false;
+	}
+
+	FAIDAEntityId Entity;
+	Entity.Type = TEXT("actor");
+	Entity.ClassPath = Wire->GetClass()->GetPathName();
+	Entity.RecipePath = WireRecipePath;
+	Entity.Pos = Wire->GetActorLocation();
+	Entity.YawDeg = 0;
+	OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
+	OutActors.Add(Wire);
+	return true;
+}
+
+bool FAIDAActionSeam::FindGridTie(UObject* WorldContext, const TArray<TWeakObjectPtr<AActor>>& OurPoles,
+	double RangeCm, AActor*& OutExternal, int32& OutPoleIndex)
+{
+	OutExternal = nullptr;
+	OutPoleIndex = INDEX_NONE;
+
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem) { return false; }
+
+	TSet<AActor*> Ours;
+	TArray<TPair<int32, FVector>> PolePoints;
+	for (int32 i = 0; i < OurPoles.Num(); ++i)
+	{
+		if (AActor* Pole = OurPoles[i].Get())
+		{
+			Ours.Add(Pole);
+			PolePoints.Emplace(i, Pole->GetActorLocation());
+		}
+	}
+	if (PolePoints.Num() == 0) { return false; }
+
+	// Nearest EXTERNAL connection that is on a live circuit and has a free slot. Existing power
+	// poles are preferred over machines (that's where players expect the tie), wires excluded (they
+	// hold no connection components of their own). Our freshly wired machines exclude themselves —
+	// their single connection has no free slot left.
+	double BestPoleDistSq = FMath::Square(RangeCm);
+	double BestAnyDistSq = FMath::Square(RangeCm);
+	AActor* BestPole = nullptr; int32 BestPoleFrom = INDEX_NONE;
+	AActor* BestAny = nullptr; int32 BestAnyFrom = INDEX_NONE;
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (!IsValid(Buildable) || Ours.Contains(Buildable)) { continue; }
+		UFGPowerConnectionComponent* Conn = FindFreePowerConn(Buildable);
+		if (!Conn || !Conn->IsConnected()) { continue; } // must already be ON a circuit
+
+		for (const TPair<int32, FVector>& PolePoint : PolePoints)
+		{
+			const double DistSq = FVector::DistSquared(Buildable->GetActorLocation(), PolePoint.Value);
+			if (Buildable->IsA<AFGBuildablePowerPole>() && DistSq < BestPoleDistSq)
+			{
+				BestPoleDistSq = DistSq;
+				BestPole = Buildable;
+				BestPoleFrom = PolePoint.Key;
+			}
+			if (DistSq < BestAnyDistSq)
+			{
+				BestAnyDistSq = DistSq;
+				BestAny = Buildable;
+				BestAnyFrom = PolePoint.Key;
+			}
+		}
+	}
+	OutExternal = BestPole ? BestPole : BestAny;
+	OutPoleIndex = BestPole ? BestPoleFrom : BestAnyFrom;
+	return OutExternal != nullptr;
 }
