@@ -5,6 +5,8 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerState.h"
 #include "FGMapArea.h"
 #include "FGMapAreaTexture.h"
 #include "FGMapManager.h"
@@ -136,4 +138,50 @@ const TArray<FAIDAResourceNode>& FAIDAMapService::GetNodes(UObject* WorldContext
 		bValid = true;
 	}
 	return Cached;
+}
+
+bool FAIDAMapService::SpawnAttentionPing(UObject* WorldContext, const FString& PlayerId, const FVector& WorldLocation)
+{
+	UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
+	if (!World) { return false; }
+
+	// Same identity convention as everywhere else: the listen host's net id is null, so an empty
+	// requester id matches the controller whose net id string is also empty.
+	APlayerController* Requester = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		APlayerState* PS = PC ? PC->PlayerState : nullptr;
+		if (!PS) { continue; }
+		const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
+		const FString Id = NetId.IsValid() ? NetId->ToString() : FString();
+		if (Id == PlayerId)
+		{
+			Requester = PC;
+			break;
+		}
+	}
+	if (!Requester)
+	{
+		// Any player's ping beats no ping — the marker is cosmetic and shared.
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (It->Get()) { Requester = It->Get(); break; }
+		}
+	}
+	if (!Requester) { return false; }
+
+	// Server_SpawnAttentionPingActor(FVector, FVector) is private C++ but a UFUNCTION — invoke it by
+	// reflection. Called on the server, a Server RPC executes its implementation directly.
+	UFunction* Fn = Requester->FindFunction(FName(TEXT("Server_SpawnAttentionPingActor")));
+	if (!Fn) { return false; }
+	struct { FVector Location; FVector Normal; } Params{ WorldLocation, FVector::UpVector };
+	if (Fn->ParmsSize != sizeof(Params))
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[map] attention-ping RPC signature drifted (parms %d != %d) — ping skipped."),
+			Fn->ParmsSize, static_cast<int32>(sizeof(Params)));
+		return false;
+	}
+	Requester->ProcessEvent(Fn, &Params);
+	return true;
 }

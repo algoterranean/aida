@@ -37,6 +37,15 @@ public:
 	 */
 	static bool PlaceMapMarker(UObject* WorldContext, const FVector& WorldLocation, const FString& Label);
 
+	/**
+	 * Spawn the game's native attention ping (the middle-click 3D marker: visible through walls,
+	 * compass icon, ~10 s) at WorldLocation, attributed to the requesting player. The spawn RPC is
+	 * private on AFGPlayerController, so it's invoked via UFunction reflection — the same pattern as
+	 * the getter-less UPROPERTY reads. Empty PlayerId = the listen host (its net id is null). False
+	 * when the player or the function can't be resolved.
+	 */
+	static bool SpawnAttentionPing(UObject* WorldContext, const FString& PlayerId, const FVector& WorldLocation);
+
 private:
 	TArray<FAIDAResourceNode> Cached;
 	double LastExtractSeconds = 0.0;

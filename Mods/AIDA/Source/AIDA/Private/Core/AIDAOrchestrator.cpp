@@ -104,9 +104,10 @@ namespace
 		"- tag_node(resource, purity?, label?): drop a labeled marker on the map at the nearest untapped "
 		"node of a resource to the player. This WRITES a shared map marker — only use it when the player "
 		"asks you to mark/tag/find-and-mark a node.\n"
-		"- mark_location(x, y, label): drop a labeled marker on the map at ANY coordinates (metres, as "
-		"other tools report them). Use when the player asks you to mark clusters, problem spots, or "
-		"anything you just found — never tell them to navigate by raw coordinates; mark the map instead.\n"
+		"- mark_location(x, y, label, ping?): drop a labeled map marker at ANY coordinates (metres, as "
+		"other tools report them) plus a 3D attention ping there (visible through walls ~10 s). Use when "
+		"the player asks you to mark/show/point out clusters, problem spots, containers, or anything you "
+		"just found — never tell them to navigate by raw coordinates; mark and ping instead.\n"
 		"- add_note(text, tags?): save a persistent note for the player (survives sessions), tagged with "
 		"their location/region. Use when they ask you to remember/note something.\n"
 		"- get_notes(keyword?, region?, near?): recall the player's saved notes. Check these when the "
@@ -839,8 +840,8 @@ void UAIDAOrchestrator::RegisterTools()
 	// only marks resource nodes, and coordinates alone don't help a player NAVIGATE anywhere.
 	Tools.Register({
 		TEXT("mark_location"),
-		TEXT("Place a labeled marker on the map at any coordinates (a saved, shared map stamp). Use to mark machine clusters, problem spots (disconnected splitters, slow belts), or anything with a known [x, y] — e.g. after get_factory_overview or find_disconnected, mark what you found so the player can navigate to it. Pass 'x' and 'y' in metres (as returned by the other tools) and a short 'label'."),
-		TEXT(R"({"type":"object","properties":{"x":{"type":"number","description":"X in metres (tool-result convention)."},"y":{"type":"number","description":"Y in metres."},"label":{"type":"string","description":"Short marker label (e.g. \"Cluster 1: Aluminum Scrap\")."}},"required":["x","y","label"]})"),
+		TEXT("Place a labeled marker on the map at any coordinates (a saved, shared map stamp) AND a 3D attention ping there (the middle-click marker: visible through walls for ~10 s). Use to mark machine clusters, problem spots (disconnected splitters, slow belts, underclock candidates), containers — anything with a known [x, y] — so the player can actually navigate to it instead of reading coordinates. Pass 'x' and 'y' in metres (as returned by the other tools) and a short 'label'; 'ping': false skips the 3D ping (e.g. when marking many far-away spots)."),
+		TEXT(R"({"type":"object","properties":{"x":{"type":"number","description":"X in metres (tool-result convention)."},"y":{"type":"number","description":"Y in metres."},"label":{"type":"string","description":"Short marker label (e.g. \"Cluster 1: Aluminum Scrap\")."},"ping":{"type":"boolean","description":"Also spawn the 3D attention ping (default true)."}},"required":["x","y","label"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
 		{
@@ -859,8 +860,26 @@ void UAIDAOrchestrator::RegisterTools()
 				return FAIDAToolResult::Error(TEXT("Could not place the marker (map unavailable or marker limit reached)."));
 			}
 
+			bool bPing = true;
+			Args->TryGetBoolField(TEXT("ping"), bPing);
+			bool bPinged = false;
+			if (bPing)
+			{
+				// The 3D ping wants to sit on/above the thing, not at the player's height across the
+				// map — probe the ground at the spot (probe reach is local; the player-Z start is fine
+				// for same-area marks, and a failed probe just keeps the borrowed height).
+				FVector PingCm = LocationCm;
+				double GroundZ = 0.0;
+				if (FAIDAActionSeam::ProbeGroundZ(this, LocationCm, GroundZ))
+				{
+					PingCm.Z = GroundZ + 100.0;
+				}
+				bPinged = FAIDAMapService::SpawnAttentionPing(GetWorld(), Ctx.PlayerId, PingCm);
+			}
+
 			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 			Root->SetBoolField(TEXT("marked"), true);
+			if (bPing) { Root->SetBoolField(TEXT("pinged"), bPinged); }
 			Root->SetStringField(TEXT("label"), Label);
 			TArray<TSharedPtr<FJsonValue>> At;
 			At.Add(AIDANumber(X));
