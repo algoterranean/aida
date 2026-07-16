@@ -720,10 +720,12 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 	if (Config.Uploads.bEnabled)
 	{
 		SystemPrompt += TEXT("\n\nPlayers may attach reference images (photos, sketches, screenshots of buildings) to their"
-			" messages. When a message includes an image, study its massing, proportions, and materials, then translate it"
-			" into an in-game structure using the propose tools with the closest available buildables — briefly state your"
-			" interpretation first. Never claim to see an image unless one is actually attached to a message in this"
-			" conversation.");
+			" messages. When a message includes an image, study its massing, proportions, and materials, then reconstruct it"
+			" as ONE propose_build version-2 COMPOSITE: decompose the reference into parts (floor slabs, walls, pillars,"
+			" beams, terraces) with explicit at:{x,y,z} offsets in metres — z is height, so stacked storeys and cantilevered"
+			" decks are different parts at different z. Use several proposals only when one composite can't express it,"
+			" placing later ones relative to the resolved origin the tool result returns. Briefly state your interpretation"
+			" first. Never claim to see an image unless one is actually attached to a message in this conversation.");
 	}
 
 	// Ground the model in the AUTHORITATIVE proposal state every request — it kept inventing queue
@@ -1297,17 +1299,27 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 	View.ExpiresUtc = Proposal->State == EAIDAProposalState::Pending
 		? Proposal->ProposedUtc + Config.Actions.TtlSeconds : 0;
 
-	// Ghost-preview payload: pending build proposals ship their tiles so clients hologram them.
+	// Ghost-preview payload: pending build proposals ship their tiles so clients hologram them —
+	// one part for v1 grids, one per part for spec-v2 composites (placements are grouped by part).
 	if (Proposal->State == EAIDAProposalState::Pending && !Proposal->bDismantle)
 	{
-		View.RecipeClassPath = Proposal->RecipeClassPath;
-		View.TileCenters.Reserve(Proposal->Placements.Num());
-		for (const FTransform& Placement : Proposal->Placements)
+		const bool bComposite = Proposal->PlacementPartIndex.Num() == Proposal->Placements.Num()
+			&& Proposal->PartRecipePaths.Num() > 0;
+		FAIDAGhostPart* Current = nullptr;
+		int32 CurrentPart = INDEX_NONE;
+		for (int32 i = 0; i < Proposal->Placements.Num(); ++i)
 		{
-			View.TileCenters.Add(Placement.GetLocation());
+			const int32 Part = bComposite ? Proposal->PlacementPartIndex[i] : 0;
+			if (!Current || Part != CurrentPart)
+			{
+				Current = &View.GhostParts.AddDefaulted_GetRef();
+				Current->RecipeClassPath = bComposite && Proposal->PartRecipePaths.IsValidIndex(Part)
+					? Proposal->PartRecipePaths[Part] : Proposal->RecipeClassPath;
+				Current->YawDeg = static_cast<float>(Proposal->Placements[i].Rotator().Yaw);
+				CurrentPart = Part;
+			}
+			Current->TileCenters.Add(Proposal->Placements[i].GetLocation());
 		}
-		View.YawDeg = Proposal->Placements.Num() > 0
-			? static_cast<float>(Proposal->Placements[0].Rotator().Yaw) : 0.f;
 	}
 	R->ServerUpsertProposal(View);
 }
@@ -1426,7 +1438,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables on a snapped grid (one buildable type, N x M repeat). Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity) and a proposalId. Spec: {version:1, buildable:'display name', origin?:{x,y,z in metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. Grids are FLAT at the origin's height by default; set followTerrain:true ONLY if the player asks to follow/trace the ground. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is thickness); only set steps for deliberate gaps. Machines that need power are wired AUTOMATICALLY: power poles (lowest unlocked mk, or pole:'display name' to override) spread through the grid, power lines to every machine, and a tie-in to the nearest existing grid — set power:false only when the player says to skip power."),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -1442,17 +1454,46 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
-			FAIDARecipeResolution Recipe;
-			if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Buildable, Recipe))
+			// Resolve every buildable up front — v1 = one resolution, v2 = one per part. Resolutions[0]
+			// is the ANCHOR part: it drives aim snapping and stands in for the v1 single recipe.
+			const bool bComposite = Spec.Parts.Num() > 0;
+			TArray<FAIDARecipeResolution> Resolutions;
+			if (bComposite)
 			{
-				FString Msg = FString::Printf(TEXT("no unlocked buildable matches '%s'"), *Spec.Buildable);
-				if (Recipe.Suggestions.Num() > 0)
+				for (int32 i = 0; i < Spec.Parts.Num(); ++i)
 				{
-					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Recipe.Suggestions, TEXT(", ")));
+					FAIDARecipeResolution PartRecipe;
+					if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Parts[i].Buildable, PartRecipe))
+					{
+						FString Msg = FString::Printf(TEXT("parts[%d]: no unlocked buildable matches '%s'"), i, *Spec.Parts[i].Buildable);
+						if (PartRecipe.Suggestions.Num() > 0)
+						{
+							Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(PartRecipe.Suggestions, TEXT(", ")));
+						}
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+					}
+					Spec.Parts[i].Buildable = PartRecipe.DisplayName; // canonical name for the summary
+					Resolutions.Add(MoveTemp(PartRecipe));
 				}
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
-			Spec.Buildable = Recipe.DisplayName; // canonical name for the summary
+			else
+			{
+				FAIDARecipeResolution Single;
+				if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Buildable, Single))
+				{
+					FString Msg = FString::Printf(TEXT("no unlocked buildable matches '%s'"), *Spec.Buildable);
+					if (Single.Suggestions.Num() > 0)
+					{
+						Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Single.Suggestions, TEXT(", ")));
+					}
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+				}
+				Spec.Buildable = Single.DisplayName; // canonical name for the summary
+				Resolutions.Add(MoveTemp(Single));
+			}
+			const FAIDARecipeResolution& Recipe = Resolutions[0];
+			TArray<FString> PartRecipePaths;
+			for (const FAIDARecipeResolution& R : Resolutions) { PartRecipePaths.Add(R.RecipeClassPath); }
 
 			// No origin = "where the requesting player is aiming", SNAPPED like the build gun (extends
 			// an aimed structure tile-perfectly / aligns to the world grid), falling back to their
@@ -1468,12 +1509,14 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (bAimDerivedOrigin)
 			{
 				// Effective steps (the same footprint clamp ExpandGrid applies) drive the anchor math.
-				const double StepXCm = FMath::Max(Spec.Grid.StepXM, Recipe.FootprintXM) * 100.0;
-				const double StepYCm = FMath::Max(Spec.Grid.StepYM, Recipe.FootprintYM) * 100.0;
+				// Composites snap by their ANCHOR part (parts[0]) — the rest ride its offsets.
+				const FAIDAGridSpec& AnchorGrid = bComposite ? Spec.Parts[0].Grid : Spec.Grid;
+				const double StepXCm = FMath::Max(AnchorGrid.StepXM, Recipe.FootprintXM) * 100.0;
+				const double StepYCm = FMath::Max(AnchorGrid.StepYM, Recipe.FootprintYM) * 100.0;
 				FVector AimCm;
 				TArray<FVector> Alternates;
 				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, /*InOut*/ Spec.YawDeg,
-					Spec.Grid.CountX, Spec.Grid.CountY, StepXCm, StepYCm, AimCm, &Alternates))
+					AnchorGrid.CountX, AnchorGrid.CountY, StepXCm, StepYCm, AimCm, &Alternates))
 				{
 					OriginCandidatesCm.Add(AimCm); // yaw now carries the snapped orientation
 					OriginCandidatesCm.Append(Alternates);
@@ -1497,9 +1540,19 @@ void UAIDAOrchestrator::RegisterActionTools()
 			// Grids are FLAT at the origin's height by default; followTerrain drops each tile to its
 			// own ground (the "trace the ground" request) by adjusting placement Z up front — the
 			// journal then records exactly what gets built.
-			const auto ExpandAt = [&](const FVector& OriginCm)
+			const auto ExpandAt = [&](const FVector& OriginCm, TArray<int32>& OutPartIndex)
 			{
 				Spec.OriginM = OriginCm / AIDAMetersToCm;
+				OutPartIndex.Reset();
+				if (bComposite)
+				{
+					TArray<FVector2D> Footprints;
+					for (const FAIDARecipeResolution& R : Resolutions)
+					{
+						Footprints.Emplace(R.FootprintXM, R.FootprintYM);
+					}
+					return AIDAActionSpec::ExpandParts(Spec, Footprints, OutPartIndex);
+				}
 				TArray<FTransform> Expanded = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
 				if (Spec.bFollowTerrain)
 				{
@@ -1518,8 +1571,10 @@ void UAIDAOrchestrator::RegisterActionTools()
 			};
 
 			TArray<FTransform> Placements;
+			TArray<int32> PlacementPartIndex;
 			FAIDADryRunResult DryRun;
 			TArray<FTransform> FallbackPlacements;   // first candidate that validates but clips
+			TArray<int32> FallbackPartIndex;
 			FAIDADryRunResult FallbackDryRun;
 			FVector FallbackOriginCm = FVector::ZeroVector;
 			FAIDADryRunResult FirstFailRun;          // the PREFERRED candidate's failures for the report
@@ -1529,16 +1584,21 @@ void UAIDAOrchestrator::RegisterActionTools()
 			bool bHaveFirstFail = false;
 			for (const FVector& OriginCm : OriginCandidatesCm)
 			{
-				TArray<FTransform> Attempt = ExpandAt(OriginCm);
+				TArray<int32> AttemptPartIndex;
+				TArray<FTransform> Attempt = ExpandAt(OriginCm, AttemptPartIndex);
 				const int32 AttemptTotal = Attempt.Num();
 				FAIDADryRunResult AttemptRun;
-				if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Attempt, AttemptRun))
+				const bool bRan = bComposite
+					? FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, AttemptPartIndex, Attempt, AttemptRun)
+					: FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Attempt, AttemptRun);
+				if (!bRan)
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(AttemptRun.Error, {}));
 				}
 				if (AttemptRun.bOk && AttemptRun.ClippingCount == 0)
 				{
 					Placements = MoveTemp(Attempt);
+					PlacementPartIndex = MoveTemp(AttemptPartIndex);
 					DryRun = MoveTemp(AttemptRun);
 					bPlaced = true; // Spec.OriginM holds this candidate (set in ExpandAt)
 					break;
@@ -1546,6 +1606,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				if (AttemptRun.bOk && !bHaveFallback)
 				{
 					FallbackPlacements = MoveTemp(Attempt);
+					FallbackPartIndex = MoveTemp(AttemptPartIndex);
 					FallbackDryRun = AttemptRun;
 					FallbackOriginCm = OriginCm;
 					bHaveFallback = true;
@@ -1562,6 +1623,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				// Every candidate clips somewhere; the most-preferred valid one wins (clipping is
 				// advisory — the player judges via the ghosts, or nudges).
 				Placements = MoveTemp(FallbackPlacements);
+				PlacementPartIndex = MoveTemp(FallbackPartIndex);
 				DryRun = MoveTemp(FallbackDryRun);
 				Spec.OriginM = FallbackOriginCm / AIDAMetersToCm;
 				bPlaced = true;
@@ -1667,6 +1729,11 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.RequesterName = Ctx.Author;
 			Proposal.Placements = Placements;
 			Proposal.RecipeClassPath = Recipe.RecipeClassPath;
+			if (bComposite)
+			{
+				Proposal.PartRecipePaths = PartRecipePaths;
+				Proposal.PlacementPartIndex = MoveTemp(PlacementPartIndex);
+			}
 			Proposal.Cost = MoveTemp(TotalCost);
 			Proposal.Summary = AIDAActionSpec::SummarizeBuild(Spec);
 			if (bAutoPower)
@@ -1694,7 +1761,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — cost %s. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
-			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0,
+				&Spec.OriginM));
 		}
 	});
 

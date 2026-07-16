@@ -191,9 +191,15 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		}
 	}
 
-	// The new spot must validate like the original did (all-or-nothing, same rules).
+	// The new spot must validate like the original did (all-or-nothing, same rules). Composites
+	// re-validate each part with its own recipe.
 	FAIDADryRunResult DryRun;
-	if (!FAIDAActionSeam::DryRunBuild(WorldContext, Proposal->RecipeClassPath, Adjusted, DryRun) || !DryRun.bOk)
+	const bool bComposite = Proposal->PlacementPartIndex.Num() == Proposal->Placements.Num()
+		&& Proposal->PartRecipePaths.Num() > 0;
+	const bool bRan = bComposite
+		? FAIDAActionSeam::DryRunBuildParts(WorldContext, Proposal->PartRecipePaths, Proposal->PlacementPartIndex, Adjusted, DryRun)
+		: FAIDAActionSeam::DryRunBuild(WorldContext, Proposal->RecipeClassPath, Adjusted, DryRun);
+	if (!bRan || !DryRun.bOk)
 	{
 		OutMessage = FString::Printf(TEXT("adjustment blocked — %s; the proposal is unchanged"),
 			DryRun.Failures.Num() > 0
@@ -251,9 +257,29 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 	}
 	else
 	{
+		// Spec-v2 composites: placements are grouped by part, so clamp each tick's batch to the
+		// current part's contiguous run and construct with THAT part's recipe.
+		FString Recipe = Proposal->RecipeClassPath;
+		int32 Batch = FMath::Max(1, Config.BatchPerTick);
+		if (Proposal->PlacementPartIndex.Num() == Proposal->Placements.Num()
+			&& Proposal->PlacementPartIndex.IsValidIndex(Proposal->Cursor))
+		{
+			const int32 Part = Proposal->PlacementPartIndex[Proposal->Cursor];
+			if (Proposal->PartRecipePaths.IsValidIndex(Part))
+			{
+				Recipe = Proposal->PartRecipePaths[Part];
+			}
+			int32 RunEnd = Proposal->Cursor;
+			while (RunEnd < Proposal->PlacementPartIndex.Num() && Proposal->PlacementPartIndex[RunEnd] == Part)
+			{
+				++RunEnd;
+			}
+			Batch = FMath::Min(Batch, RunEnd - Proposal->Cursor);
+		}
+
 		int32 Skipped = 0;
-		Proposal->Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal->RecipeClassPath,
-			Proposal->Placements, Proposal->Cursor, FMath::Max(1, Config.BatchPerTick),
+		Proposal->Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Recipe,
+			Proposal->Placements, Proposal->Cursor, Batch,
 			Proposal->AffectedEntityIds, BuiltActors, Skipped);
 		SkippedCount += Skipped;
 		if (Proposal->Cursor < Proposal->Placements.Num()) { return true; }

@@ -64,6 +64,17 @@ struct FAIDATranscriptEntry
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FGuid> ImageIds;
 };
 
+/** One recipe's slice of a pending proposal's ghost preview (spec-v2 composites have several). */
+USTRUCT(BlueprintType)
+struct FAIDAGhostPart
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString RecipeClassPath;
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FVector> TileCenters; // world cm
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") float YawDeg = 0.f;
+};
+
 /**
  * Client-facing view of one build/dismantle proposal (docs/PHASE4.md §2e). Replicated as a state
  * array on AAIDAProposalRelay so late joiners see pending proposals for free. Carries display
@@ -87,10 +98,9 @@ struct FAIDAProposalView
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") int64 ExpiresUtc = 0;
 
 	//~ Ghost-preview payload (build proposals while pending; empty otherwise). Clients spawn local
-	//~ holograms of the recipe at each tile so players see EXACTLY where the build will land.
-	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString RecipeClassPath;
-	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FVector> TileCenters; // world cm
-	UPROPERTY(BlueprintReadOnly, Category = "AIDA") float YawDeg = 0.f;
+	//~ holograms per part at each tile so players see EXACTLY where the build will land — one part
+	//~ for v1 grids, several for spec-v2 composites.
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FAIDAGhostPart> GhostParts;
 };
 
 /**

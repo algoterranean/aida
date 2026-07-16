@@ -103,6 +103,12 @@ correct names, undo removes them.
 
 ### Slice 4 — Connected builds: spec v2 (Hands v2b)
 
+> **Status (2026-07-16): the `parts` half SHIPPED early** as part of Phase 5's fidelity fix —
+> `propose_build` accepts `{version:2, origin, yawDeg, parts:[{buildable, at, yawDeg?, grid?}]}`
+> (per-part grid repeat is an addition to the sketch below; `id`/`recipe`/`clock` and the
+> `belts`/`wires` port routing remain THIS slice). A v2 spec with `belts`/`wires` is rejected with
+> a clear error until then; v2 skips auto-power (poles are parts; wiring lands here).
+
 The centerpiece. Build spec v2 expresses a *machine group*: typed parts + connections, not one
 buildable × N.
 

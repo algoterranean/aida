@@ -29,13 +29,25 @@ namespace
 		return ((Snapped % 360) + 360) % 360;
 	}
 
-	/** Shared version gate: only spec version 1 exists. */
+	/** Shared version gate: only spec version 1 exists (build specs accept 2 via CheckBuildVersion). */
 	bool CheckVersion(const TSharedPtr<FJsonObject>& Spec, FString& OutError)
 	{
 		int32 Version = 0;
 		if (!Spec->TryGetNumberField(TEXT("version"), Version) || Version != 1)
 		{
 			OutError = TEXT("spec version must be 1");
+			return false;
+		}
+		return true;
+	}
+
+	/** Build-spec version gate: 1 = single buildable, 2 = composite parts (docs/PHASE7.md Slice 4). */
+	bool CheckBuildVersion(const TSharedPtr<FJsonObject>& Spec, int32& OutVersion, FString& OutError)
+	{
+		OutVersion = 0;
+		if (!Spec->TryGetNumberField(TEXT("version"), OutVersion) || (OutVersion != 1 && OutVersion != 2))
+		{
+			OutError = TEXT("spec version must be 1 (single buildable) or 2 (composite parts)");
 			return false;
 		}
 		return true;
@@ -53,9 +65,108 @@ namespace
 bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDABuildSpec& Out, FString& OutError)
 {
 	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }
-	if (!CheckVersion(Spec, OutError)) { return false; }
 
 	FAIDABuildSpec Parsed;
+	if (!CheckBuildVersion(Spec, Parsed.Version, OutError)) { return false; }
+
+	if (Parsed.Version == 2)
+	{
+		// Composite: shared origin/yaw + a part list. Belts/wires (the PHASE7 Slice 4 second half)
+		// are not accepted yet — reject loudly rather than silently dropping them.
+		if (Spec->HasField(TEXT("belts")) || Spec->HasField(TEXT("wires")))
+		{
+			OutError = TEXT("'belts'/'wires' are not supported yet — propose the parts now and connect them later");
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* PartsArr = nullptr;
+		if (!Spec->TryGetArrayField(TEXT("parts"), PartsArr) || !PartsArr || PartsArr->Num() == 0)
+		{
+			OutError = TEXT("version 2 requires a non-empty 'parts' array");
+			return false;
+		}
+		constexpr int32 kMaxParts = 32;
+		if (PartsArr->Num() > kMaxParts)
+		{
+			OutError = FString::Printf(TEXT("%d parts exceeds the per-proposal cap of %d"), PartsArr->Num(), kMaxParts);
+			return false;
+		}
+
+		int64 Total = 0;
+		for (int32 i = 0; i < PartsArr->Num(); ++i)
+		{
+			const TSharedPtr<FJsonObject>* PartObj = nullptr;
+			if (!(*PartsArr)[i].IsValid() || !(*PartsArr)[i]->TryGetObject(PartObj) || !PartObj)
+			{
+				OutError = FString::Printf(TEXT("parts[%d] must be an object"), i);
+				return false;
+			}
+
+			FAIDABuildPart Part;
+			if (!(*PartObj)->TryGetStringField(TEXT("buildable"), Part.Buildable) || Part.Buildable.TrimStartAndEnd().IsEmpty())
+			{
+				OutError = FString::Printf(TEXT("parts[%d].buildable (display name) is required"), i);
+				return false;
+			}
+			Part.Buildable = Part.Buildable.TrimStartAndEnd();
+
+			if ((*PartObj)->HasField(TEXT("at")) && !ReadVectorM(*PartObj, TEXT("at"), Part.OffsetM))
+			{
+				OutError = FString::Printf(TEXT("parts[%d].at must be an object with numeric x and y (metres, relative to the origin) — or omit it for {0,0,0}"), i);
+				return false;
+			}
+
+			double PartYaw = 0.0;
+			(*PartObj)->TryGetNumberField(TEXT("yawDeg"), PartYaw);
+			Part.YawDeg = SnapYaw(PartYaw);
+
+			const TSharedPtr<FJsonObject>* Grid = nullptr;
+			if ((*PartObj)->TryGetObjectField(TEXT("grid"), Grid) && Grid)
+			{
+				int32 I;
+				if ((*Grid)->TryGetNumberField(TEXT("countX"), I)) { Part.Grid.CountX = I; }
+				if ((*Grid)->TryGetNumberField(TEXT("countY"), I)) { Part.Grid.CountY = I; }
+				(*Grid)->TryGetNumberField(TEXT("stepX"), Part.Grid.StepXM);
+				(*Grid)->TryGetNumberField(TEXT("stepY"), Part.Grid.StepYM);
+			}
+			if (Part.Grid.CountX < 1 || Part.Grid.CountY < 1)
+			{
+				OutError = FString::Printf(TEXT("parts[%d]: grid counts must be >= 1"), i);
+				return false;
+			}
+			if (Part.Grid.StepXM < 0.0 || Part.Grid.StepYM < 0.0)
+			{
+				OutError = FString::Printf(TEXT("parts[%d]: grid steps must be >= 0 (0 = buildable footprint)"), i);
+				return false;
+			}
+
+			Total += static_cast<int64>(Part.Grid.CountX) * Part.Grid.CountY;
+			Parsed.Parts.Add(MoveTemp(Part));
+		}
+		if (MaxItems > 0 && Total > MaxItems)
+		{
+			OutError = FString::Printf(TEXT("%lld placements across parts exceeds the per-proposal cap of %d"), Total, MaxItems);
+			return false;
+		}
+
+		if (Spec->HasField(TEXT("origin")))
+		{
+			if (!ReadVectorM(Spec, TEXT("origin"), Parsed.OriginM))
+			{
+				OutError = TEXT("'origin' must be an object with numeric x and y (metres) — or omit it to build at the player");
+				return false;
+			}
+			Parsed.bHasOrigin = true;
+		}
+		double Yaw = 0.0;
+		Spec->TryGetNumberField(TEXT("yawDeg"), Yaw);
+		Parsed.YawDeg = SnapYaw(Yaw);
+		Parsed.bPower = false; // v2: no auto-power — include poles as parts; wire routing lands with P7
+
+		Out = MoveTemp(Parsed);
+		return true;
+	}
+
 	if (!Spec->TryGetStringField(TEXT("buildable"), Parsed.Buildable) || Parsed.Buildable.TrimStartAndEnd().IsEmpty())
 	{
 		OutError = TEXT("'buildable' (display name) is required");
@@ -562,8 +673,62 @@ TArray<FTransform> AIDAActionSpec::ExpandGrid(const FAIDABuildSpec& Spec, double
 	return Out;
 }
 
+TArray<FTransform> AIDAActionSpec::ExpandParts(const FAIDABuildSpec& Spec, const TArray<FVector2D>& FootprintsM,
+	TArray<int32>& OutPartIndex)
+{
+	OutPartIndex.Reset();
+	TArray<FTransform> Out;
+
+	// Part offsets rotate with the composite yaw so the whole arrangement turns as one rigid body.
+	const double CompositeYawRad = FMath::DegreesToRadians(static_cast<double>(Spec.YawDeg));
+	const FVector AxisX(FMath::Cos(CompositeYawRad), FMath::Sin(CompositeYawRad), 0.0);
+	const FVector AxisY(-FMath::Sin(CompositeYawRad), FMath::Cos(CompositeYawRad), 0.0);
+
+	for (int32 PartIdx = 0; PartIdx < Spec.Parts.Num(); ++PartIdx)
+	{
+		const FAIDABuildPart& Part = Spec.Parts[PartIdx];
+
+		// Reuse the v1 grid expansion by synthesizing a single-part spec at the part's world origin.
+		FAIDABuildSpec PartSpec;
+		PartSpec.OriginM = Spec.OriginM
+			+ AxisX * Part.OffsetM.X + AxisY * Part.OffsetM.Y + FVector(0, 0, Part.OffsetM.Z);
+		PartSpec.YawDeg = ((Spec.YawDeg + Part.YawDeg) % 360 + 360) % 360;
+		PartSpec.Grid = Part.Grid;
+
+		const FVector2D Footprint = FootprintsM.IsValidIndex(PartIdx) ? FootprintsM[PartIdx] : FVector2D(8.0, 8.0);
+		TArray<FTransform> Expanded = ExpandGrid(PartSpec, Footprint.X, Footprint.Y);
+		for (FTransform& Placement : Expanded)
+		{
+			OutPartIndex.Add(PartIdx);
+			Out.Add(MoveTemp(Placement));
+		}
+	}
+	return Out;
+}
+
 FString AIDAActionSpec::SummarizeBuild(const FAIDABuildSpec& Spec)
 {
+	if (Spec.Parts.Num() > 0)
+	{
+		int32 Total = 0;
+		TArray<FString> PartLines;
+		for (const FAIDABuildPart& Part : Spec.Parts)
+		{
+			const int32 Count = Part.Grid.CountX * Part.Grid.CountY;
+			Total += Count;
+			if (PartLines.Num() < 4)
+			{
+				PartLines.Add(FString::Printf(TEXT("%d x %s"), Count, *Part.Buildable));
+			}
+		}
+		if (Spec.Parts.Num() > 4)
+		{
+			PartLines.Add(FString::Printf(TEXT("+%d more part(s)"), Spec.Parts.Num() - 4));
+		}
+		return FString::Printf(TEXT("place a %d-part composite (%d placements: %s)"),
+			Spec.Parts.Num(), Total, *FString::Join(PartLines, TEXT(", ")));
+	}
+
 	const int32 Total = Spec.Grid.CountX * Spec.Grid.CountY;
 	if (Total == 1)
 	{
@@ -595,7 +760,8 @@ FString AIDAActionSpec::StateToString(EAIDAProposalState State)
 	return TEXT("unknown");
 }
 
-FString AIDAActionSpec::BuildDryRunJson(const FAIDAProposal& Proposal, int32 ExpiresInSec, bool bAffordable, double PowerDrawMW)
+FString AIDAActionSpec::BuildDryRunJson(const FAIDAProposal& Proposal, int32 ExpiresInSec, bool bAffordable, double PowerDrawMW,
+	const FVector* OriginM)
 {
 	TArray<TSharedPtr<FJsonValue>> Cost;
 	for (const FAIDACostItem& Item : Proposal.Cost)
@@ -617,6 +783,15 @@ FString AIDAActionSpec::BuildDryRunJson(const FAIDAProposal& Proposal, int32 Exp
 			TEXT("cost covers the attachments; belt/pipe runs are length-priced and charged from central storage as they build"));
 	}
 	if (PowerDrawMW > 0.0) { Root->SetField(TEXT("powerDrawMW"), AIDANumber(PowerDrawMW)); }
+	if (OriginM)
+	{
+		// The resolved anchor (metres) — follow-up proposals can place parts relative to it.
+		const TSharedRef<FJsonObject> Origin = MakeShared<FJsonObject>();
+		Origin->SetField(TEXT("x"), AIDANumber(OriginM->X));
+		Origin->SetField(TEXT("y"), AIDANumber(OriginM->Y));
+		Origin->SetField(TEXT("z"), AIDANumber(OriginM->Z));
+		Root->SetObjectField(TEXT("origin"), Origin);
+	}
 	Root->SetStringField(TEXT("status"), TEXT("awaiting approval"));
 	Root->SetNumberField(TEXT("expiresInSec"), ExpiresInSec);
 	return AIDAToCompactJson(Root);

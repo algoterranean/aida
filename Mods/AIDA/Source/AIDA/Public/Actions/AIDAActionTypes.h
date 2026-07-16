@@ -35,22 +35,37 @@ struct FAIDAGridSpec
 	double StepYM = 0.0;
 };
 
-/** propose_build spec v1 (docs/PHASE4.md §2a) — one recipe, one origin, one repeat pattern. */
+/** One part of a spec-v2 composite build: a buildable placed (optionally grid-repeated) at an
+ *  offset relative to the composite's shared origin, rotated with the composite's yaw. */
+struct FAIDABuildPart
+{
+	FString Buildable;                     // display name, fuzzy-resolved server-side (unlocked only)
+	FVector OffsetM = FVector::ZeroVector; // metres, relative to the composite origin (pre-rotation)
+	int32 YawDeg = 0;                      // relative to the composite yaw; snapped to 0/90/180/270
+	FAIDAGridSpec Grid;
+};
+
+/** propose_build spec (docs/PHASE4.md §2a): v1 = one recipe, one origin, one repeat pattern.
+ *  v2 (spec-v2 composite, PHASE7.md Slice 4's `parts` half) = one shared origin/yaw + a part list —
+ *  Parts non-empty ⇔ v2. v2 ignores followTerrain (parts carry explicit z) and skips auto-power
+ *  (include poles as parts; wire routing lands with P7 belts/wires). */
 struct FAIDABuildSpec
 {
 	int32 Version = 1;
-	FString Buildable;                     // display name, fuzzy-resolved server-side (unlocked only)
+	FString Buildable;                     // v1: display name, fuzzy-resolved server-side (unlocked only)
 	FVector OriginM = FVector::ZeroVector; // metres
 	bool bHasOrigin = false;               // omitted origin = at the requesting player (Ctx.Location)
-	int32 YawDeg = 0;                      // snapped to 0/90/180/270
-	FAIDAGridSpec Grid;
+	int32 YawDeg = 0;                      // snapped to 0/90/180/270 (v2: whole-composite rotation)
+	FAIDAGridSpec Grid;                    // v1 only
 	/** Default false = a FLAT grid at the origin's height; true = each tile drops to its own terrain. */
 	bool bFollowTerrain = false;
 	/** Auto-power (docs/PHASE4-POWER.md): default true — powered buildables get poles + power lines
-	 *  + a grid tie-in as part of the proposal. "power": false opts out. */
+	 *  + a grid tie-in as part of the proposal. "power": false opts out. v1 only. */
 	bool bPower = true;
 	/** Optional pole display-name override; "" = the lowest unlocked mk. */
 	FString Pole;
+	/** v2 composite parts (empty = v1 single-buildable spec). */
+	TArray<FAIDABuildPart> Parts;
 };
 
 /** PlanPower output (docs/PHASE4-POWER.md §3): pole transforms + wire index pairs, pure geometry. */
@@ -246,7 +261,11 @@ struct FAIDAProposal
 	EAIDAProposalState State = EAIDAProposalState::Pending;
 	TArray<FTransform> Placements;         // build: expanded + validated grid (world units)
 	int32 TargetCount = 0;                 // dismantle: matches found at dry-run (re-resolved at execute)
-	FString RecipeClassPath;               // build: resolved once at dry-run
+	FString RecipeClassPath;               // build: resolved once at dry-run (v2: parts[0], legacy reads)
+	//~ Spec-v2 composites: per-part recipes + a per-placement part map. Placements are stored grouped
+	//  by part (contiguous runs) so the executor batches one recipe at a time. Empty = v1 proposal.
+	TArray<FString> PartRecipePaths;
+	TArray<int32> PlacementPartIndex;      // parallel to Placements; values index PartRecipePaths
 	TArray<FAIDACostItem> Cost;            // tallied at dry-run; deducted upfront at execute
 	FString Summary;                       // human diff line ("place 100 x Foundation …")
 	int32 Cursor = 0;                      // executor progress into Placements/targets

@@ -756,6 +756,60 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 	return true;
 }
 
+bool FAIDAActionSeam::DryRunBuildParts(UObject* WorldContext, const TArray<FString>& PartRecipePaths,
+	const TArray<int32>& PlacementPartIndex, const TArray<FTransform>& Placements, FAIDADryRunResult& Out)
+{
+	Out = FAIDADryRunResult();
+	if (PlacementPartIndex.Num() != Placements.Num() || PartRecipePaths.Num() == 0)
+	{
+		Out.Error = TEXT("internal: part index map out of sync");
+		return false;
+	}
+
+	// One DryRunBuild per part over its slice; failures/indices are remapped back to global.
+	for (int32 PartIdx = 0; PartIdx < PartRecipePaths.Num(); ++PartIdx)
+	{
+		TArray<FTransform> Slice;
+		TArray<int32> GlobalIndex;
+		for (int32 i = 0; i < Placements.Num(); ++i)
+		{
+			if (PlacementPartIndex[i] == PartIdx)
+			{
+				Slice.Add(Placements[i]);
+				GlobalIndex.Add(i);
+			}
+		}
+		if (Slice.Num() == 0) { continue; }
+
+		FAIDADryRunResult PartRun;
+		if (!DryRunBuild(WorldContext, PartRecipePaths[PartIdx], Slice, PartRun))
+		{
+			Out.Error = PartRun.Error;
+			return false;
+		}
+		for (FAIDAPlacementFailure& Failure : PartRun.Failures)
+		{
+			Failure.Index = GlobalIndex.IsValidIndex(Failure.Index) ? GlobalIndex[Failure.Index] : Failure.Index;
+			Out.Failures.Add(MoveTemp(Failure));
+		}
+		Out.ClippingCount += PartRun.ClippingCount;
+		for (const FAIDACostItem& Item : PartRun.Cost)
+		{
+			bool bMerged = false;
+			for (FAIDACostItem& Existing : Out.Cost)
+			{
+				if (Existing.ClassPath == Item.ClassPath) { Existing.Amount += Item.Amount; bMerged = true; break; }
+			}
+			if (!bMerged) { Out.Cost.Add(Item); }
+		}
+	}
+
+	// Per-part affordability checks can each pass while the SUM does not — re-check the merged tally.
+	Out.bAffordable = CheckAffordable(WorldContext, Out.Cost);
+	Out.bOk = Out.Failures.Num() == 0;
+	return true;
+}
+
 bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDADismantleSpec& Selector, FAIDADismantleResolution& Out)
 {
 	Out = FAIDADismantleResolution();

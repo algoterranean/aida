@@ -1895,7 +1895,9 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 	// Rejections: wrong version, missing buildable, malformed origin, over-cap grid.
 	{
 		FAIDABuildSpec Spec;
-		TestFalse(TEXT("rejects version 2"), AIDAActionSpec::ParseBuildSpec(
+		TestFalse(TEXT("rejects version 3"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 3, "buildable": "x", "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
+		TestFalse(TEXT("version 2 without parts rejected"), AIDAActionSpec::ParseBuildSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 2, "buildable": "x", "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
 		TestFalse(TEXT("rejects missing buildable"), AIDAActionSpec::ParseBuildSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "origin": { "x": 0, "y": 0 } })")), 200, Spec, Error));
@@ -1997,6 +1999,96 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 		TestTrue(TEXT("summary names the count and sign"),
 			Summary.Contains(TEXT("6 container(s)")) && Summary.Contains(TEXT("Label Sign")));
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsSpecParseV2Test, "AIDA.Actions.SpecParseV2",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsSpecParseV2Test::RunTest(const FString&)
+{
+	FString Error;
+
+	// A valid composite: two parts with offsets, per-part yaw + grid; auto-power forced off.
+	{
+		FAIDABuildSpec Spec;
+		const TSharedPtr<FJsonObject> Json = AIDATestParseJson(TEXT(
+			R"json({ "version": 2, "origin": { "x": 10, "y": 20, "z": 5 }, "yawDeg": 90, "parts": [
+			     { "buildable": "Foundation (2 m)", "grid": { "countX": 3, "countY": 2 } },
+			     { "buildable": "Big Concrete Pillar", "at": { "x": 4, "y": 8, "z": 2 }, "yawDeg": -90 } ] })json"));
+		TestTrue(FString::Printf(TEXT("parses (%s)"), *Error), AIDAActionSpec::ParseBuildSpec(Json, 200, Spec, Error));
+		TestEqual(TEXT("two parts"), Spec.Parts.Num(), 2);
+		TestEqual(TEXT("composite yaw"), Spec.YawDeg, 90);
+		TestEqual(TEXT("origin z"), Spec.OriginM.Z, 5.0);
+		if (Spec.Parts.Num() == 2)
+		{
+			TestEqual(TEXT("part 0 grid"), Spec.Parts[0].Grid.CountX * Spec.Parts[0].Grid.CountY, 6);
+			TestEqual(TEXT("part 0 offset default"), Spec.Parts[0].OffsetM, FVector::ZeroVector);
+			TestEqual(TEXT("part 1 offset"), Spec.Parts[1].OffsetM, FVector(4, 8, 2));
+			TestEqual(TEXT("part 1 yaw normalized"), Spec.Parts[1].YawDeg, 270);
+		}
+		TestFalse(TEXT("v2 disables auto-power"), Spec.bPower);
+	}
+
+	// Rejections: missing part buildable, cap across ALL parts, belts/wires not yet supported.
+	{
+		FAIDABuildSpec Spec;
+		TestFalse(TEXT("part without buildable rejected"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 2, "parts": [ { "at": { "x": 0, "y": 0 } } ] })")), 200, Spec, Error));
+		TestTrue(TEXT("error names the part"), Error.Contains(TEXT("parts[0]")));
+
+		TestFalse(TEXT("cap spans parts"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 2, "parts": [
+				{ "buildable": "a", "grid": { "countX": 10, "countY": 10 } },
+				{ "buildable": "b", "grid": { "countX": 10, "countY": 11 } } ] })")), 200, Spec, Error));
+
+		TestFalse(TEXT("belts rejected for now"), AIDAActionSpec::ParseBuildSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 2, "parts": [ { "buildable": "a" } ], "belts": [] })")), 200, Spec, Error));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsExpandPartsTest, "AIDA.Actions.ExpandParts",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsExpandPartsTest::RunTest(const FString&)
+{
+	// Composite at (10, 20, 5) m rotated 90°: part offsets must rotate with the composite yaw, and
+	// per-part yaw adds on top. Part 0 = a 2x1 grid of 8 m tiles at the origin; part 1 = one piece
+	// offset (+4, 0, +2) m — which the 90° composite yaw carries to world (+Y).
+	FAIDABuildSpec Spec;
+	Spec.OriginM = FVector(10, 20, 5);
+	Spec.YawDeg = 90;
+
+	FAIDABuildPart Floor;
+	Floor.Buildable = TEXT("floor");
+	Floor.Grid.CountX = 2;
+	Spec.Parts.Add(Floor);
+
+	FAIDABuildPart Pillar;
+	Pillar.Buildable = TEXT("pillar");
+	Pillar.OffsetM = FVector(4, 0, 2);
+	Pillar.YawDeg = 90;
+	Spec.Parts.Add(Pillar);
+
+	TArray<FVector2D> Footprints = { FVector2D(8, 8), FVector2D(2, 2) };
+	TArray<int32> PartIndex;
+	const TArray<FTransform> Out = AIDAActionSpec::ExpandParts(Spec, Footprints, PartIndex);
+
+	if (!TestEqual(TEXT("3 placements"), Out.Num(), 3) || !TestEqual(TEXT("part map parallel"), PartIndex.Num(), 3))
+	{
+		return false;
+	}
+	TestTrue(TEXT("grouped by part"), PartIndex[0] == 0 && PartIndex[1] == 0 && PartIndex[2] == 1);
+
+	// Part 0, tile 0: at the composite origin (cm).
+	TestTrue(TEXT("floor tile 0 at origin"), Out[0].GetLocation().Equals(FVector(1000, 2000, 500), 0.1));
+	// Part 0, tile 1: +X footprint step rotated 90° -> world +Y, 8 m = 800 cm.
+	TestTrue(TEXT("floor tile 1 rotated step"), Out[1].GetLocation().Equals(FVector(1000, 2800, 500), 0.1));
+	TestTrue(TEXT("floor yaw = composite"), FMath::IsNearlyEqual(Out[0].Rotator().Yaw, 90.0, 0.1));
+	// Part 1: offset (+4, 0, +2) m rotated 90° -> world (0, +4, +2) m from the origin.
+	TestTrue(TEXT("pillar offset rotated"), Out[2].GetLocation().Equals(FVector(1000, 2400, 700), 0.1));
+	// Part yaw stacks on the composite yaw: 90 + 90 = 180.
+	TestTrue(TEXT("pillar yaw stacks"), FMath::IsNearlyEqual(FMath::UnwindDegrees(Out[2].Rotator().Yaw), 180.0, 0.1)
+		|| FMath::IsNearlyEqual(Out[2].Rotator().Yaw, 180.0, 0.1));
 	return true;
 }
 

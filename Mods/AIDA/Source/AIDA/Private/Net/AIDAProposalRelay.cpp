@@ -68,21 +68,30 @@ void AAIDAProposalRelay::RefreshGhosts()
 
 	for (const FAIDAProposalView& View : Proposals)
 	{
-		if (View.State != TEXT("pending") || View.TileCenters.Num() == 0 || View.RecipeClassPath.IsEmpty())
+		if (View.State != TEXT("pending") || View.GhostParts.Num() == 0)
 		{
 			continue;
 		}
 		TArray<TWeakObjectPtr<AActor>>& Spawned = Ghosts.Add(View.Id);
-		const int32 Count = FMath::Min(View.TileCenters.Num(), kMaxGhostTiles);
-		for (int32 i = 0; i < Count; ++i)
+		int32 Budget = kMaxGhostTiles; // the tile cap spans all of a composite's parts
+		int32 Total = 0;
+		for (const FAIDAGhostPart& Part : View.GhostParts)
 		{
-			AActor* Ghost = FAIDAActionSeam::SpawnGhostHologram(this, View.RecipeClassPath, View.TileCenters[i], View.YawDeg, this);
-			if (!Ghost) { break; }
-			Spawned.Add(Ghost);
+			Total += Part.TileCenters.Num();
+			if (Part.RecipeClassPath.IsEmpty()) { continue; }
+			const int32 Count = FMath::Min(Part.TileCenters.Num(), Budget);
+			for (int32 i = 0; i < Count; ++i)
+			{
+				AActor* Ghost = FAIDAActionSeam::SpawnGhostHologram(this, Part.RecipeClassPath, Part.TileCenters[i], Part.YawDeg, this);
+				if (!Ghost) { break; }
+				Spawned.Add(Ghost);
+				--Budget;
+			}
+			if (Budget <= 0) { break; }
 		}
-		if (View.TileCenters.Num() > Count)
+		if (Total > Spawned.Num())
 		{
-			UE_LOG(LogAIDA, Log, TEXT("[actions] ghost preview capped at %d of %d tiles."), Count, View.TileCenters.Num());
+			UE_LOG(LogAIDA, Log, TEXT("[actions] ghost preview capped at %d of %d tiles."), Spawned.Num(), Total);
 		}
 	}
 }

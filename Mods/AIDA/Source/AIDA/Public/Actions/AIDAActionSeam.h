@@ -71,6 +71,15 @@ public:
 		const TArray<FTransform>& Placements, FAIDADryRunResult& Out);
 
 	/**
+	 * Spec-v2 composite dry-run: DryRunBuild per part over its slice of the placements (grouped by
+	 * PlacementPartIndex), with failures remapped to GLOBAL placement indices, costs merged by item,
+	 * clipping summed, and affordability checked against the merged tally. PartRecipePaths is indexed
+	 * by the values in PlacementPartIndex (parallel to Placements).
+	 */
+	static bool DryRunBuildParts(UObject* WorldContext, const TArray<FString>& PartRecipePaths,
+		const TArray<int32>& PlacementPartIndex, const TArray<FTransform>& Placements, FAIDADryRunResult& Out);
+
+	/**
 	 * Count live buildables matching the selector (display name + radius, full actors AND
 	 * lightweight instances) and tally their dismantle refunds. Called at dry-run for the report
 	 * and AGAIN at execute (Slice 2) — never from a cached FactoryIndex snapshot.

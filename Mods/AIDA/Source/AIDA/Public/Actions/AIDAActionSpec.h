@@ -14,9 +14,11 @@ class FJsonObject;
 namespace AIDAActionSpec
 {
 	/**
-	 * Parse + validate a propose_build spec (docs/PHASE4.md §2a). Strict: version must be 1, buildable
-	 * non-empty, grid counts >= 1, countX*countY <= MaxItems. Yaw is snapped to the nearest 90° and
-	 * normalized to 0/90/180/270. Returns false with a model-facing reason in OutError.
+	 * Parse + validate a propose_build spec (docs/PHASE4.md §2a). v1: buildable non-empty, grid counts
+	 * >= 1, countX*countY <= MaxItems. v2 (composite): a non-empty `parts` array (each part = buildable
+	 * + optional at:{x,y,z} offset in metres + optional yawDeg + optional grid), total placements across
+	 * parts <= MaxItems. Yaws snap to the nearest 90° and normalize to 0/90/180/270. Returns false with
+	 * a model-facing reason in OutError.
 	 */
 	bool ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDABuildSpec& Out, FString& OutError);
 
@@ -90,7 +92,17 @@ namespace AIDAActionSpec
 	 */
 	TArray<FTransform> ExpandGrid(const FAIDABuildSpec& Spec, double DefaultStepXM, double DefaultStepYM);
 
-	/** Human diff line: "place 100 x Foundation 8m x 2m in a 10x10 grid". */
+	/**
+	 * Expand a v2 composite (Spec.Parts non-empty) into world-unit transforms, grouped by part
+	 * (contiguous runs, part order preserved — the executor batches one recipe at a time). Each part's
+	 * origin = composite origin + composite-yaw-rotated offset; each part's yaw = composite yaw + part
+	 * yaw. FootprintsM is parallel to Spec.Parts (per-part default/clamp grid steps, metres).
+	 * OutPartIndex is filled parallel to the returned placements.
+	 */
+	TArray<FTransform> ExpandParts(const FAIDABuildSpec& Spec, const TArray<FVector2D>& FootprintsM,
+		TArray<int32>& OutPartIndex);
+
+	/** Human diff line: "place 100 x Foundation 8m x 2m in a 10x10 grid" (v2: parts breakdown). */
 	FString SummarizeBuild(const FAIDABuildSpec& Spec);
 
 	/** Human diff line: "dismantle up to 20 x Smelter within 50 m of (-120, 45)". */
@@ -99,8 +111,11 @@ namespace AIDAActionSpec
 	/** Proposal-state name for reports ("pending", "awaiting approval" is phrased by callers). */
 	FString StateToString(EAIDAProposalState State);
 
-	/** Dry-run success report (docs/PHASE4.md §2b) — the propose_* tool result once a proposal is stored. */
-	FString BuildDryRunJson(const FAIDAProposal& Proposal, int32 ExpiresInSec, bool bAffordable, double PowerDrawMW);
+	/** Dry-run success report (docs/PHASE4.md §2b) — the propose_* tool result once a proposal is
+	 *  stored. OriginM (metres), when supplied, is echoed as "origin" so the model can place follow-up
+	 *  proposals relative to what it just anchored. */
+	FString BuildDryRunJson(const FAIDAProposal& Proposal, int32 ExpiresInSec, bool bAffordable, double PowerDrawMW,
+		const FVector* OriginM = nullptr);
 
 	/** Dry-run failure report: bounded per-index reasons so the model can revise the spec. */
 	FString BuildErrorJson(const FString& Error, const TArray<FAIDAPlacementFailure>& FirstFailures, int32 MaxShown = 5);
