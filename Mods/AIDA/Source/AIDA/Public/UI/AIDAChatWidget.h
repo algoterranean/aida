@@ -178,6 +178,7 @@ private:
 		FGuid Id;
 		FString Prefix;
 		FString Body;
+		bool bSystem = false; // System lines render dimmed + markdown-sanitized (no nested tags)
 	};
 	struct FConversationView
 	{

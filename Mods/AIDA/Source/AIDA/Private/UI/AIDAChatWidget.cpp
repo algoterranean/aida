@@ -126,7 +126,7 @@ void UAIDAChatWidget::NativeConstruct()
 		// Semi-transparent dark backdrop behind the chat (left half) so text reads over the game, like
 		// the native chat. Added first + given a low Z so it sits behind the tabs/transcript/input.
 		UBorder* Backdrop = WidgetTree->ConstructWidget<UBorder>();
-		Backdrop->SetBrushColor(FLinearColor(0.f, 0.f, 0.f, 0.4f));
+		Backdrop->SetBrushColor(FLinearColor(0.02f, 0.02f, 0.025f, 0.78f)); // near-opaque dark (user: "darker")
 		Backdrop->SetVisibility(ESlateVisibility::HitTestInvisible);
 		if (UCanvasPanelSlot* BgSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(Backdrop)))
 		{
@@ -264,7 +264,7 @@ void UAIDAChatWidget::BuildProposalPanel(UFont* GameFont, float FontSize)
 
 	// Dark card anchored to the top of the right half (the chat window occupies the left half).
 	ProposalPanel = WidgetTree->ConstructWidget<UBorder>();
-	ProposalPanel->SetBrushColor(FLinearColor(0.f, 0.f, 0.f, 0.55f));
+	ProposalPanel->SetBrushColor(FLinearColor(0.02f, 0.02f, 0.025f, 0.82f));
 	ProposalPanel->SetPadding(FMargin(12.f));
 	ProposalPanel->SetVisibility(ESlateVisibility::Collapsed);
 	if (UCanvasPanelSlot* CardSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(ProposalPanel)))
@@ -423,9 +423,27 @@ void UAIDAChatWidget::BuildTranscriptRich(UFont* GameFont, float FontSize)
 	AddStyle(TEXT("Bold"), MakeFont(TEXT("Bold"), FontSize), FLinearColor::White);
 	AddStyle(TEXT("Italic"), MakeFont(TEXT("Italic"), FontSize), FLinearColor::White);
 	AddStyle(TEXT("Code"), MonoFont, FLinearColor(0.70f, 0.88f, 1.0f, 1.0f));
-	AddStyle(TEXT("Header"), MakeFont(TEXT("Bold"), FontSize + 3.f), FLinearColor::White);
+	AddStyle(TEXT("Header"), MakeFont(TEXT("Bold"), FontSize + 2.f), FLinearColor::White); // compact: +2, was +3
 	AddStyle(TEXT("Mono"), MonoFont, FLinearColor::White);
 	AddStyle(TEXT("MonoHeader"), MonoFont, FLinearColor(1.0f, 0.85f, 0.4f, 1.0f)); // amber header
+
+	// Per-participant name colors (user ask): AIDA amber, System gray, players from a fixed palette
+	// by name hash — the same speaker keeps the same color all session. Sys dims whole system lines.
+	AddStyle(TEXT("NameAida"), MakeFont(TEXT("Bold"), FontSize), FLinearColor(1.0f, 0.72f, 0.30f, 1.0f));
+	AddStyle(TEXT("NameSys"), MakeFont(TEXT("Bold"), FontSize - 1.f), FLinearColor(0.62f, 0.62f, 0.62f, 1.0f));
+	AddStyle(TEXT("Sys"), MakeFont(NAME_None, FontSize - 1.f), FLinearColor(0.66f, 0.66f, 0.66f, 1.0f));
+	const FLinearColor NamePalette[6] = {
+		FLinearColor(0.45f, 0.85f, 1.00f, 1.f),  // cyan
+		FLinearColor(0.55f, 0.95f, 0.55f, 1.f),  // green
+		FLinearColor(0.95f, 0.60f, 0.95f, 1.f),  // magenta
+		FLinearColor(1.00f, 0.95f, 0.50f, 1.f),  // yellow
+		FLinearColor(0.60f, 0.70f, 1.00f, 1.f),  // blue
+		FLinearColor(1.00f, 0.60f, 0.55f, 1.f)   // salmon
+	};
+	for (int32 i = 0; i < 6; ++i)
+	{
+		AddStyle(FName(*FString::Printf(TEXT("Name%d"), i)), MakeFont(TEXT("Bold"), FontSize), NamePalette[i]);
+	}
 
 	TranscriptRich = WidgetTree->ConstructWidget<URichTextBlock>();
 	TranscriptRich->SetTextStyleSet(StyleSet);
@@ -473,9 +491,23 @@ void UAIDAChatWidget::HandleMsgBegin(const FAIDAMessageHeader& Header)
 	}
 	else
 	{
+		// Author names get their own color style (rich tags pass through the markdown converter
+		// untouched): AIDA amber, System gray, players hashed into a stable palette slot.
+		const TCHAR* Tag = nullptr;
+		FString PlayerTag;
+		const bool bSystem = Header.Author.Equals(TEXT("System"), ESearchCase::IgnoreCase);
+		if (bSystem) { Tag = TEXT("NameSys"); }
+		else if (Header.Author.Equals(TEXT("AIDA"), ESearchCase::IgnoreCase)) { Tag = TEXT("NameAida"); }
+		else
+		{
+			PlayerTag = FString::Printf(TEXT("Name%u"), GetTypeHash(Header.Author.ToLower()) % 6u);
+			Tag = *PlayerTag;
+		}
+
 		FRenderedMessage Msg;
 		Msg.Id = Header.Id;
-		Msg.Prefix = FString::Printf(TEXT("**%s:** "), *Header.Author); // bold author via markdown
+		Msg.bSystem = bSystem;
+		Msg.Prefix = FString::Printf(TEXT("<%s>%s:</> "), Tag, *Header.Author);
 		View.IndexById.Add(Header.Id, View.Messages.Add(MoveTemp(Msg)));
 	}
 	if (Header.ConversationId == CurrentConversationId) { RenderActiveConversation(); }
@@ -670,9 +702,25 @@ void UAIDAChatWidget::RenderActiveConversation()
 	{
 		for (const FRenderedMessage& Msg : View->Messages)
 		{
-			if (!Out.IsEmpty()) { Out += TEXT("\n\n"); }
+			// Compact transcript (user ask): single newline between messages, like a terminal.
+			if (!Out.IsEmpty()) { Out += TEXT("\n"); }
 			Out += Msg.Prefix;
-			Out += Msg.Body;
+			if (Msg.bSystem)
+			{
+				// Whole system line dimmed. Rich-text tags don't nest, so strip anything the
+				// markdown pass could turn into a tag — system lines are plain server prose anyway.
+				FString Plain = Msg.Body;
+				Plain.ReplaceInline(TEXT("*"), TEXT(""));
+				Plain.ReplaceInline(TEXT("`"), TEXT(""));
+				Plain.ReplaceInline(TEXT("<"), TEXT("("));
+				Plain.ReplaceInline(TEXT(">"), TEXT(")"));
+				Plain.ReplaceInline(TEXT("\n"), TEXT("</>\n<Sys>")); // tags don't span lines
+				Out += FString::Printf(TEXT("<Sys>%s</>"), *Plain);
+			}
+			else
+			{
+				Out += Msg.Body;
+			}
 		}
 	}
 	RenderedTranscript = MoveTemp(Out);
