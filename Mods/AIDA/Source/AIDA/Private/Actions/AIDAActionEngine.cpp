@@ -151,6 +151,11 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		OutMessage = TEXT("manifolds are anchored to machine ports and can't be nudged — reject and re-propose instead");
 		return false;
 	}
+	if (Proposal->bLabel)
+	{
+		OutMessage = TEXT("labels are anchored to their containers and can't be nudged — reject and re-propose instead");
+		return false;
+	}
 
 	// Transform a copy; the original survives an invalid adjustment untouched. Auto-power pole
 	// placements ride along with the SAME transform (same rotation centroid — the machines') so a
@@ -225,6 +230,10 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 	if (Proposal->bManifold)
 	{
 		return TickManifold(WorldContext, Config, Memory, *Proposal);
+	}
+	if (Proposal->bLabel)
+	{
+		return TickLabels(WorldContext, Config, Memory, *Proposal);
 	}
 	if (Proposal->bAutoPower && !Proposal->bDismantle)
 	{
@@ -345,6 +354,38 @@ bool FAIDAActionEngine::TickManifold(UObject* WorldContext, const FAIDAActionsCo
 			RunOne(Attachment, Proposal.DropDir, Machine, MachineDir, TEXT("drop"), Index);
 		}
 		if (Proposal.Cursor < N) { return true; }
+	}
+
+	FinishExecution(WorldContext, Config, Memory, Proposal);
+	return false;
+}
+
+bool FAIDAActionEngine::TickLabels(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
+{
+	// One sign per tick: each is a trace + hologram walk + construct + sign-data write, and label
+	// counts are small (a container row) — smoothness over raw throughput, like the run phases.
+	if (Proposal.Cursor < Proposal.LabelTargets.Num())
+	{
+		const int32 Index = Proposal.Cursor++;
+		const FAIDALabelTarget& Target = Proposal.LabelTargets[Index];
+		FString Error;
+		if (FAIDAActionSeam::BuildLabelSign(WorldContext, Proposal.RecipeClassPath, Target.Container.Get(),
+			Target.SignPosCm, Target.OutwardCm, Target.Text,
+			Proposal.AffectedEntityIds, BuiltActors, Error))
+		{
+			++RunBuiltCount;
+		}
+		else
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("sign %d (%s, \"%s\"): %s"),
+					Index, *Target.ContainerClass, *Target.Text, *Error));
+			}
+			UE_LOG(LogAIDA, Warning, TEXT("[actions] label sign %d failed: %s"), Index, *Error);
+		}
+		if (Proposal.Cursor < Proposal.LabelTargets.Num()) { return true; }
 	}
 
 	FinishExecution(WorldContext, Config, Memory, Proposal);
@@ -484,10 +525,10 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed, NowUtc);
 
 	const int32 Affected = Proposal.AffectedEntityIds.Num();
-	if (Proposal.bManifold || Proposal.bAutoPower)
+	if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel)
 	{
-		const TCHAR* Kind = Proposal.bManifold ? TEXT("manifold") : TEXT("power");
-		const TCHAR* Piece = Proposal.bManifold ? TEXT("run") : TEXT("wire");
+		const TCHAR* Kind = Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels") : TEXT("power"));
+		const TCHAR* Piece = Proposal.bManifold ? TEXT("run") : (Proposal.bLabel ? TEXT("sign") : TEXT("wire"));
 		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (%s): %d placement(s) (%d skipped), %d %s(s) built, %d %s(s) failed (journal %s)."),
 			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), Kind,
 			Proposal.Placements.Num() + Proposal.PolePlacements.Num() - SkippedCount, SkippedCount,

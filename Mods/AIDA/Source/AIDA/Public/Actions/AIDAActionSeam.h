@@ -164,6 +164,39 @@ public:
 		bool bChargeCost, TArray<FAIDACostItem>& OutCost,
 		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
 
+	//~ Container labels (P7 Slice 3 write side).
+
+	/**
+	 * Resolve the sign recipe for labels: the override name when given (normal fuzzy resolve),
+	 * otherwise the SMALLEST unlocked sign whose buildable is an AFGBuildableWidgetSign — no display-
+	 * name guessing across game versions. False with OutError when nothing sign-like is unlocked.
+	 */
+	static bool ResolveSignRecipe(UObject* WorldContext, const FString& OverrideName, FAIDARecipeResolution& Out, FString& OutError);
+
+	/**
+	 * Storage containers within RadiusCm of CenterCm that need a label: dominant inventory item →
+	 * Text; empty containers and containers that already have a sign within a face's reach are
+	 * skipped (counted separately). The sign spot sits just off the container face nearest the
+	 * viewer (falling back to the container's front). Returns the number of targets.
+	 */
+	static int32 ResolveLabelTargets(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+		int32 MaxCount, const FString& ItemFilter, const FVector& ViewerCm, bool bHasViewer,
+		TArray<FAIDALabelTarget>& OutTargets, int32& OutSkippedEmpty, int32& OutSkippedLabeled);
+
+	/**
+	 * Build ONE label sign on a container: trace from the sign spot into the container face for a
+	 * real hit, drive the sign hologram through the standard headless recipe (reset disqualifiers →
+	 * build mode → UpdateHologramPlacement → validate), Construct, then write the label text into
+	 * the sign via GetSignPrefabData/SetPrefabSignData (all text elements; descriptor defaults when
+	 * the fresh sign has none). Cost is NOT charged here — label proposals pay upfront like builds.
+	 */
+	static bool BuildLabelSign(UObject* WorldContext, const FString& SignRecipePath, AActor* Container,
+		const FVector& SignPosCm, const FVector& OutwardCm, const FString& Text,
+		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
+
+	/** Tally one recipe's ingredient cost × Count (the label proposal's upfront cost line). */
+	static bool TallyRecipeCost(UObject* WorldContext, const FString& RecipeClassPath, int32 Count, TArray<FAIDACostItem>& Out);
+
 	//~ Auto-power (docs/PHASE4-POWER.md).
 
 	/** Resolved power kit for an auto-powered build: pole recipe (lowest unlocked mk or the

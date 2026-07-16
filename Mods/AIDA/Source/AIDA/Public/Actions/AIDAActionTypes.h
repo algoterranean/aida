@@ -88,6 +88,29 @@ struct FAIDAManifoldSpec
 	int32 PortIndex = 0;                   // which matching unconnected machine port (0 = first)
 };
 
+/** propose_label_containers spec v1 (P7 Slice 3 write side): put a sign with the dominant item name
+ *  on each storage container near a point. The model supplies a selector, never transforms. */
+struct FAIDALabelSpec
+{
+	int32 Version = 1;
+	FString Sign;                          // optional sign display-name override; "" = smallest unlocked sign
+	FVector CenterM = FVector::ZeroVector; // metres
+	bool bHasCenter = false;               // omitted center = the requester's aim (falling back to position)
+	double RadiusM = 30.0;
+	int32 MaxCount = 20;
+	FString ItemFilter;                    // optional: only containers holding this item (substring)
+};
+
+/** One container a label proposal holds between propose and execute (world units). */
+struct FAIDALabelTarget
+{
+	TWeakObjectPtr<AActor> Container;      // re-verified at execute; a dead container = one failed sign
+	FString ContainerClass;                // for failure reports
+	FVector SignPosCm = FVector::ZeroVector;   // where the sign goes (just off the chosen face)
+	FVector OutwardCm = FVector::XAxisVector;  // unit, from the container face toward the viewer
+	FString Text;                          // the label (dominant item), resolved at propose time
+};
+
 /** One machine-port point for the pure planner (world units; the seam resolves these live). */
 struct FAIDAManifoldPortPoint
 {
@@ -229,6 +252,11 @@ struct FAIDAProposal
 	FVector RowAxis = FVector::XAxisVector;
 	FVector DropDir = FVector::ZeroVector; // unit, from each attachment toward its machine
 	int32 Phase = 0;                       // executor: 0 = attachments/machines, then kind-specific
+
+	//~ Container-label extensions (P7 Slice 3). Placements carry the sign spots (ghost preview +
+	//  count + upfront cost reuse the build paths); Targets carry the containers and their texts.
+	bool bLabel = false;
+	TArray<FAIDALabelTarget> LabelTargets; // index-aligned with Placements
 
 	//~ Auto-power extensions (docs/PHASE4-POWER.md). Powered builds run phases 0 machines →
 	//  1 poles → 2 wires + grid tie. Empty/false = a plain (or manifold) proposal.

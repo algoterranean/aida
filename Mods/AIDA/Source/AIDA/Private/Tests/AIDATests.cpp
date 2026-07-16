@@ -1935,6 +1935,31 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 		TestFalse(TEXT("rejects missing radius"), AIDAActionSpec::ParseDismantleSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "center": { "x": 1, "y": 2 } })")), 200, Sel, Error));
 	}
+
+	// Label spec (P7 Slice 3): everything optional but the version; defaults hold; bad radius rejects.
+	{
+		FAIDALabelSpec Label;
+		TestTrue(TEXT("minimal label spec parses"), AIDAActionSpec::ParseLabelSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1 })")), 200, Label, Error));
+		TestFalse(TEXT("omitted center flagged"), Label.bHasCenter);
+		TestEqual(TEXT("default radius 30"), Label.RadiusM, 30.0);
+		TestEqual(TEXT("default maxCount 20"), Label.MaxCount, 20);
+
+		TestTrue(TEXT("full label spec parses"), AIDAActionSpec::ParseLabelSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "sign": "Label Sign", "center": { "x": 5, "y": -3 },
+			                            "radiusM": 12, "maxCount": 500, "item": "Iron Plate" })")), 200, Label, Error));
+		TestTrue(TEXT("center flagged"), Label.bHasCenter);
+		TestEqual(TEXT("sign override"), Label.Sign, TEXT("Label Sign"));
+		TestEqual(TEXT("item filter"), Label.ItemFilter, TEXT("Iron Plate"));
+		TestEqual(TEXT("maxCount clamped to cap"), Label.MaxCount, 200);
+
+		TestFalse(TEXT("rejects bad radius"), AIDAActionSpec::ParseLabelSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "radiusM": -4 })")), 200, Label, Error));
+
+		const FString Summary = AIDAActionSpec::SummarizeLabel(Label, TEXT("Label Sign"), 6);
+		TestTrue(TEXT("summary names the count and sign"),
+			Summary.Contains(TEXT("6 container(s)")) && Summary.Contains(TEXT("Label Sign")));
+	}
 	return true;
 }
 

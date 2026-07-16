@@ -85,6 +85,13 @@ private:
 	bool TickManifold(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 
 	/**
+	 * Advance a container-label proposal (P7 Slice 3): one sign per tick — trace onto the container
+	 * face, hologram-place, construct, write the text. Failed signs (container gone, face blocked,
+	 * placement invalid) are counted + reported like manifold runs, never fatal. True while more remain.
+	 */
+	bool TickLabels(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
+
+	/**
 	 * Advance an auto-powered build (docs/PHASE4-POWER.md): phase 0 machines, phase 1 poles (both
 	 * index-captured), phase 2 power lines (batched per tick) + one grid tie-in. Wire failures use
 	 * the same counted-and-announced report as manifold runs. True while more work remains.

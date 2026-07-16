@@ -32,6 +32,10 @@
 #include "FGRecipeManager.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildableStorage.h"
+#include "Buildables/FGBuildableWidgetSign.h"
+#include "FGSignInterface.h"
+#include "FGSignTypes.h"
 #include "Hologram/FGHologram.h"
 #include "ItemAmount.h"
 #include "Resources/FGBuildingDescriptor.h"
@@ -2000,4 +2004,296 @@ bool FAIDAActionSeam::FindGridTie(UObject* WorldContext, const TArray<TWeakObjec
 	OutExternal = BestPole ? BestPole : BestAny;
 	OutPoleIndex = BestPole ? BestPoleFrom : BestAnyFrom;
 	return OutExternal != nullptr;
+}
+
+bool FAIDAActionSeam::ResolveSignRecipe(UObject* WorldContext, const FString& OverrideName, FAIDARecipeResolution& Out, FString& OutError)
+{
+	// An explicit override resolves like any buildable, then must actually be a widget sign.
+	if (!OverrideName.IsEmpty())
+	{
+		if (!ResolveBuildRecipe(WorldContext, OverrideName, Out))
+		{
+			OutError = FString::Printf(TEXT("no unlocked buildable matches sign '%s'"), *OverrideName);
+			if (Out.Suggestions.Num() > 0)
+			{
+				OutError += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Out.Suggestions, TEXT(", ")));
+			}
+			return false;
+		}
+		UClass* RecipeClass = FSoftClassPath(Out.RecipeClassPath).TryLoadClass<UFGRecipe>();
+		const TArray<FItemAmount> Products = RecipeClass ? UFGRecipe::GetProducts(RecipeClass) : TArray<FItemAmount>();
+		const TSubclassOf<UFGBuildingDescriptor> Descriptor = Products.Num() > 0
+			? TSubclassOf<UFGBuildingDescriptor>(Products[0].ItemClass.Get()) : nullptr;
+		const TSubclassOf<AFGBuildable> BuildableClass = UFGBuildingDescriptor::GetBuildableClass(Descriptor);
+		if (!BuildableClass || !BuildableClass->IsChildOf(AFGBuildableWidgetSign::StaticClass()))
+		{
+			OutError = FString::Printf(TEXT("'%s' is not a text sign — pick a label/display sign"), *Out.DisplayName);
+			return false;
+		}
+		return true;
+	}
+
+	// No override: the SMALLEST unlocked widget sign, judged by clearance footprint — no name
+	// guessing ("Label Sign 2m" vs "Small Label Sign" drift across game versions).
+	UWorld* World = ResolveWorld(WorldContext);
+	TArray<FBuildRecipeEntry> Entries;
+	CollectBuildRecipes(World, Entries);
+
+	const FBuildRecipeEntry* Best = nullptr;
+	double BestArea = 0.0;
+	double BestX = 8.0, BestY = 8.0;
+	for (const FBuildRecipeEntry& Entry : Entries)
+	{
+		const TSubclassOf<AFGBuildable> BuildableClass = UFGBuildingDescriptor::GetBuildableClass(Entry.Descriptor);
+		if (!BuildableClass || !BuildableClass->IsChildOf(AFGBuildableWidgetSign::StaticClass())) { continue; }
+		double XM, YM;
+		ResolveFootprint(Entry.Descriptor, XM, YM);
+		const double Area = XM * YM;
+		if (!Best || Area < BestArea)
+		{
+			Best = &Entry;
+			BestArea = Area;
+			BestX = XM;
+			BestY = YM;
+		}
+	}
+	if (!Best)
+	{
+		OutError = TEXT("no sign is unlocked yet (signs unlock with a later tier) — labels need one");
+		return false;
+	}
+	Out = FAIDARecipeResolution();
+	Out.RecipeClassPath = Best->Recipe->GetPathName();
+	Out.DisplayName = Best->Name;
+	Out.FootprintXM = BestX;
+	Out.FootprintYM = BestY;
+	return true;
+}
+
+int32 FAIDAActionSeam::ResolveLabelTargets(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+	int32 MaxCount, const FString& ItemFilter, const FVector& ViewerCm, bool bHasViewer,
+	TArray<FAIDALabelTarget>& OutTargets, int32& OutSkippedEmpty, int32& OutSkippedLabeled)
+{
+	OutTargets.Reset();
+	OutSkippedEmpty = 0;
+	OutSkippedLabeled = 0;
+
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World) { return 0; }
+
+	// Existing signs, so re-running "label these" does not stack a second sign on every container.
+	TArray<FVector> SignLocations;
+	for (TActorIterator<AFGBuildableWidgetSign> It(World); It; ++It)
+	{
+		SignLocations.Add(It->GetActorLocation());
+	}
+
+	const FString WantedItem = NormalizeName(ItemFilter);
+	const double RadiusSq = FMath::Square(RadiusCm);
+
+	AFGBuildableSubsystem* Subsystem = AFGBuildableSubsystem::Get(World);
+	if (!Subsystem) { return 0; }
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (MaxCount > 0 && OutTargets.Num() >= MaxCount) { break; }
+		AFGBuildableStorage* Storage = Cast<AFGBuildableStorage>(Buildable);
+		if (!Storage || !IsValid(Storage)) { continue; }
+		if (FVector::DistSquared(Storage->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+
+		// Dominant inventory item -> label text; empty boxes would make noisy "Empty" signs, skip.
+		UFGInventoryComponent* Inventory = Storage->GetStorageInventory();
+		if (!Inventory) { continue; }
+		TMap<FString, int32> Totals;
+		bool bHoldsWanted = WantedItem.IsEmpty();
+		for (int32 Idx = 0; Idx < Inventory->GetSizeLinear(); ++Idx)
+		{
+			FInventoryStack Stack;
+			if (!Inventory->GetStackFromIndex(Idx, Stack) || !Stack.HasItems()) { continue; }
+			const FString Name = DescriptorName(Stack.Item.GetItemClass());
+			Totals.FindOrAdd(Name) += Stack.NumItems;
+			bHoldsWanted |= NormalizeName(Name).Contains(WantedItem);
+		}
+		if (Totals.Num() == 0) { ++OutSkippedEmpty; continue; }
+		if (!bHoldsWanted) { continue; }
+		FString Dominant;
+		int32 DominantCount = 0;
+		for (const TPair<FString, int32>& Pair : Totals)
+		{
+			if (Pair.Value > DominantCount || (Pair.Value == DominantCount && Pair.Key < Dominant))
+			{
+				Dominant = Pair.Key;
+				DominantCount = Pair.Value;
+			}
+		}
+
+		FVector BoundsOrigin, BoundsExtent;
+		Storage->GetActorBounds(/*bOnlyCollidingComponents*/ false, BoundsOrigin, BoundsExtent);
+
+		// One sign per box: an existing sign within the container's reach means "already labeled".
+		const double LabeledReach = BoundsExtent.GetMax() + 200.0;
+		const bool bLabeled = SignLocations.ContainsByPredicate([&](const FVector& At)
+		{
+			return FVector::DistSquared(At, BoundsOrigin) <= FMath::Square(LabeledReach);
+		});
+		if (bLabeled) { ++OutSkippedLabeled; continue; }
+
+		// Face the viewer when we know where they are; the container front otherwise. Snap to the
+		// nearest of the actor's four horizontal axes so the sign sits flat on a face.
+		FVector Toward = bHasViewer ? (ViewerCm - BoundsOrigin) : Storage->GetActorForwardVector();
+		Toward.Z = 0.0;
+		if (!Toward.Normalize()) { Toward = Storage->GetActorForwardVector(); }
+		const FVector Axes[4] = {
+			Storage->GetActorForwardVector(), -Storage->GetActorForwardVector(),
+			Storage->GetActorRightVector(), -Storage->GetActorRightVector() };
+		FVector Outward = Axes[0];
+		double BestDot = -2.0;
+		for (const FVector& Axis : Axes)
+		{
+			FVector Flat = Axis;
+			Flat.Z = 0.0;
+			if (!Flat.Normalize()) { continue; }
+			const double Dot = Flat | Toward;
+			if (Dot > BestDot) { BestDot = Dot; Outward = Flat; }
+		}
+		const double FaceOffset = FMath::Abs(Outward.X) * BoundsExtent.X + FMath::Abs(Outward.Y) * BoundsExtent.Y;
+
+		FAIDALabelTarget Target;
+		Target.Container = Storage;
+		Target.ContainerClass = GetNameSafe(Storage->GetClass());
+		Target.OutwardCm = Outward;
+		Target.SignPosCm = BoundsOrigin + Outward * (FaceOffset + 60.0);
+		Target.Text = Dominant;
+		OutTargets.Add(MoveTemp(Target));
+	}
+	return OutTargets.Num();
+}
+
+bool FAIDAActionSeam::BuildLabelSign(UObject* WorldContext, const FString& SignRecipePath, AActor* Container,
+	const FVector& SignPosCm, const FVector& OutwardCm, const FString& Text,
+	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(SignRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass) { OutError = TEXT("sign recipe failed to load"); return false; }
+	if (!IsValid(Container)) { OutError = TEXT("container is gone"); return false; }
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory) { OutError = TEXT("no player available for validation"); return false; }
+
+	// A real hit ON the container face — sign holograms snap to surfaces, not to thin air.
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDALabelTrace), /*bTraceComplex*/ false);
+	FHitResult Hit;
+	const FVector TraceEnd = SignPosCm - OutwardCm * 400.0;
+	if (!World->LineTraceSingleByChannel(Hit, SignPosCm, TraceEnd, AIDABuildGunChannel, Params)
+		|| Hit.GetActor() != Container)
+	{
+		// Something sits between the sign spot and the box (or the trace missed): aim at the center.
+		if (!World->LineTraceSingleByChannel(Hit, SignPosCm, Container->GetActorLocation(), AIDABuildGunChannel, Params)
+			|| Hit.GetActor() != Container)
+		{
+			OutError = TEXT("could not reach the container face (something is in the way)");
+			return false;
+		}
+	}
+
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, Hit.ImpactPoint);
+	if (!Hologram) { OutError = TEXT("sign hologram failed to spawn"); return false; }
+
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(Hit);
+	Hologram->ValidatePlacementAndCost(Inventory);
+
+	TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
+	Hologram->GetConstructDisqualifiers(Disqualifiers);
+	for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+	{
+		if (IsBlockingDisqualifier(Disqualifier))
+		{
+			OutError = UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString();
+			Hologram->Destroy();
+			return false;
+		}
+	}
+
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	if (!Built) { OutError = TEXT("sign construction failed"); return false; }
+
+	const auto Capture = [&](AActor* Actor)
+	{
+		if (!Actor) { return; }
+		FAIDAEntityId Entity;
+		Entity.Type = TEXT("actor");
+		Entity.ClassPath = Actor->GetClass()->GetPathName();
+		Entity.RecipePath = Actor == Built ? SignRecipePath : FString();
+		Entity.Pos = Actor->GetActorLocation();
+		Entity.YawDeg = FMath::RoundToInt32(Actor->GetActorRotation().Yaw);
+		OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
+		OutActors.Add(Actor);
+	};
+	Capture(Built);
+	for (AActor* Child : Children) { Capture(Child); }
+
+	// The label itself. A fresh sign may carry no prefab data at all — fall back to its type
+	// descriptor for the element names, the first prefab layout, and the default colors.
+	AFGBuildableWidgetSign* Sign = Cast<AFGBuildableWidgetSign>(Built);
+	if (!Sign)
+	{
+		for (AActor* Child : Children)
+		{
+			Sign = Cast<AFGBuildableWidgetSign>(Child);
+			if (Sign) { break; }
+		}
+	}
+	if (!Sign)
+	{
+		OutError = TEXT("built, but the result is not a text sign — text not set");
+		return false;
+	}
+
+	FPrefabSignData Data;
+	Sign->GetSignPrefabData(Data);
+	TSubclassOf<UFGSignTypeDescriptor> TypeDesc = Data.SignTypeDesc;
+	if (!TypeDesc)
+	{
+		TypeDesc = IFGSignInterface::Execute_GetSignTypeDescriptor(Sign);
+		Data.SignTypeDesc = TypeDesc;
+	}
+	if (const UFGSignTypeDescriptor* Descriptor = TypeDesc ? TypeDesc->GetDefaultObject<UFGSignTypeDescriptor>() : nullptr)
+	{
+		if (Data.TextElementData.Num() == 0)
+		{
+			TArray<FString> Keys;
+			Descriptor->GetTextElementNameMap().GenerateKeyArray(Keys);
+			for (const FString& Key : Keys) { Data.TextElementData.Add(Key, Text); }
+		}
+		if (Data.PrefabLayout.IsNull() && Descriptor->GetPrefabArray().Num() > 0)
+		{
+			Data.PrefabLayout = Descriptor->GetPrefabArray()[0];
+		}
+		if (Data.ForegroundColor.Equals(Data.BackgroundColor)) // black-on-black defaults = unreadable
+		{
+			Data.ForegroundColor = Descriptor->GetDefaultForegroundColor();
+			Data.BackgroundColor = Descriptor->GetDefaultBackgroundColor();
+			Data.AuxiliaryColor = Descriptor->GetDefaultAuxiliaryColor();
+		}
+	}
+	for (TPair<FString, FString>& Element : Data.TextElementData)
+	{
+		Element.Value = Text;
+	}
+	Data.Emissive = FMath::Max(Data.Emissive, 1.0f);
+	Sign->SetPrefabSignData(Data);
+	return true;
+}
+
+bool FAIDAActionSeam::TallyRecipeCost(UObject* WorldContext, const FString& RecipeClassPath, int32 Count, TArray<FAIDACostItem>& Out)
+{
+	UClass* RecipeClass = FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>();
+	if (!RecipeClass || Count <= 0) { return false; }
+	for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(WorldContext, RecipeClass))
+	{
+		AddCost(Out, Ingredient.ItemClass, Ingredient.Amount * Count);
+	}
+	return true;
 }

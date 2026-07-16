@@ -151,6 +151,58 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 	return true;
 }
 
+bool AIDAActionSpec::ParseLabelSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDALabelSpec& Out, FString& OutError)
+{
+	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }
+	if (!CheckVersion(Spec, OutError)) { return false; }
+
+	FAIDALabelSpec Parsed;
+	Spec->TryGetStringField(TEXT("sign"), Parsed.Sign);
+	Parsed.Sign = Parsed.Sign.TrimStartAndEnd();
+	Spec->TryGetStringField(TEXT("item"), Parsed.ItemFilter);
+	Parsed.ItemFilter = Parsed.ItemFilter.TrimStartAndEnd();
+
+	// center is optional, like every selector: omitted = around the requester's aim/position.
+	if (Spec->HasField(TEXT("center")))
+	{
+		if (!ReadVectorM(Spec, TEXT("center"), Parsed.CenterM))
+		{
+			OutError = TEXT("'center' must be an object with numeric x and y (metres) — or omit it to label containers around the player");
+			return false;
+		}
+		Parsed.bHasCenter = true;
+	}
+	if (Spec->HasField(TEXT("radiusM")))
+	{
+		if (!Spec->TryGetNumberField(TEXT("radiusM"), Parsed.RadiusM) || Parsed.RadiusM <= 0.0)
+		{
+			OutError = TEXT("'radiusM' must be a positive number");
+			return false;
+		}
+	}
+	int32 MaxCount = 0;
+	if (Spec->TryGetNumberField(TEXT("maxCount"), MaxCount))
+	{
+		if (MaxCount < 1) { OutError = TEXT("'maxCount' must be >= 1"); return false; }
+		Parsed.MaxCount = MaxCount;
+	}
+	if (MaxItems > 0) { Parsed.MaxCount = FMath::Min(Parsed.MaxCount, MaxItems); }
+
+	Out = MoveTemp(Parsed);
+	return true;
+}
+
+FString AIDAActionSpec::SummarizeLabel(const FAIDALabelSpec& Spec, const FString& SignName, int32 Count)
+{
+	FString Summary = FString::Printf(TEXT("label %d container(s) with a %s each (contents as text) within %.0f m of (%.0f, %.0f)"),
+		Count, *SignName, Spec.RadiusM, Spec.CenterM.X, Spec.CenterM.Y);
+	if (!Spec.ItemFilter.IsEmpty())
+	{
+		Summary += FString::Printf(TEXT(", holding %s"), *Spec.ItemFilter);
+	}
+	return Summary;
+}
+
 bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError)
 {
 	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }

@@ -123,6 +123,9 @@ namespace
 		"cost, cap), revise the spec or explain the reason. Never claim something was built until "
 		"get_proposal_status says executed.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
+		"- propose_label_containers(spec): propose one sign per storage container, its text set to the "
+		"container's main item. Use when the player asks to label containers/boxes. Omit spec.center to "
+		"label the containers they're looking at; empty or already-labeled containers are skipped.\n"
 		"- propose_manifold(spec): propose the belt-plumbing for a row of machines — one splitter (or "
 		"merger) per machine plus the connecting belts, or the pipe-junction + pipe equivalent. Use it "
 		"whenever the player asks to belt up / feed / connect machines; do NOT build splitters and belts "
@@ -1757,6 +1760,123 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Stage(TEXT("published — done"));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
+		}
+	});
+
+	// propose_label_containers (P7 Slice 3): containers resolve live -> sign spot + dominant-item
+	// text each -> one proposal through the standard approve/execute/journal pipeline.
+	Tools.Register({
+		TEXT("propose_label_containers"),
+		TEXT("PROPOSE labeling storage containers: one small sign per container, its text set to the container's main (dominant) item. Nothing is built until a player with act permission approves. Spec: {version:1, sign?:'sign display name (default: smallest unlocked sign)', center?:{x,y in metres}, radiusM?:30, maxCount?:20, item?:'only containers holding this item'}. OMIT center to label the containers near where the requesting player is looking. Empty containers and containers that already have a sign are skipped automatically. Costs the signs' materials."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned label spec (see tool description)."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+
+			FAIDALabelSpec Spec;
+			FString Error;
+			if (!AIDAActionSpec::ParseLabelSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			FAIDARecipeResolution Sign;
+			if (!FAIDAActionSeam::ResolveSignRecipe(this, Spec.Sign, Sign, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			// No center = the containers the player is looking at, falling back to their position.
+			if (!Spec.bHasCenter)
+			{
+				FVector AimCm;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				{
+					Spec.CenterM = AimCm / 100.0;
+				}
+				else if (Ctx.bHasLocation)
+				{
+					Spec.CenterM = Ctx.Location / 100.0;
+				}
+				else
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'center' {x,y in metres}"), {}));
+				}
+				Spec.bHasCenter = true;
+				const TSharedRef<FJsonObject> Center = MakeShared<FJsonObject>();
+				Center->SetField(TEXT("x"), AIDANumber(Spec.CenterM.X));
+				Center->SetField(TEXT("y"), AIDANumber(Spec.CenterM.Y));
+				Center->SetField(TEXT("z"), AIDANumber(Spec.CenterM.Z));
+				(*SpecObj)->SetObjectField(TEXT("center"), Center);
+			}
+
+			// The signs face the requesting player — the person asking is looking at the boxes.
+			TArray<FAIDALabelTarget> Targets;
+			int32 SkippedEmpty = 0, SkippedLabeled = 0;
+			FAIDAActionSeam::ResolveLabelTargets(this, Spec.CenterM * AIDAMetersToCm, Spec.RadiusM * AIDAMetersToCm,
+				Spec.MaxCount, Spec.ItemFilter, Ctx.Location, Ctx.bHasLocation, Targets, SkippedEmpty, SkippedLabeled);
+			if (Targets.Num() == 0)
+			{
+				FString Msg = FString::Printf(TEXT("no containers to label within %.0f m"), Spec.RadiusM);
+				if (SkippedLabeled > 0) { Msg += FString::Printf(TEXT(" — %d already labeled"), SkippedLabeled); }
+				if (SkippedEmpty > 0) { Msg += FString::Printf(TEXT(", %d empty (skipped)"), SkippedEmpty); }
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			TArray<FAIDACostItem> Cost;
+			FAIDAActionSeam::TallyRecipeCost(this, Sign.RecipeClassPath, Targets.Num(), Cost);
+			if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, Cost))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					FString::Printf(TEXT("%d sign(s) not affordable from central storage (dimensional depot)"), Targets.Num()), {}));
+			}
+
+			// Sign spots as placements: the ghost preview, pending caps, and upfront cost reuse the
+			// standard build paths for free. Yaw faces outward, like the built sign will.
+			TArray<FTransform> Placements;
+			Placements.Reserve(Targets.Num());
+			for (const FAIDALabelTarget& Target : Targets)
+			{
+				Placements.Add(FTransform(Target.OutwardCm.Rotation(), Target.SignPosCm));
+			}
+
+			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid();
+			Proposal.SpecJson = AIDAToCompactJson(SpecObj->ToSharedRef());
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = MoveTemp(Placements);
+			Proposal.RecipeClassPath = Sign.RecipeClassPath;
+			Proposal.Cost = Cost;
+			Proposal.bLabel = true;
+			Proposal.LabelTargets = MoveTemp(Targets);
+			Proposal.Summary = AIDAActionSpec::SummarizeLabel(Spec, Sign.DisplayName, Proposal.LabelTargets.Num());
+			if (SkippedLabeled > 0)
+			{
+				Proposal.Summary += FString::Printf(TEXT(" [%d already labeled, skipped]"), SkippedLabeled);
+			}
+			if (SkippedEmpty > 0)
+			{
+				Proposal.Summary += FString::Printf(TEXT(" [%d empty, skipped]"), SkippedEmpty);
+			}
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — costs %s. Awaiting approval."),
+				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, true, 0.0));
 		}
 	});
 

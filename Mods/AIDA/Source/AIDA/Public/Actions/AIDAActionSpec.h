@@ -24,6 +24,16 @@ namespace AIDAActionSpec
 	bool ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDADismantleSpec& Out, FString& OutError);
 
 	/**
+	 * Parse + validate a propose_label_containers spec (P7 Slice 3): version 1, everything optional —
+	 * sign override, center (omitted = requester's aim), radiusM (default 30), maxCount (default 20,
+	 * clamped to MaxItems), item filter.
+	 */
+	bool ParseLabelSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDALabelSpec& Out, FString& OutError);
+
+	/** Human diff line: "label 6 container(s) with a Label Sign each (contents as text) within 30 m of (x, y)". */
+	FString SummarizeLabel(const FAIDALabelSpec& Spec, const FString& SignName, int32 Count);
+
+	/**
 	 * Parse + validate a propose_manifold spec (docs/PHASE4-MANIFOLDS.md §2): version 1, kind
 	 * belt/pipe, direction in/out, transport + machines.buildable required. Machine selector
 	 * defaults: radiusM 30, maxCount 0 (= all matches, clamped to MaxItems when capped).
