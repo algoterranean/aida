@@ -1326,10 +1326,11 @@ namespace
 		FHitResult Hit(ForceInit);
 		Hit.bBlockingHit = true;
 		Hit.HitObjectHandle = FActorInstanceHandle(Actor);
-		if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(Actor->GetRootComponent()))
-		{
-			Hit.Component = Root;
-		}
+		// A real primitive matters: built factory actors often root on a plain scene component, and
+		// engine snap code reads the hit component (live-verify: no snap with a null component).
+		UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Actor->GetRootComponent());
+		if (!Prim) { Prim = Actor->FindComponentByClass<UPrimitiveComponent>(); }
+		if (Prim) { Hit.Component = Prim; }
 		Hit.Location = ConnectorLoc;
 		Hit.ImpactPoint = ConnectorLoc;
 		Hit.Normal = Normal;
@@ -1373,6 +1374,72 @@ namespace
 			}
 		}
 		return bSnapped;
+	}
+}
+
+namespace
+{
+	/**
+	 * Wire a constructed belt to its endpoint ports DIRECTLY — the same thing the game's blueprint
+	 * paste does for open connections (FGBlueprintOpenFactoryConnectionManager). Engine hologram
+	 * snapping never latched onto our synthetic hits (live-verify: hologram AT the port, zero
+	 * snapped connections), so the connection layer is authored here: belt flow runs
+	 * mConnection0 → mConnection1, so conn0 must marry the source (From) port and conn1 the
+	 * destination — verified with CanConnectTo before touching anything. Idempotent per end (an end
+	 * the hologram DID snap is already connected and is skipped). False = report + let the caller
+	 * dismantle; never half-wires: a one-end failure disconnects what this call just connected.
+	 */
+	bool ConnectBeltEnds(AFGBuildableConveyorBase* Belt,
+		UFGFactoryConnectionComponent* FromConn, UFGFactoryConnectionComponent* ToConn, FString& OutError)
+	{
+		UFGFactoryConnectionComponent* C0 = Belt->GetConnection0();
+		UFGFactoryConnectionComponent* C1 = Belt->GetConnection1();
+		if (!C0 || !C1)
+		{
+			OutError = TEXT("constructed belt has no connection components");
+			return false;
+		}
+
+		// Orientation check: the belt's input (conn0) belongs at the SOURCE port. A reversed belt
+		// would run backwards — refuse it (CanConnectTo also enforces direction compatibility).
+		const double D0From = FVector::DistSquared(C0->GetConnectorLocation(), FromConn->GetConnectorLocation());
+		const double D1From = FVector::DistSquared(C1->GetConnectorLocation(), FromConn->GetConnectorLocation());
+		if (D1From < D0From)
+		{
+			OutError = TEXT("belt constructed reversed (output end at the source port)");
+			return false;
+		}
+
+		bool bConnectedStart = false;
+		if (!C0->IsConnected() && !FromConn->IsConnected())
+		{
+			if (!C0->CanConnectTo(FromConn))
+			{
+				OutError = TEXT("belt input end refuses the source port (direction mismatch)");
+				return false;
+			}
+			C0->SetConnection(FromConn);
+			bConnectedStart = true;
+		}
+		if (!C1->IsConnected() && !ToConn->IsConnected())
+		{
+			if (!C1->CanConnectTo(ToConn))
+			{
+				if (bConnectedStart) { C0->ClearConnection(); }
+				OutError = TEXT("belt output end refuses the destination port (direction mismatch)");
+				return false;
+			}
+			C1->SetConnection(ToConn);
+		}
+
+		if (!FromConn->IsConnected() || !ToConn->IsConnected())
+		{
+			// One port got taken between resolve and now (player built something) — undo our half.
+			if (bConnectedStart) { C0->ClearConnection(); }
+			OutError = TEXT("an endpoint port was already taken");
+			return false;
+		}
+		return true;
 	}
 }
 
@@ -1488,17 +1555,20 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 	if (!Inventory) { OutError = TEXT("no player inventory available to validate against"); return false; }
 
 	// Pick the endpoint ports on the LIVE actors (belts: from = output, to = input; pipes any↔any).
+	// The factory (belt) connections stay in scope: belts get wired directly after Construct.
 	FVector FromLoc, ToLoc, FromNormal, ToNormal;
+	UFGFactoryConnectionComponent* FromFactoryConn = nullptr;
+	UFGFactoryConnectionComponent* ToFactoryConn = nullptr;
 	if (!bPipe)
 	{
-		UFGFactoryConnectionComponent* FromConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
-		UFGFactoryConnectionComponent* ToConn = FindFactoryPort(ToActor, /*bWantOutput*/ false, ToWantDir);
-		if (!FromConn) { OutError = FString::Printf(TEXT("no free output port on %s facing the run"), *GetNameSafe(FromActor)); return false; }
-		if (!ToConn) { OutError = FString::Printf(TEXT("no free input port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
-		FromLoc = FromConn->GetConnectorLocation();
-		ToLoc = ToConn->GetConnectorLocation();
-		FromNormal = FromConn->GetConnectorNormal();
-		ToNormal = ToConn->GetConnectorNormal();
+		FromFactoryConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
+		ToFactoryConn = FindFactoryPort(ToActor, /*bWantOutput*/ false, ToWantDir);
+		if (!FromFactoryConn) { OutError = FString::Printf(TEXT("no free output port on %s facing the run"), *GetNameSafe(FromActor)); return false; }
+		if (!ToFactoryConn) { OutError = FString::Printf(TEXT("no free input port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
+		FromLoc = FromFactoryConn->GetConnectorLocation();
+		ToLoc = ToFactoryConn->GetConnectorLocation();
+		FromNormal = FromFactoryConn->GetConnectorNormal();
+		ToNormal = ToFactoryConn->GetConnectorNormal();
 	}
 	else
 	{
@@ -1533,9 +1603,12 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 		return false;
 	}
 
+	// Snap is attempted (a snapped end is already perfect) but NOT required for belts — engine snap
+	// never latched onto synthetic hits in live-verify; belts get their connections authored
+	// directly after Construct instead. Pipes still require the snap (no manual fluid wiring yet).
 	Hologram->ResetConstructDisqualifiers();
 	Hologram->UpdateHologramPlacement(MakePortHit(FromActor, FromLoc, FromNormal));
-	if (!VerifyRunSnap(Spline, FromActor, /*bLastConnection*/ false, FromLoc))
+	if (!VerifyRunSnap(Spline, FromActor, /*bLastConnection*/ false, FromLoc) && bPipe)
 	{
 		OutError = FString::Printf(TEXT("run start did not snap to %s's port"), *GetNameSafe(FromActor));
 		Hologram->Destroy();
@@ -1545,7 +1618,7 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 
 	Hologram->ResetConstructDisqualifiers();
 	Hologram->UpdateHologramPlacement(MakePortHit(ToActor, ToLoc, ToNormal));
-	if (!VerifyRunSnap(Spline, ToActor, /*bLastConnection*/ true, ToLoc))
+	if (!VerifyRunSnap(Spline, ToActor, /*bLastConnection*/ true, ToLoc) && bPipe)
 	{
 		OutError = FString::Printf(TEXT("run end did not snap to %s's port"), *GetNameSafe(ToActor));
 		Hologram->Destroy();
@@ -1596,6 +1669,42 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 			UE_LOG(LogAIDA, Error, TEXT("[actions] run failed AFTER cost deduction — items lost to the void."));
 		}
 		return false;
+	}
+
+	// Belts: author the endpoint connections directly (idempotent for ends the hologram DID snap).
+	// A belt that can't be wired is torn down again — a manifold never leaves dead belts around.
+	if (!bPipe)
+	{
+		AFGBuildableConveyorBase* Belt = Cast<AFGBuildableConveyorBase>(Built);
+		FString WireError;
+		if (!Belt || !ConnectBeltEnds(Belt, FromFactoryConn, ToFactoryConn, WireError))
+		{
+			OutError = FString::Printf(TEXT("belt could not be wired to its ports (%s)"),
+				Belt ? *WireError : TEXT("constructed actor is not a conveyor"));
+			for (AActor* Child : Children)
+			{
+				if (Child && Child->Implements<UFGDismantleInterface>()) { IFGDismantleInterface::Execute_Dismantle(Child); }
+			}
+			if (Built->Implements<UFGDismantleInterface>()) { IFGDismantleInterface::Execute_Dismantle(Built); }
+			if (bChargeCost)
+			{
+				UE_LOG(LogAIDA, Warning, TEXT("[actions] run torn down after wiring failure — its cost stays spent (dismantle refunds go nowhere here)."));
+			}
+			return false;
+		}
+
+		// Unsnapped ends made the hologram construct support poles AT the ports — clipping into the
+		// splitter/machine. The connections are authored now; the props go.
+		for (AActor* Child : Children)
+		{
+			if (Child && Child != Built && !Cast<AFGBuildableConveyorBase>(Child) &&
+				Child->Implements<UFGDismantleInterface>() &&
+				IFGDismantleInterface::Execute_CanDismantle(Child))
+			{
+				IFGDismantleInterface::Execute_Dismantle(Child);
+			}
+		}
+		Children.Reset(); // journal only the belt — the poles no longer exist
 	}
 
 	FAIDAEntityId Entity;
