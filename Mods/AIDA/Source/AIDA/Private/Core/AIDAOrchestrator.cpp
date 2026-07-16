@@ -104,6 +104,9 @@ namespace
 		"- tag_node(resource, purity?, label?): drop a labeled marker on the map at the nearest untapped "
 		"node of a resource to the player. This WRITES a shared map marker — only use it when the player "
 		"asks you to mark/tag/find-and-mark a node.\n"
+		"- mark_location(x, y, label): drop a labeled marker on the map at ANY coordinates (metres, as "
+		"other tools report them). Use when the player asks you to mark clusters, problem spots, or "
+		"anything you just found — never tell them to navigate by raw coordinates; mark the map instead.\n"
 		"- add_note(text, tags?): save a persistent note for the player (survives sessions), tagged with "
 		"their location/region. Use when they ask you to remember/note something.\n"
 		"- get_notes(keyword?, region?, near?): recall the player's saved notes. Check these when the "
@@ -114,6 +117,12 @@ namespace
 		"- compare_to(timestamp?, item?): how the factory changed vs an earlier snapshot (per-item + power "
 		"deltas). Use for 'how has my X changed', 'what changed since...'. Omit timestamp for the latest "
 		"snapshot.\n\n"
+		"LOCATION RULE (applies to EVERY tool with an optional origin/center/position): an OMITTED "
+		"location always resolves server-side to where the requesting player is AIMING (falling back to "
+		"where they stand). When the player says 'here', 'there', 'in front of me', 'these machines', or "
+		"gives NO location at all, call the tool immediately WITHOUT coordinates. NEVER ask the player "
+		"for coordinates and NEVER refuse a request for lack of a location — omitting the field IS the "
+		"correct way to say 'where I'm looking'.\n\n"
 		"World-modifying proposal tools (only registered when the server enables them):\n"
 		"- propose_build(spec): propose placing buildables on a snapped grid. NOTHING is built until a "
 		"player with act permission approves the proposal. Only call it when the player explicitly asks "
@@ -822,6 +831,41 @@ void UAIDAOrchestrator::RegisterTools()
 			Root->SetStringField(TEXT("resource"), Node->Resource);
 			Root->SetStringField(TEXT("purity"), Node->Purity);
 			if (!Node->Region.IsEmpty()) { Root->SetStringField(TEXT("region"), Node->Region); }
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+		}
+	});
+
+	// P7 polish (live-verify feedback): a general map stamp, so "mark the clusters" works — tag_node
+	// only marks resource nodes, and coordinates alone don't help a player NAVIGATE anywhere.
+	Tools.Register({
+		TEXT("mark_location"),
+		TEXT("Place a labeled marker on the map at any coordinates (a saved, shared map stamp). Use to mark machine clusters, problem spots (disconnected splitters, slow belts), or anything with a known [x, y] — e.g. after get_factory_overview or find_disconnected, mark what you found so the player can navigate to it. Pass 'x' and 'y' in metres (as returned by the other tools) and a short 'label'."),
+		TEXT(R"({"type":"object","properties":{"x":{"type":"number","description":"X in metres (tool-result convention)."},"y":{"type":"number","description":"Y in metres."},"label":{"type":"string","description":"Short marker label (e.g. \"Cluster 1: Aluminum Scrap\")."}},"required":["x","y","label"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			double X = 0.0, Y = 0.0;
+			FString Label;
+			const bool bHasX = Args->TryGetNumberField(TEXT("x"), X);
+			const bool bHasY = Args->TryGetNumberField(TEXT("y"), Y);
+			Args->TryGetStringField(TEXT("label"), Label);
+			if (!bHasX || !bHasY) { return FAIDAToolResult::Error(TEXT("mark_location needs numeric 'x' and 'y' (metres).")); }
+			if (Label.TrimStartAndEnd().IsEmpty()) { return FAIDAToolResult::Error(TEXT("mark_location needs a 'label'.")); }
+
+			// The 2D map only cares about X/Y; borrow the requester's Z so the stamp isn't underground.
+			const FVector LocationCm(X * 100.0, Y * 100.0, Ctx.bHasLocation ? Ctx.Location.Z : 0.0);
+			if (!FAIDAMapService::PlaceMapMarker(GetWorld(), LocationCm, Label))
+			{
+				return FAIDAToolResult::Error(TEXT("Could not place the marker (map unavailable or marker limit reached)."));
+			}
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetBoolField(TEXT("marked"), true);
+			Root->SetStringField(TEXT("label"), Label);
+			TArray<TSharedPtr<FJsonValue>> At;
+			At.Add(AIDANumber(X));
+			At.Add(AIDANumber(Y));
+			Root->SetArrayField(TEXT("location_m"), At);
 			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
 		}
 	});
