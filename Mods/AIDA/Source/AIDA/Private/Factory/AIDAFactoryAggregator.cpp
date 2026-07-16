@@ -157,18 +157,23 @@ TArray<FAIDACluster> FAIDAFactoryAggregator::BuildClusters(const TArray<FAIDAMac
 
 		FVector Sum = FVector::ZeroVector;
 		double EfficiencySum = 0.0;
+		int32 ProducingMachines = 0; // logistics-only nodes (splitters etc.) must not dilute efficiency
 		for (int32 i : Idx)
 		{
 			const FAIDAMachine& M = Machines[i];
 			Cluster.MachineIds.Add(M.Id);
 			Cluster.BuildingCensus.FindOrAdd(M.BuildingClass) += 1;
 			Sum += M.Location;
-			EfficiencySum += M.Productivity;
+			if (!M.bLogisticsOnly)
+			{
+				EfficiencySum += M.Productivity;
+				++ProducingMachines;
+			}
 		}
 		if (Idx.Num() > 0)
 		{
 			Cluster.Centroid = Sum / Idx.Num();
-			Cluster.Efficiency = static_cast<float>(EfficiencySum / Idx.Num());
+			Cluster.Efficiency = ProducingMachines > 0 ? static_cast<float>(EfficiencySum / ProducingMachines) : 1.0f;
 		}
 		NetMachineFlows(Machines, Idx, Config.RateTolerance, Cluster.NetInputs, Cluster.NetOutputs);
 		Clusters.Add(MoveTemp(Cluster));

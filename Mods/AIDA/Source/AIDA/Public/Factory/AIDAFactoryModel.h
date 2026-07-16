@@ -40,15 +40,29 @@ struct FAIDAMachine
 	TArray<FAIDAItemRate> Outputs;   // items/min produced at Clock
 	double PowerMW = 0.0;            // electrical load; >0 draws, <0 generates
 	int32 CircuitId = 0;             // power circuit this machine is wired to (0 = none)
+
+	//~ Logistics graph (P7 Slice 0). Splitters/mergers/pipe attachments enter Machines as
+	//~ bLogisticsOnly nodes: no production, but they carry edges, join clusters, and count ports.
+	bool bLogisticsOnly = false;
+	int32 InPortsTotal = 0;          // directional belt+pipe ports (FCD_INPUT / PCT_CONSUMER)
+	int32 InPortsConnected = 0;
+	int32 OutPortsTotal = 0;         // FCD_OUTPUT / PCT_PRODUCER
+	int32 OutPortsConnected = 0;
+	int32 AnyPortsTotal = 0;         // direction-agnostic ports (pipe junctions are all PCT_ANY)
+	int32 AnyPortsConnected = 0;
 };
 
-/** A belt/pipe carrying one item from one machine's output to another's input. */
+/**
+ * A logical belt/pipe link between two snapshot nodes (machines, logistics nodes, or containers —
+ * one shared id space). Chains of belt/pipe segments are collapsed to one edge; 0 = a dangling end.
+ */
 struct FAIDAConveyorEdge
 {
-	int32 FromMachine = 0;
-	int32 ToMachine = 0;
-	FString Item;
-	double PerMinute = 0.0;          // throughput the link carries (belt/pipe rate)
+	int32 FromMachine = 0;           // source node id; 0 = fed by nothing (dangling input)
+	int32 ToMachine = 0;             // sink node id; 0 = feeds nothing (dangling output)
+	FString Item;                    // best-effort: pipe fluid, or the source machine's main output; may be empty
+	double PerMinute = 0.0;          // carrying CAPACITY (slowest segment): belts items/min, pipes m³/min
+	bool bPipe = false;
 };
 
 /** Per-circuit electrical stats as read from the game's power circuit (not derived). */

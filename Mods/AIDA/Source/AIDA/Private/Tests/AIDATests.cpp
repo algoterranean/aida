@@ -13,6 +13,7 @@
 #include "Adapters/SSEStream.h"
 #include "Tools/AIDAToolRegistry.h"
 #include "Factory/AIDAFactoryAggregator.h"
+#include "Factory/AIDALogisticsGraph.h"
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
@@ -971,6 +972,94 @@ bool FAIDAFactoryBottleneckTest::RunTest(const FString&)
 		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("IronIngot"));
 		TestTrue(TEXT("power-limited"), R.Kind == EAIDABottleneck::Power);
 		TestEqual(TEXT("overloaded circuit id"), R.LimitingDetail, FString(TEXT("1")));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDALogisticsGraphTest, "AIDA.Factory.LogisticsGraph",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDALogisticsGraphTest::RunTest(const FString&)
+{
+	using namespace AIDALogisticsGraph;
+
+	// Three-segment chain node1 → [270, 60, 270] → node2 collapses to one edge at the slowest rate.
+	{
+		TArray<FSegment> Segments;
+		Segments.Add({ /*Id*/10, /*FromSeg*/0, /*FromNode*/1, /*ToSeg*/11, /*ToNode*/0, 270.0 });
+		Segments.Add({ 11, 10, 0, 12, 0, 60.0 });
+		Segments.Add({ 12, 11, 0, 0, 2, 270.0 });
+		const TArray<FAIDAConveyorEdge> Edges = CollapseChains(Segments);
+		TestEqual(TEXT("one edge"), Edges.Num(), 1);
+		if (Edges.Num() == 1)
+		{
+			TestEqual(TEXT("from node 1"), Edges[0].FromMachine, 1);
+			TestEqual(TEXT("to node 2"), Edges[0].ToMachine, 2);
+			AIDA_TEST_NEAR("slowest segment wins", Edges[0].PerMinute, 60.0);
+		}
+	}
+
+	// Splitter fan-out (two heads from node 3) + a dangling tail + a free-floating segment + a cycle.
+	{
+		TArray<FSegment> Segments;
+		Segments.Add({ 20, 0, 3, 0, 4, 120.0 });  // node3 → node4
+		Segments.Add({ 21, 0, 3, 0, 0, 120.0 });  // node3 → dangling
+		Segments.Add({ 22, 0, 0, 0, 0, 60.0 });   // floats free → dropped
+		Segments.Add({ 30, 31, 0, 31, 0, 60.0 }); // 30 ↔ 31 belt loop → dropped, must terminate
+		Segments.Add({ 31, 30, 0, 30, 0, 60.0 });
+		const TArray<FAIDAConveyorEdge> Edges = CollapseChains(Segments);
+		TestEqual(TEXT("two anchored edges"), Edges.Num(), 2);
+		const FAIDAConveyorEdge* Dangling = Edges.FindByPredicate(
+			[](const FAIDAConveyorEdge& E) { return E.ToMachine == 0; });
+		TestTrue(TEXT("dangling edge kept with To=0"), Dangling && Dangling->FromMachine == 3);
+	}
+
+	// Item attribution: pipes keep their fluid; belt edges take the source machine's main output;
+	// edges out of logistics-only nodes stay unknown.
+	{
+		TArray<FSegment> Segments;
+		Segments.Add({ 40, 0, 1, 0, 2, 300.0, /*bPipe*/true, TEXT("Water") });
+		Segments.Add({ 41, 0, 1, 0, 3, 60.0 });
+		Segments.Add({ 42, 0, 9, 0, 1, 60.0 });
+		TArray<FAIDAConveyorEdge> Edges = CollapseChains(Segments);
+
+		TArray<FAIDAMachine> Machines;
+		FAIDAMachine Producer = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Smelter"));
+		Producer.Outputs = { { TEXT("Iron Ingot"), 30.0 }, { TEXT("Slag"), 5.0 } };
+		Machines.Add(Producer);
+		FAIDAMachine Splitter = AIDAMakeTestMachine(9, FVector::ZeroVector, TEXT("Splitter"));
+		Splitter.bLogisticsOnly = true;
+		Machines.Add(Splitter);
+		AttributeItems(Edges, Machines);
+
+		const FAIDAConveyorEdge* PipeEdge = Edges.FindByPredicate([](const FAIDAConveyorEdge& E) { return E.bPipe; });
+		TestTrue(TEXT("pipe keeps its fluid"), PipeEdge && PipeEdge->Item == TEXT("Water"));
+		const FAIDAConveyorEdge* BeltEdge = Edges.FindByPredicate(
+			[](const FAIDAConveyorEdge& E) { return !E.bPipe && E.FromMachine == 1; });
+		TestTrue(TEXT("belt takes the source's main output"), BeltEdge && BeltEdge->Item == TEXT("Iron Ingot"));
+		const FAIDAConveyorEdge* SplitterEdge = Edges.FindByPredicate(
+			[](const FAIDAConveyorEdge& E) { return E.FromMachine == 9; });
+		TestTrue(TEXT("logistics-only source stays unknown"), SplitterEdge && SplitterEdge->Item.IsEmpty());
+	}
+
+	// Cluster efficiency ignores logistics-only nodes.
+	{
+		TArray<FAIDAMachine> Machines;
+		FAIDAMachine Slow = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Constructor"));
+		Slow.Productivity = 0.5f;
+		Machines.Add(Slow);
+		FAIDAMachine Node = AIDAMakeTestMachine(2, FVector(100, 0, 0), TEXT("Splitter"));
+		Node.bLogisticsOnly = true;
+		Node.Productivity = 1.0f;
+		Machines.Add(Node);
+		const FAIDAAggregatorConfig Config;
+		const TArray<int32> Labels = FAIDAFactoryAggregator::ClusterMachines(Machines, Config);
+		const TArray<FAIDACluster> Clusters = FAIDAFactoryAggregator::BuildClusters(Machines, Labels, Config);
+		TestEqual(TEXT("one cluster"), Clusters.Num(), 1);
+		if (Clusters.Num() == 1)
+		{
+			AIDA_TEST_NEAR("efficiency from producers only", Clusters[0].Efficiency, 0.5);
+			TestEqual(TEXT("census still counts the splitter"), Clusters[0].BuildingCensus[FString(TEXT("Splitter"))], 1);
+		}
 	}
 	return true;
 }

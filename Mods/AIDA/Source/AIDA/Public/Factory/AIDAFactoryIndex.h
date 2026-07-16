@@ -12,8 +12,10 @@ class UObject;
  *
  * Wrapped in a short TTL cache so a burst of tool calls in one request shares a single walk. Only the
  * .cpp includes FactoryGame headers; everything downstream (aggregator, tools) stays on plain structs
- * and is unit-testable. First cut extracts production machines (manufacturers + resource extractors)
- * and power circuits; belt/pipe edge rates are deferred, so `Snapshot.Edges` is currently empty.
+ * and is unit-testable. Extracts production machines (manufacturers, extractors, generators),
+ * logistics nodes (splitters/mergers/pipe attachments), storage containers, power circuits, and — as
+ * of P7 Slice 0 — the belt/pipe graph: segments collapse into node-to-node `Snapshot.Edges` via
+ * AIDALogisticsGraph, with per-machine port-connectivity counts for dangling-port diagnostics.
  */
 class FAIDAFactoryIndex
 {
