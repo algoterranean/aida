@@ -40,8 +40,10 @@ public:
 
 	/**
 	 * Move (DeltaCm) and/or rotate (YawDeltaDeg, around the grid centroid) a PENDING build
-	 * proposal's placements, re-running the dry-run against the new spot — an invalid adjustment
-	 * reports and leaves the proposal unchanged. The republished view moves the client ghosts.
+	 * proposal's placements. The adjustment ALWAYS applies (user rule: validity never blocks a
+	 * pending ghost — the player may be nudging it off bad ground); the dry-run still runs so
+	 * OutMessage and the proposal's InvalidCount double as live placement feedback. The
+	 * republished view moves the client ghosts.
 	 */
 	bool AdjustPending(UObject* WorldContext, const FAIDAActionsConfig& Config, const FGuid& Id,
 		const FVector& DeltaCm, int32 YawDeltaDeg, FString& OutMessage);
@@ -75,6 +77,13 @@ public:
 private:
 	void FinishExecution(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 	void ResetScratch();
+
+	/**
+	 * Skipped placements accrue their recipe cost for refund (validity is advisory at propose/nudge
+	 * time — the upfront charge must not eat tiles that never re-validated at execute). Central
+	 * cost mode only; FinishExecution pays AccruedRefund out and journals the NET cost.
+	 */
+	void AccrueSkippedCost(UObject* WorldContext, const FAIDAActionsConfig& Config, const FString& RecipeClassPath, int32 Skipped);
 
 	/**
 	 * Advance a manifold proposal (docs/PHASE4-MANIFOLDS.md §5): phase 0 batches the attachments

@@ -113,9 +113,11 @@ namespace AIDAActionSpec
 
 	/** Dry-run success report (docs/PHASE4.md §2b) — the propose_* tool result once a proposal is
 	 *  stored. OriginM (metres), when supplied, is echoed as "origin" so the model can place follow-up
-	 *  proposals relative to what it just anchored. */
+	 *  proposals relative to what it just anchored. InvalidPlacements (when non-empty) reports blocked
+	 *  spots as an ADVISORY — validity never blocks a proposal (user rule); the ghost goes up and the
+	 *  player nudges it, or approval builds the valid subset and refunds the rest. */
 	FString BuildDryRunJson(const FAIDAProposal& Proposal, int32 ExpiresInSec, bool bAffordable, double PowerDrawMW,
-		const FVector* OriginM = nullptr);
+		const FVector* OriginM = nullptr, const TArray<FAIDAPlacementFailure>* InvalidPlacements = nullptr);
 
 	/** Dry-run failure report: bounded per-index reasons so the model can revise the spec. */
 	FString BuildErrorJson(const FString& Error, const TArray<FAIDAPlacementFailure>& FirstFailures, int32 MaxShown = 5);

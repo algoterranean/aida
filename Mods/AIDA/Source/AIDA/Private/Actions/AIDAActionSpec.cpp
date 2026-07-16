@@ -851,8 +851,34 @@ FString AIDAActionSpec::StateToString(EAIDAProposalState State)
 	return TEXT("unknown");
 }
 
+namespace
+{
+	/** Bounded per-index failure list shared by the dry-run advisory and the error report. */
+	void AppendFailureList(const TSharedRef<FJsonObject>& Root, const TArray<FAIDAPlacementFailure>& Failures, int32 MaxShown)
+	{
+		const int32 Shown = FMath::Min(Failures.Num(), MaxShown);
+		if (Shown <= 0) { return; }
+
+		TArray<TSharedPtr<FJsonValue>> List;
+		for (int32 i = 0; i < Shown; ++i)
+		{
+			const FAIDAPlacementFailure& F = Failures[i];
+			const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetNumberField(TEXT("index"), F.Index);
+			const TSharedRef<FJsonObject> At = MakeShared<FJsonObject>();
+			At->SetField(TEXT("x"), AIDANumber(F.AtM.X));
+			At->SetField(TEXT("y"), AIDANumber(F.AtM.Y));
+			O->SetObjectField(TEXT("at"), At);
+			O->SetStringField(TEXT("reason"), F.Reason);
+			List.Add(MakeShared<FJsonValueObject>(O));
+		}
+		Root->SetArrayField(TEXT("firstFailures"), List);
+		if (Failures.Num() > Shown) { Root->SetNumberField(TEXT("omitted"), Failures.Num() - Shown); }
+	}
+}
+
 FString AIDAActionSpec::BuildDryRunJson(const FAIDAProposal& Proposal, int32 ExpiresInSec, bool bAffordable, double PowerDrawMW,
-	const FVector* OriginM)
+	const FVector* OriginM, const TArray<FAIDAPlacementFailure>* InvalidPlacements)
 {
 	TArray<TSharedPtr<FJsonValue>> Cost;
 	for (const FAIDACostItem& Item : Proposal.Cost)
@@ -883,6 +909,15 @@ FString AIDAActionSpec::BuildDryRunJson(const FAIDAProposal& Proposal, int32 Exp
 		Origin->SetField(TEXT("z"), AIDANumber(OriginM->Z));
 		Root->SetObjectField(TEXT("origin"), Origin);
 	}
+	if (InvalidPlacements && InvalidPlacements->Num() > 0)
+	{
+		// Advisory, never a failure (user rule: terrain/validation trouble must not stop the ghost).
+		Root->SetNumberField(TEXT("invalidCount"), InvalidPlacements->Num());
+		AppendFailureList(Root, *InvalidPlacements, 5);
+		Root->SetStringField(TEXT("note"), Proposal.bManifold
+			? TEXT("blocked attachments are skipped at execute and their cost refunded — reject and re-propose with a different standoffM if the row must be complete")
+			: TEXT("the ghost preview is up anyway — tell the player to nudge it onto clear ground before approving; approving as-is builds only the currently-valid placements and refunds the rest"));
+	}
 	Root->SetStringField(TEXT("status"), TEXT("awaiting approval"));
 	Root->SetNumberField(TEXT("expiresInSec"), ExpiresInSec);
 	return AIDAToCompactJson(Root);
@@ -892,26 +927,7 @@ FString AIDAActionSpec::BuildErrorJson(const FString& Error, const TArray<FAIDAP
 {
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("error"), Error);
-
-	const int32 Shown = FMath::Min(FirstFailures.Num(), MaxShown);
-	if (Shown > 0)
-	{
-		TArray<TSharedPtr<FJsonValue>> List;
-		for (int32 i = 0; i < Shown; ++i)
-		{
-			const FAIDAPlacementFailure& F = FirstFailures[i];
-			const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
-			O->SetNumberField(TEXT("index"), F.Index);
-			const TSharedRef<FJsonObject> At = MakeShared<FJsonObject>();
-			At->SetField(TEXT("x"), AIDANumber(F.AtM.X));
-			At->SetField(TEXT("y"), AIDANumber(F.AtM.Y));
-			O->SetObjectField(TEXT("at"), At);
-			O->SetStringField(TEXT("reason"), F.Reason);
-			List.Add(MakeShared<FJsonValueObject>(O));
-		}
-		Root->SetArrayField(TEXT("firstFailures"), List);
-		if (FirstFailures.Num() > Shown) { Root->SetNumberField(TEXT("omitted"), FirstFailures.Num() - Shown); }
-	}
+	AppendFailureList(Root, FirstFailures, MaxShown);
 	return AIDAToCompactJson(Root);
 }
 
@@ -933,6 +949,12 @@ FString AIDAActionSpec::BuildStatusJson(const TArray<FAIDAProposal>& Proposals, 
 			++PendingCount;
 			const int64 Left = (P.ProposedUtc + TtlSeconds) - NowUtc;
 			O->SetNumberField(TEXT("expiresInSec"), FMath::Max<int64>(0, Left));
+			if (P.InvalidCount > 0)
+			{
+				// Advisory: blocked at the last dry-run (propose or nudge) — a nudge onto clear
+				// ground drops this to 0; approval as-is builds the valid subset + refunds the rest.
+				O->SetNumberField(TEXT("invalidCount"), P.InvalidCount);
+			}
 		}
 
 		// As-built geometry for plain builds that actually placed something (executed, or failed

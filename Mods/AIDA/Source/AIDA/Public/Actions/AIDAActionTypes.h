@@ -270,6 +270,11 @@ struct FAIDAProposal
 	FString Summary;                       // human diff line ("place 100 x Foundation …")
 	int32 Cursor = 0;                      // executor progress into Placements/targets
 	TArray<FString> AffectedEntityIds;     // encoded FAIDAEntityIds, filled during execute
+	/** Blocked placements at the LAST dry-run (propose or nudge). ADVISORY ONLY — placement
+	 *  validity never blocks a proposal or a nudge (user rule: the ghost always goes up and the
+	 *  player nudges it somewhere valid); execute re-validates per tile, skips what still fails,
+	 *  and refunds the skips. */
+	int32 InvalidCount = 0;
 
 	//~ Manifold extensions (docs/PHASE4-MANIFOLDS.md). Defaults = a plain build/dismantle proposal.
 	//  For manifolds, Placements/RecipeClassPath/Cost describe the ATTACHMENTS (so ghosts, upfront

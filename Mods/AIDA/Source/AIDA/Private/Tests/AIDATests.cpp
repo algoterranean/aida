@@ -2434,6 +2434,33 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		TestTrue(TEXT("reason preserved"), AIDAToCompactJson(O.ToSharedRef()).Contains(TEXT("Encroaching")));
 	}
 
+	// Blocked placements are ADVISORY on a stored proposal (user rule: validity never blocks the
+	// ghost) — the success report carries invalidCount + bounded firstFailures + a nudge note.
+	{
+		TArray<FAIDAPlacementFailure> Failures;
+		for (int32 i = 0; i < 7; ++i) { Failures.Add({ i, FVector(i, 0.0, 0.0), TEXT("Invalid floor!") }); }
+		const TSharedPtr<FJsonObject> O = AIDATestParseJson(
+			AIDAActionSpec::BuildDryRunJson(P, 600, true, 0.0, nullptr, &Failures));
+		if (!TestTrue(TEXT("advisory dry-run is JSON"), O.IsValid())) { return false; }
+		TestEqual(TEXT("still awaiting approval"), O->GetStringField(TEXT("status")), TEXT("awaiting approval"));
+		TestEqual(TEXT("invalidCount"), static_cast<int32>(O->GetNumberField(TEXT("invalidCount"))), 7);
+		TestEqual(TEXT("advisory failures bounded to 5"), O->GetArrayField(TEXT("firstFailures")).Num(), 5);
+		TestEqual(TEXT("advisory omitted counted"), static_cast<int32>(O->GetNumberField(TEXT("omitted"))), 2);
+		TestTrue(TEXT("build note says nudge"), O->GetStringField(TEXT("note")).Contains(TEXT("nudge")));
+
+		FAIDAProposal M = P;
+		M.bManifold = true;
+		const TSharedPtr<FJsonObject> OM = AIDATestParseJson(
+			AIDAActionSpec::BuildDryRunJson(M, 600, true, 0.0, nullptr, &Failures));
+		if (!TestTrue(TEXT("manifold advisory is JSON"), OM.IsValid())) { return false; }
+		TestTrue(TEXT("manifold note says standoffM (not nudge)"), OM->GetStringField(TEXT("note")).Contains(TEXT("standoffM")));
+
+		// No failures = no advisory fields at all.
+		const TSharedPtr<FJsonObject> Clean = AIDATestParseJson(AIDAActionSpec::BuildDryRunJson(P, 600, true, 0.0));
+		TestFalse(TEXT("clean report has no invalidCount"), Clean->HasField(TEXT("invalidCount")));
+		TestFalse(TEXT("clean report has no note"), Clean->HasField(TEXT("note")));
+	}
+
 	// Status report: filter narrows to one; pending entries carry a countdown.
 	{
 		FAIDAProposal Q;
@@ -2441,6 +2468,7 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		Q.Summary = TEXT("q");
 		Q.State = EAIDAProposalState::Pending;
 		Q.ProposedUtc = 1000;
+		Q.InvalidCount = 3; // advisory rides into the status report while pending
 		const TSharedPtr<FJsonObject> All = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P, Q }, FGuid(), /*Now*/ 1100, /*Ttl*/ 600));
 		TestEqual(TEXT("status lists both"), static_cast<int32>(All->GetNumberField(TEXT("count"))), 2);
 		const TSharedPtr<FJsonObject> One = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P, Q }, Q.Id, 1100, 600));
@@ -2449,6 +2477,7 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		if (TestEqual(TEXT("one entry"), List.Num(), 1))
 		{
 			TestEqual(TEXT("pending countdown"), static_cast<int32>(List[0]->AsObject()->GetNumberField(TEXT("expiresInSec"))), 500);
+			TestEqual(TEXT("pending invalidCount advisory"), static_cast<int32>(List[0]->AsObject()->GetNumberField(TEXT("invalidCount"))), 3);
 		}
 		TestEqual(TEXT("filtered pendingCount"), static_cast<int32>(One->GetNumberField(TEXT("pendingCount"))), 1);
 

@@ -139,8 +139,11 @@ namespace
 		"player with act permission approves the proposal. Only call it when the player explicitly asks "
 		"you to build/place something. Omit the spec's 'origin' to build where the player is aiming ('here', "
 		"'there', 'at my position', or no location given) — you never need to ask for coordinates. On success, "
-		"relay the returned summary + cost and say it awaits approval; on a tool error (invalid placement, "
-		"cost, cap), revise the spec or explain the reason. Never claim something was built until "
+		"relay the returned summary + cost and say it awaits approval; on a tool error (unknown buildable, "
+		"cost, cap), revise the spec or explain the reason. Blocked/uneven ground is NEVER an error: the "
+		"proposal still goes up with its ghost and the result carries invalidCount — relay it and tell the "
+		"player to nudge the ghost onto clear ground before approving (approving as-is builds only the valid "
+		"placements and refunds the rest). Never claim something was built until "
 		"get_proposal_status says executed.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
 		"- propose_power(spec): wire EXISTING machines to electricity — poles beside them, power lines, "
@@ -1421,6 +1424,14 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 	View.Id = Proposal->Id;
 	View.Requester = Proposal->RequesterName;
 	View.Summary = Proposal->Summary;
+	// Live validity advisory (never a rejection — user rule): recomputed on every nudge, so the
+	// tag disappears the moment the player walks the ghost onto clear ground. Manifolds bake
+	// their own (they can't be nudged).
+	if (Proposal->State == EAIDAProposalState::Pending && Proposal->InvalidCount > 0 && !Proposal->bManifold)
+	{
+		View.Summary += FString::Printf(TEXT(" [%d placement(s) blocked here — nudge the ghost before approving]"),
+			Proposal->InvalidCount);
+	}
 	View.CostSummary = AIDACostSummaryString(Proposal->Cost);
 	View.State = AIDAActionSpec::StateToString(Proposal->State);
 	View.ExpiresUtc = Proposal->State == EAIDAProposalState::Pending
@@ -1565,7 +1576,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first."),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -1704,8 +1715,10 @@ void UAIDAOrchestrator::RegisterActionTools()
 			TArray<int32> FallbackPartIndex;
 			FAIDADryRunResult FallbackDryRun;
 			FVector FallbackOriginCm = FVector::ZeroVector;
-			FAIDADryRunResult FirstFailRun;          // the PREFERRED candidate's failures for the report
-			int32 FirstFailTotal = 0;
+			FAIDADryRunResult FirstFailRun;          // the PREFERRED failing candidate (last resort — still ghosts)
+			TArray<FTransform> FirstFailPlacements;
+			TArray<int32> FirstFailPartIndex;
+			FVector FirstFailOriginCm = FVector::ZeroVector;
 			bool bPlaced = false;
 			bool bHaveFallback = false;
 			bool bHaveFirstFail = false;
@@ -1713,7 +1726,6 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				TArray<int32> AttemptPartIndex;
 				TArray<FTransform> Attempt = ExpandAt(OriginCm, AttemptPartIndex);
-				const int32 AttemptTotal = Attempt.Num();
 				FAIDADryRunResult AttemptRun;
 				const bool bRan = bComposite
 					? FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, AttemptPartIndex, Attempt, AttemptRun, Ctx.PlayerId)
@@ -1741,7 +1753,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 				else if (!AttemptRun.bOk && !bHaveFirstFail)
 				{
 					FirstFailRun = MoveTemp(AttemptRun);
-					FirstFailTotal = AttemptTotal;
+					FirstFailPlacements = MoveTemp(Attempt);
+					FirstFailPartIndex = MoveTemp(AttemptPartIndex);
+					FirstFailOriginCm = OriginCm;
 					bHaveFirstFail = true;
 				}
 			}
@@ -1755,11 +1769,24 @@ void UAIDAOrchestrator::RegisterActionTools()
 				Spec.OriginM = FallbackOriginCm / AIDAMetersToCm;
 				bPlaced = true;
 			}
+			if (!bPlaced && bHaveFirstFail)
+			{
+				// Every candidate has hard-blocked tiles (uneven terrain, water, a cliff edge…).
+				// The ghost STILL goes up (user rule: validation trouble never prohibits a proposal)
+				// — the failures ride along as an advisory and the player nudges it somewhere valid;
+				// execute re-validates per tile, skips what still fails, and refunds the skips.
+				Placements = MoveTemp(FirstFailPlacements);
+				PlacementPartIndex = MoveTemp(FirstFailPartIndex);
+				DryRun = MoveTemp(FirstFailRun);
+				Spec.OriginM = FirstFailOriginCm / AIDAMetersToCm;
+				bPlaced = true;
+			}
 			if (!bPlaced)
 			{
-				const FString Msg = FString::Printf(TEXT("%d of %d placements invalid (every anchor tried)"),
-					FirstFailRun.Failures.Num(), FirstFailTotal);
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, FirstFailRun.Failures));
+				// Unreachable in practice (every candidate lands in one of the buckets above) —
+				// defensive against an empty candidate list.
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("no placement candidate could be evaluated"), {}));
 			}
 
 			// Write the CHOSEN origin back into the stored/journaled spec — the record (and any
@@ -1876,20 +1903,27 @@ void UAIDAOrchestrator::RegisterActionTools()
 					Proposal.PolePlacements.Num(), *Power.PoleName);
 			}
 			Proposal.Summary += PowerNote;
+			Proposal.InvalidCount = DryRun.Failures.Num(); // advisory — never blocks the ghost
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
-			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
-				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s, %d blocked placement(s))"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author, Proposal.InvalidCount);
 			PublishProposal(Proposal.Id);
-			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — cost %s. Awaiting approval."),
-				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost));
+			if (Proposal.InvalidCount > 0)
+			{
+				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving (approving as-is builds only the valid ones and refunds the rest)."),
+					Proposal.InvalidCount, Proposal.Placements.Num());
+			}
+			AnnounceSystem(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0,
-				&Spec.OriginM));
+				&Spec.OriginM, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
 		}
 	});
 
@@ -1984,7 +2018,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
 	Tools.Register({
 		TEXT("propose_manifold"),
-		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build."),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -2143,9 +2177,13 @@ void UAIDAOrchestrator::RegisterActionTools()
 			FAIDADryRunResult NearestValidDryRun;
 			double NearestValidStandoffM = -1.0;
 			bool bNearestValidOverlaps = false;
+			FAIDAManifoldPlan FirstFailPlan;     // the BASE lane when every lane has blocked spots (last resort — still ghosts)
+			FAIDADryRunResult FirstFailRun;
+			double FirstFailStandoffM = -1.0;
 			bool bPlaced = false;
 			bool bClips = false;
 			bool bOverlaps = false;
+			bool bBlockedSome = false;
 			for (int32 Attempt = 0; Attempt < 4; ++Attempt)
 			{
 				UsedStandoffM = BaseStandoffM + Attempt * 3.0;
@@ -2189,6 +2227,14 @@ void UAIDAOrchestrator::RegisterActionTools()
 					NearestValidStandoffM = UsedStandoffM;
 					bNearestValidOverlaps = Overlaps > 0;
 				}
+				else if (!DryRun.bOk && FirstFailStandoffM < 0.0)
+				{
+					// The nearest lane with blocked spots — the last-resort ghost when no lane in
+					// range validates (validation trouble never prohibits a proposal, user rule).
+					FirstFailPlan = Plan;
+					FirstFailRun = DryRun;
+					FirstFailStandoffM = UsedStandoffM;
+				}
 				Stage(FString::Printf(TEXT("%.0f m lane: %d blocked, %d clipping, %d overlapping — stepping the row out"),
 					UsedStandoffM, DryRun.Failures.Num(), DryRun.ClippingCount, Overlaps));
 			}
@@ -2203,11 +2249,22 @@ void UAIDAOrchestrator::RegisterActionTools()
 				bClips = true;
 				bOverlaps = bNearestValidOverlaps;
 			}
+			if (!bPlaced && FirstFailStandoffM >= 0.0)
+			{
+				// Every lane in range has blocked attachment spots: the nearest lane still ghosts
+				// (user rule — validation trouble never prohibits a proposal). Blocked attachments
+				// skip at execute (their cost refunds) and their runs then fail loudly.
+				Plan = MoveTemp(FirstFailPlan);
+				DryRun = MoveTemp(FirstFailRun);
+				UsedStandoffM = FirstFailStandoffM;
+				bPlaced = true;
+				bBlockedSome = true;
+			}
 			if (!bPlaced)
 			{
-				const FString Msg = FString::Printf(TEXT("%d of %d attachment placement(s) invalid even %.0f m out from the ports"),
-					DryRun.Failures.Num(), Plan.Attachments.Num(), UsedStandoffM);
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
+				// Unreachable in practice (every attempt lands in one of the buckets above).
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("no attachment lane could be evaluated"), DryRun.Failures));
 			}
 			// The stored/journaled spec carries the BASE standoff that actually validated (actual row
 			// distance minus the lane offset) — a spec copied into a later propose re-derives the same
@@ -2276,6 +2333,13 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Proposal.Summary += TEXT(" [OVERLAPS existing splitters/junctions — no clear lane in range; reject and ask for a larger standoffM unless intended]");
 			}
+			Proposal.InvalidCount = DryRun.Failures.Num(); // advisory — never blocks the ghost
+			if (bBlockedSome)
+			{
+				// Manifolds can't be nudged (anchored to ports) — the escape hatch is a re-propose.
+				Proposal.Summary += FString::Printf(TEXT(" [%d of %d attachment spot(s) blocked — skipped + refunded at execute; reject and re-propose with a different standoffM if the row must be complete]"),
+					Proposal.InvalidCount, Proposal.Placements.Num());
+			}
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
@@ -2289,7 +2353,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 			Stage(TEXT("published — done"));
 
-			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0,
+				nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
 		}
 	});
 
@@ -2370,8 +2435,11 @@ void UAIDAOrchestrator::RegisterActionTools()
 			FAIDADryRunResult PoleDryRun;
 			FAIDAPowerPlan FallbackPlan;
 			FAIDADryRunResult FallbackDryRun;
+			FAIDAPowerPlan FirstFailPlan;    // nearest lane when EVERY lane has blocked pole spots (still ghosts)
+			FAIDADryRunResult FirstFailRun;
 			bool bPlaced = false;
 			bool bHaveFallback = false;
+			bool bHaveFirstFail = false;
 			for (const double Offset : Offsets)
 			{
 				FAIDAPowerPlan AttemptPlan = AIDAActionSpec::PlanPowerForPoints(Positions,
@@ -2408,6 +2476,12 @@ void UAIDAOrchestrator::RegisterActionTools()
 					FallbackDryRun = AttemptRun;
 					bHaveFallback = true;
 				}
+				else if (!AttemptRun.bOk && !bHaveFirstFail)
+				{
+					FirstFailPlan = MoveTemp(AttemptPlan);
+					FirstFailRun = MoveTemp(AttemptRun);
+					bHaveFirstFail = true;
+				}
 			}
 			if (!bPlaced && bHaveFallback)
 			{
@@ -2415,10 +2489,20 @@ void UAIDAOrchestrator::RegisterActionTools()
 				PoleDryRun = MoveTemp(FallbackDryRun);
 				bPlaced = true;
 			}
+			if (!bPlaced && bHaveFirstFail)
+			{
+				// Both sides have blocked pole spots: the nearest lane still ghosts (user rule —
+				// validation trouble never prohibits a proposal). Blocked poles skip at execute
+				// (refunded) and their machines' wires then fail loudly.
+				Plan = MoveTemp(FirstFailPlan);
+				PoleDryRun = MoveTemp(FirstFailRun);
+				bPlaced = true;
+			}
 			if (!bPlaced)
 			{
+				// Unreachable in practice (every offset lands in one of the buckets above).
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-					TEXT("no valid pole spot beside those machines (both sides blocked) — pass 'pole' or a different center"), {}));
+					TEXT("no pole lane could be evaluated beside those machines — pass 'pole' or a different center"), {}));
 			}
 			if (Config.Actions.CostMode == TEXT("central") && !PoleDryRun.bAffordable)
 			{
@@ -2450,6 +2534,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Proposal.Summary += FString::Printf(TEXT(" [%d machine(s) already powered, skipped]"), SkippedPowered);
 			}
+			// Blocked pole spots are advisory like every other placement (user rule) — poles skip
+			// at execute (refunded) and their machines' wires then fail loudly.
+			Proposal.InvalidCount = PoleDryRun.Failures.Num();
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
@@ -2462,7 +2549,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — poles cost %s; wires charged as built. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
-			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, PoleDryRun.bAffordable, 0.0));
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, PoleDryRun.bAffordable, 0.0,
+				nullptr, PoleDryRun.Failures.Num() > 0 ? &PoleDryRun.Failures : nullptr));
 		}
 	});
 

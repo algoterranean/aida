@@ -32,6 +32,24 @@ namespace
 			if (!bMerged) { Into.Add(Item); }
 		}
 	}
+
+	/** Subtract one tally from another by item name, clamping at zero (the journaled cost must be
+	 *  the NET consumption once skipped placements refund — undo refunds from that record). */
+	void SubtractCost(TArray<FAIDACostItem>& From, const TArray<FAIDACostItem>& Minus)
+	{
+		for (const FAIDACostItem& Item : Minus)
+		{
+			for (FAIDACostItem& Existing : From)
+			{
+				if (Existing.Item == Item.Item)
+				{
+					Existing.Amount = FMath::Max(0, Existing.Amount - Item.Amount);
+					break;
+				}
+			}
+		}
+		From.RemoveAll([](const FAIDACostItem& Item) { return Item.Amount <= 0; });
+	}
 }
 
 bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig& Config, const FGuid& Id, const FString& ApproverId, FString& OutMessage)
@@ -192,7 +210,10 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		}
 	}
 
-	// The new spot must validate like the original did (all-or-nothing, same rules). Composites
+	// Validity at the new spot is ADVISORY, never a rejection (user rule: a pending ghost is the
+	// player's to move — they may be walking it OFF bad ground, so an invalid waypoint must not
+	// freeze it there). The dry-run still runs so the reply doubles as live placement feedback,
+	// and execute re-validates per tile anyway (skips + refunds what still fails). Composites
 	// re-validate each part with its own recipe.
 	FAIDADryRunResult DryRun;
 	const bool bComposite = Proposal->PlacementPartIndex.Num() == Proposal->Placements.Num()
@@ -201,20 +222,25 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		? FAIDAActionSeam::DryRunBuildParts(WorldContext, Proposal->PartRecipePaths, Proposal->PlacementPartIndex, Adjusted, DryRun,
 			Proposal->RequesterId)
 		: FAIDAActionSeam::DryRunBuild(WorldContext, Proposal->RecipeClassPath, Adjusted, DryRun, Proposal->RequesterId);
-	if (!bRan || !DryRun.bOk)
+	FString Validity;
+	if (!bRan)
 	{
-		OutMessage = FString::Printf(TEXT("adjustment blocked — %s; the proposal is unchanged"),
-			DryRun.Failures.Num() > 0
-				? *FString::Printf(TEXT("%d placement(s) invalid there"), DryRun.Failures.Num())
-				: (DryRun.Error.IsEmpty() ? TEXT("validation failed") : *DryRun.Error));
-		return false;
+		Validity = FString::Printf(TEXT(" [couldn't validate there: %s]"),
+			DryRun.Error.IsEmpty() ? TEXT("validation failed") : *DryRun.Error);
+	}
+	else
+	{
+		Proposal->InvalidCount = DryRun.Failures.Num();
+		Validity = DryRun.Failures.Num() > 0
+			? FString::Printf(TEXT(" [%d placement(s) blocked here — keep nudging]"), DryRun.Failures.Num())
+			: TEXT(" [all placements valid here]");
 	}
 
 	Proposal->Placements = MoveTemp(Adjusted);
 	Proposal->PolePlacements = MoveTemp(AdjustedPoles);
-	OutMessage = YawDeltaDeg != 0
+	OutMessage = (YawDeltaDeg != 0
 		? FString::Printf(TEXT("rotated %d° — %s"), YawDeltaDeg, *Proposal->Summary)
-		: FString::Printf(TEXT("nudged %.1f m — %s"), DeltaCm.Size() / 100.0, *Proposal->Summary);
+		: FString::Printf(TEXT("nudged %.1f m — %s"), DeltaCm.Size() / 100.0, *Proposal->Summary)) + Validity;
 	UE_LOG(LogAIDA, Log, TEXT("[actions] %s adjusted (delta=%s yaw+=%d)."),
 		*Id.ToString(EGuidFormats::DigitsWithHyphens), *DeltaCm.ToCompactString(), YawDeltaDeg);
 	return true;
@@ -284,6 +310,7 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 			Proposal->Placements, Proposal->Cursor, Batch,
 			Proposal->AffectedEntityIds, BuiltActors, Skipped);
 		SkippedCount += Skipped;
+		AccrueSkippedCost(WorldContext, Config, Recipe, Skipped);
 		if (Proposal->Cursor < Proposal->Placements.Num()) { return true; }
 	}
 
@@ -303,6 +330,7 @@ bool FAIDAActionEngine::TickManifold(UObject* WorldContext, const FAIDAActionsCo
 			Proposal.Placements, Proposal.Cursor, FMath::Max(1, Config.BatchPerTick),
 			Proposal.AffectedEntityIds, BuiltActors, Skipped, &AttachmentActors);
 		SkippedCount += Skipped;
+		AccrueSkippedCost(WorldContext, Config, Proposal.RecipeClassPath, Skipped);
 		if (Proposal.Cursor < N) { return true; }
 		Proposal.Phase = 1;
 		Proposal.Cursor = 0;
@@ -406,6 +434,7 @@ bool FAIDAActionEngine::TickLabels(UObject* WorldContext, const FAIDAActionsConf
 		else
 		{
 			++RunFailCount;
+			AccrueSkippedCost(WorldContext, Config, Proposal.RecipeClassPath, 1); // the sign was paid upfront
 			if (RunFailures.Num() < 5)
 			{
 				RunFailures.Add(FString::Printf(TEXT("sign %d (%s, \"%s\"): %s"),
@@ -445,6 +474,7 @@ bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsCon
 			Proposal.Placements, Proposal.Cursor, Batch,
 			Proposal.AffectedEntityIds, BuiltActors, Skipped, &AttachmentActors);
 		SkippedCount += Skipped;
+		AccrueSkippedCost(WorldContext, Config, Proposal.RecipeClassPath, Skipped);
 		if (Proposal.Cursor < Proposal.Placements.Num()) { return true; }
 		Proposal.Phase = 1;
 		Proposal.Cursor = 0;
@@ -460,6 +490,7 @@ bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsCon
 			Proposal.PolePlacements, Proposal.Cursor, Batch,
 			Proposal.AffectedEntityIds, BuiltActors, Skipped, &PoleActors);
 		SkippedCount += Skipped;
+		AccrueSkippedCost(WorldContext, Config, Proposal.PoleRecipePath, Skipped);
 		if (Proposal.Cursor < Proposal.PolePlacements.Num()) { return true; }
 		Proposal.Phase = 2;
 		Proposal.Cursor = 0;
@@ -536,6 +567,17 @@ bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsCon
 	return false;
 }
 
+void FAIDAActionEngine::AccrueSkippedCost(UObject* WorldContext, const FAIDAActionsConfig& Config, const FString& RecipeClassPath, int32 Skipped)
+{
+	if (Skipped <= 0 || Config.CostMode != TEXT("central")) { return; }
+
+	TArray<FAIDACostItem> Items;
+	if (FAIDAActionSeam::TallyRecipeCost(WorldContext, RecipeClassPath, Skipped, Items))
+	{
+		MergeCost(AccruedRefund, Items);
+	}
+}
+
 void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
 {
 	// Dismantle refunds pay out to the approver's inventory (central storage has no deposit API).
@@ -544,6 +586,21 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 		int32 Refunded = 0, Lost = 0;
 		FAIDAActionSeam::RefundToPlayer(WorldContext, Proposal.ApproverId, AccruedRefund, Refunded, Lost);
 		UE_LOG(LogAIDA, Log, TEXT("[actions] dismantle refund: %d item(s) to the approver, %d lost."), Refunded, Lost);
+	}
+	else if (!Proposal.bDismantle && Config.CostMode == TEXT("central") && AccruedRefund.Num() > 0)
+	{
+		// Build skips (placements that failed re-validation — a partially-blocked ghost approved
+		// as-is, or a world that changed underneath) give back what the upfront charge covered but
+		// never built. The REQUESTER paid, so they get the refund (pockets — no central deposit
+		// API); the journal below records the NET cost so undo can't refund the skips twice.
+		SubtractCost(Proposal.Cost, AccruedRefund);
+		int32 Refunded = 0, Lost = 0;
+		FAIDAActionSeam::RefundToPlayer(WorldContext, Proposal.RequesterId, AccruedRefund, Refunded, Lost);
+		UE_LOG(LogAIDA, Log, TEXT("[actions] skipped-placement refund: %d item(s) to the requester, %d lost."), Refunded, Lost);
+		if (Refunded > 0)
+		{
+			RunReport.Add(FString::Printf(TEXT("refunded %d item(s) for placements that no longer validated"), Refunded));
+		}
 	}
 
 	// The persistent record undo works from (docs/PHASE4.md §2d).
@@ -597,6 +654,11 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE: built %d, skipped %d (journal %s)."),
 			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), Affected, SkippedCount,
 			*JournalId.ToString(EGuidFormats::DigitsWithHyphens));
+		if (!Proposal.bDismantle && SkippedCount > 0)
+		{
+			RunReport.Add(FString::Printf(TEXT("%d placement(s) skipped — still blocked at execute (uneven ground or obstruction)"),
+				SkippedCount));
+		}
 	}
 
 	ResetScratch();

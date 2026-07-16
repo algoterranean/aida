@@ -85,13 +85,19 @@ model self-corrects.
   "affordable": true, "powerDrawMW": 0,       // powerDrawMW informational only (building catalog)
   "status": "awaiting approval", "expiresInSec": 600 }
 
-// failure (nothing stored; FAIDAToolResult::Error so the model revises):
-{ "error": "12 of 100 placements invalid", "firstFailures": [
-    { "index": 37, "at": { "x": -96, "y": 45 }, "reason": "Encroaching other building" } ] }  // ≤5 shown
+// blocked placements (proposal STILL stored — the ghost goes up; validity is advisory):
+{ "proposalId": "…", "summary": "…", "count": 100, "cost": [ … ], "affordable": true,
+  "invalidCount": 12, "firstFailures": [
+    { "index": 37, "at": { "x": -96, "y": 45 }, "reason": "Encroaching other building" } ],  // ≤5 shown
+  "note": "the ghost preview is up anyway — tell the player to nudge it onto clear ground …",
+  "status": "awaiting approval", "expiresInSec": 600 }
 ```
 
-Disqualifier text comes from `UFGConstructDisqualifier::GetDisqualifyingText`. v1 dry-run is
-**all-or-nothing** — any invalid placement fails the whole proposal (a `skipInvalid` mode is deferred).
+Disqualifier text comes from `UFGConstructDisqualifier::GetDisqualifyingText`. **Placement validity
+never fails a proposal** (user rule — uneven terrain must not stop the ghost): blocked placements ride
+along as `invalidCount`/`firstFailures`, nudging always applies (the nudge reply reports live validity),
+and execute re-validates per tile — still-blocked placements are skipped and their recipe cost is
+refunded to the requester (the journal records the NET cost so undo can't double-refund).
 
 ### 2c. Proposal record (server-side, in-memory — deliberately not saved)
 
@@ -358,8 +364,9 @@ gating; save/reload re-resolution; the exit gate itself.
 
 ## 9. Decisions & open questions
 
-- **Dry-run is all-or-nothing** in v1 — a "build what fits" `skipInvalid` mode is deferred; the per-index
-  error contract exists so the *model* fixes specs, matching §6's revise loop.
+- ~~**Dry-run is all-or-nothing** in v1~~ — superseded: placement validity is now ADVISORY at propose and
+  nudge time (see §2b). Every proposal ghosts; execute builds what re-validates, skips the rest, and
+  refunds the skips. The per-index failure contract survives as the `firstFailures` advisory.
 - **Proposals don't survive restart** (in-memory store; the journal is the only persisted artifact).
   Within a 10-minute TTL this is correct behavior, not a gap.
 - **Replicated-array relay** deviates from the chat relay's multicast style — justified by the late-join
