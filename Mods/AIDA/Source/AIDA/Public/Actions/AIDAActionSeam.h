@@ -68,7 +68,8 @@ public:
 	 * capped upstream by actions.maxProposalItems.
 	 */
 	static bool DryRunBuild(UObject* WorldContext, const FString& RecipeClassPath,
-		const TArray<FTransform>& Placements, FAIDADryRunResult& Out);
+		const TArray<FTransform>& Placements, FAIDADryRunResult& Out,
+		const FString& PayerPlayerId = FString());
 
 	/**
 	 * Spec-v2 composite dry-run: DryRunBuild per part over its slice of the placements (grouped by
@@ -77,7 +78,8 @@ public:
 	 * by the values in PlacementPartIndex (parallel to Placements).
 	 */
 	static bool DryRunBuildParts(UObject* WorldContext, const TArray<FString>& PartRecipePaths,
-		const TArray<int32>& PlacementPartIndex, const TArray<FTransform>& Placements, FAIDADryRunResult& Out);
+		const TArray<int32>& PlacementPartIndex, const TArray<FTransform>& Placements, FAIDADryRunResult& Out,
+		const FString& PayerPlayerId = FString());
 
 	/**
 	 * Count live buildables matching the selector (display name + radius, full actors AND
@@ -87,11 +89,14 @@ public:
 	static bool ResolveDismantleTargets(UObject* WorldContext, const FAIDADismantleSpec& Selector, FAIDADismantleResolution& Out);
 
 	/**
-	 * Deduct a tallied cost upfront from central storage (docs/PHASE4.md §3 — one failure point;
-	 * a mid-run change can't strand a half-built grid). Re-verifies every line first; deducts only
-	 * when the whole tally is payable. False = nothing was deducted.
+	 * Deduct a tallied cost upfront (docs/PHASE4.md §3 — one failure point; a mid-run change can't
+	 * strand a half-built grid). Draws from central storage FIRST, then the payer's inventory when
+	 * PayerPlayerId names a reachable player (the game's own build gun pulls from pockets too).
+	 * Re-verifies every line against the combined total first; deducts only when the whole tally is
+	 * payable. False = nothing was deducted.
 	 */
-	static bool DeductCost(UObject* WorldContext, const TArray<FAIDACostItem>& Cost);
+	static bool DeductCost(UObject* WorldContext, const TArray<FAIDACostItem>& Cost,
+		const FString& PayerPlayerId = FString());
 
 	/**
 	 * Refund items into a player's inventory — central storage has no server-side deposit API
@@ -199,7 +204,8 @@ public:
 	static bool BuildConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
 		AActor* FromActor, const FVector& FromWantDir, AActor* ToActor, const FVector& ToWantDir,
 		bool bChargeCost, TArray<FAIDACostItem>& OutCost,
-		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
+		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError,
+		const FString& PayerPlayerId = FString());
 
 	//~ Container labels (P7 Slice 3 write side).
 
@@ -267,8 +273,17 @@ public:
 		const FVector& CenterCm, double RadiusCm, int32 MaxCount,
 		TArray<FAIDAManifoldPort>& OutMachines, int32& OutSkippedPowered);
 
-	/** Can central storage cover this WHOLE tally right now? (Merged machine+pole affordability.) */
-	static bool CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost);
+	/** Can central storage (+ the payer's inventory when PayerPlayerId is given) cover this WHOLE
+	 *  tally right now? (Merged machine+pole affordability.) */
+	static bool CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost,
+		const FString& PayerPlayerId = FString());
+
+	/**
+	 * The named player's pocket inventory (empty PlayerId matches the empty-net-id listen host, the
+	 * act-allowlist convention). bFallbackToAny = first player with an inventory (refund destination).
+	 */
+	static class UFGInventoryComponent* ResolvePlayerInventory(UWorld* World, const FString& PlayerId,
+		bool bFallbackToAny = false);
 
 	/**
 	 * Spawn one power line between two live actors' circuit connections and Connect() both ends —
@@ -279,7 +294,8 @@ public:
 	 */
 	static bool BuildWire(UObject* WorldContext, const FString& WireRecipePath,
 		AActor* A, AActor* B, bool bChargeCost, TArray<FAIDACostItem>& OutCost,
-		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError);
+		TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError,
+		const FString& PayerPlayerId = FString());
 
 	/**
 	 * The nearest EXTERNAL circuit connection with a free slot within RangeCm of any given pole

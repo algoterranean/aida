@@ -669,7 +669,7 @@ bool FAIDAActionSeam::ProbeGroundZ(UObject* WorldContext, const FVector& AtCm, d
 }
 
 bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeClassPath,
-	const TArray<FTransform>& Placements, FAIDADryRunResult& Out)
+	const TArray<FTransform>& Placements, FAIDADryRunResult& Out, const FString& PayerPlayerId)
 {
 	Out = FAIDADryRunResult();
 
@@ -731,25 +731,8 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 		AddCost(Out.Cost, Entry.ItemClass, Entry.Amount * Placements.Num());
 	}
 
-	// Affordability vs central storage. Name→descriptor is resolved from the same cost entries.
-	Out.bAffordable = true;
-	if (AFGCentralStorageSubsystem* Central = AFGCentralStorageSubsystem::Get(World))
-	{
-		for (const FItemAmount& Entry : PerConstruct)
-		{
-			if (!Entry.ItemClass) { continue; }
-			const int32 Needed = Entry.Amount * Placements.Num();
-			if (Central->GetNumItemsFromCentralStorage(Entry.ItemClass) < Needed)
-			{
-				Out.bAffordable = false;
-				break;
-			}
-		}
-	}
-	else
-	{
-		Out.bAffordable = false; // no central storage built yet — "central" costMode can't pay
-	}
+	// Affordability vs central storage + (when known) the payer's pocket inventory.
+	Out.bAffordable = CheckAffordable(WorldContext, Out.Cost, PayerPlayerId);
 
 	Hologram->Destroy();
 	Out.bOk = Out.Failures.Num() == 0;
@@ -757,7 +740,8 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 }
 
 bool FAIDAActionSeam::DryRunBuildParts(UObject* WorldContext, const TArray<FString>& PartRecipePaths,
-	const TArray<int32>& PlacementPartIndex, const TArray<FTransform>& Placements, FAIDADryRunResult& Out)
+	const TArray<int32>& PlacementPartIndex, const TArray<FTransform>& Placements, FAIDADryRunResult& Out,
+	const FString& PayerPlayerId)
 {
 	Out = FAIDADryRunResult();
 	if (PlacementPartIndex.Num() != Placements.Num() || PartRecipePaths.Num() == 0)
@@ -805,7 +789,7 @@ bool FAIDAActionSeam::DryRunBuildParts(UObject* WorldContext, const TArray<FStri
 	}
 
 	// Per-part affordability checks can each pass while the SUM does not — re-check the merged tally.
-	Out.bAffordable = CheckAffordable(WorldContext, Out.Cost);
+	Out.bAffordable = CheckAffordable(WorldContext, Out.Cost, PayerPlayerId);
 	Out.bOk = Out.Failures.Num() == 0;
 	return true;
 }
@@ -886,18 +870,48 @@ bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDA
 	return true;
 }
 
-bool FAIDAActionSeam::DeductCost(UObject* WorldContext, const TArray<FAIDACostItem>& Cost)
+UFGInventoryComponent* FAIDAActionSeam::ResolvePlayerInventory(UWorld* World, const FString& PlayerId,
+	bool bFallbackToAny)
+{
+	if (!World) { return nullptr; }
+
+	UFGInventoryComponent* Fallback = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		AFGCharacterPlayer* Character = PC ? Cast<AFGCharacterPlayer>(PC->GetPawn()) : nullptr;
+		if (!Character || !Character->GetInventory()) { continue; }
+		if (!Fallback) { Fallback = Character->GetInventory(); }
+
+		// The LISTEN HOST's net id resolves null — an empty PlayerId matches it (allowlist convention).
+		APlayerState* PS = PC->PlayerState;
+		const TSharedPtr<const FUniqueNetId> NetId = PS ? PS->GetUniqueId().GetUniqueNetId() : nullptr;
+		const FString ControllerId = NetId.IsValid() ? NetId->ToString() : FString();
+		if (ControllerId == PlayerId)
+		{
+			return Character->GetInventory();
+		}
+	}
+	return bFallbackToAny ? Fallback : nullptr;
+}
+
+bool FAIDAActionSeam::DeductCost(UObject* WorldContext, const TArray<FAIDACostItem>& Cost,
+	const FString& PayerPlayerId)
 {
 	UWorld* World = ResolveWorld(WorldContext);
 	AFGCentralStorageSubsystem* Central = World ? AFGCentralStorageSubsystem::Get(World) : nullptr;
-	if (!Central) { return false; }
+	UFGInventoryComponent* Pockets = World ? ResolvePlayerInventory(World, PayerPlayerId) : nullptr;
+	if (!Central && !Pockets) { return false; }
 
-	// Verify the WHOLE tally first, then deduct — never a partial payment.
+	// Verify the WHOLE tally first (central + payer pockets), then deduct — never a partial payment.
 	TArray<TPair<TSubclassOf<UFGItemDescriptor>, int32>> Lines;
 	for (const FAIDACostItem& Item : Cost)
 	{
 		const TSubclassOf<UFGItemDescriptor> Descriptor = LoadDescriptor(Item.ClassPath);
-		if (!Descriptor || Central->GetNumItemsFromCentralStorage(Descriptor) < Item.Amount)
+		if (!Descriptor) { return false; }
+		const int32 Available = (Central ? Central->GetNumItemsFromCentralStorage(Descriptor) : 0)
+			+ (Pockets ? Pockets->GetNumItems(Descriptor) : 0);
+		if (Available < Item.Amount)
 		{
 			return false;
 		}
@@ -905,12 +919,26 @@ bool FAIDAActionSeam::DeductCost(UObject* WorldContext, const TArray<FAIDACostIt
 	}
 	for (const auto& Line : Lines)
 	{
-		const int32 Removed = Central->TryRemoveItemsFromCentralStorage(Line.Key, Line.Value);
-		if (Removed < Line.Value)
+		// Central storage first (the depot exists to feed building); the payer's pockets cover the rest.
+		int32 Remaining = Line.Value;
+		if (Central)
+		{
+			const int32 FromCentral = FMath::Min(Remaining, Central->GetNumItemsFromCentralStorage(Line.Key));
+			if (FromCentral > 0)
+			{
+				Remaining -= Central->TryRemoveItemsFromCentralStorage(Line.Key, FromCentral);
+			}
+		}
+		if (Remaining > 0 && Pockets)
+		{
+			Pockets->Remove(Line.Key, Remaining);
+			Remaining = 0;
+		}
+		if (Remaining > 0)
 		{
 			// Should not happen after the verify pass; log loudly, keep going (items already left).
-			UE_LOG(LogAIDA, Error, TEXT("[actions] cost deduction shortfall: %d/%d %s"),
-				Removed, Line.Value, *GetNameSafe(Line.Key.Get()));
+			UE_LOG(LogAIDA, Error, TEXT("[actions] cost deduction shortfall: %d %s unpaid"),
+				Remaining, *GetNameSafe(Line.Key.Get()));
 		}
 	}
 	return true;
@@ -931,24 +959,7 @@ void FAIDAActionSeam::RefundToPlayer(UObject* WorldContext, const FString& Playe
 
 	// The refund destination: the named player's inventory, else the first player with one (covers
 	// the console/host approver). Central storage exposes no server-side deposit API.
-	UFGInventoryComponent* Inventory = nullptr;
-	UFGInventoryComponent* Fallback = nullptr;
-	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
-	{
-		APlayerController* PC = It->Get();
-		AFGCharacterPlayer* Character = PC ? Cast<AFGCharacterPlayer>(PC->GetPawn()) : nullptr;
-		if (!Character || !Character->GetInventory()) { continue; }
-		if (!Fallback) { Fallback = Character->GetInventory(); }
-
-		APlayerState* PS = PC->PlayerState;
-		const TSharedPtr<const FUniqueNetId> NetId = PS ? PS->GetUniqueId().GetUniqueNetId() : nullptr;
-		if (NetId.IsValid() && NetId->ToString() == PlayerId)
-		{
-			Inventory = Character->GetInventory();
-			break;
-		}
-	}
-	if (!Inventory) { Inventory = Fallback; }
+	UFGInventoryComponent* Inventory = ResolvePlayerInventory(World, PlayerId, /*bFallbackToAny*/ true);
 	if (!Inventory)
 	{
 		OutLost = Total;
@@ -1660,7 +1671,8 @@ bool FAIDAActionSeam::ResolveMachinePorts(UObject* WorldContext, const FAIDADism
 bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
 	AActor* FromActor, const FVector& FromWantDir, AActor* ToActor, const FVector& ToWantDir,
 	bool bChargeCost, TArray<FAIDACostItem>& OutCost,
-	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError)
+	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError,
+	const FString& PayerPlayerId)
 {
 	OutCost.Reset();
 	OutError.Reset();
@@ -1762,9 +1774,9 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 	{
 		AddCost(OutCost, Entry.ItemClass, Entry.Amount);
 	}
-	if (bChargeCost && !DeductCost(WorldContext, OutCost))
+	if (bChargeCost && !DeductCost(WorldContext, OutCost, PayerPlayerId))
 	{
-		OutError = TEXT("central storage cannot afford this run");
+		OutError = TEXT("central storage + the requester's inventory cannot afford this run");
 		Hologram->Destroy();
 		return false;
 	}
@@ -1952,15 +1964,20 @@ bool FAIDAActionSeam::ResolveAutoPower(UObject* WorldContext, const FString& Mac
 	return true;
 }
 
-bool FAIDAActionSeam::CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost)
+bool FAIDAActionSeam::CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost,
+	const FString& PayerPlayerId)
 {
 	UWorld* World = ResolveWorld(WorldContext);
 	AFGCentralStorageSubsystem* Central = World ? AFGCentralStorageSubsystem::Get(World) : nullptr;
-	if (!Central) { return false; }
+	UFGInventoryComponent* Pockets = World ? ResolvePlayerInventory(World, PayerPlayerId) : nullptr;
+	if (!Central && !Pockets) { return false; }
 	for (const FAIDACostItem& Item : Cost)
 	{
 		const TSubclassOf<UFGItemDescriptor> Descriptor = LoadDescriptor(Item.ClassPath);
-		if (!Descriptor || Central->GetNumItemsFromCentralStorage(Descriptor) < Item.Amount)
+		if (!Descriptor) { return false; }
+		const int32 Available = (Central ? Central->GetNumItemsFromCentralStorage(Descriptor) : 0)
+			+ (Pockets ? Pockets->GetNumItems(Descriptor) : 0);
+		if (Available < Item.Amount)
 		{
 			return false;
 		}
@@ -1970,7 +1987,8 @@ bool FAIDAActionSeam::CheckAffordable(UObject* WorldContext, const TArray<FAIDAC
 
 bool FAIDAActionSeam::BuildWire(UObject* WorldContext, const FString& WireRecipePath,
 	AActor* A, AActor* B, bool bChargeCost, TArray<FAIDACostItem>& OutCost,
-	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError)
+	TArray<FString>& OutEntityIds, TArray<TWeakObjectPtr<AActor>>& OutActors, FString& OutError,
+	const FString& PayerPlayerId)
 {
 	OutCost.Reset();
 	OutError.Reset();
@@ -1998,9 +2016,9 @@ bool FAIDAActionSeam::BuildWire(UObject* WorldContext, const FString& WireRecipe
 	{
 		AddCost(OutCost, Ingredient.ItemClass, Ingredient.Amount * Multiplier);
 	}
-	if (bChargeCost && !DeductCost(WorldContext, OutCost))
+	if (bChargeCost && !DeductCost(WorldContext, OutCost, PayerPlayerId))
 	{
-		OutError = TEXT("central storage cannot afford this power line");
+		OutError = TEXT("central storage + the requester's inventory cannot afford this power line");
 		return false;
 	}
 

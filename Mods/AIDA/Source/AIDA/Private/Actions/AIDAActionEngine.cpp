@@ -90,10 +90,11 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 	}
 	else if (Config.CostMode == TEXT("central"))
 	{
-		// Pay the whole tally upfront; failure leaves the proposal pending (player can restock).
-		if (!FAIDAActionSeam::DeductCost(WorldContext, Proposal->Cost))
+		// Pay the whole tally upfront (central storage first, then the REQUESTER's inventory —
+		// they asked for the build); failure leaves the proposal pending (player can restock).
+		if (!FAIDAActionSeam::DeductCost(WorldContext, Proposal->Cost, Proposal->RequesterId))
 		{
-			OutMessage = TEXT("no longer affordable from central storage — restock and approve again");
+			OutMessage = TEXT("no longer affordable from central storage + the requester's inventory — restock and approve again");
 			return false;
 		}
 	}
@@ -197,8 +198,9 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 	const bool bComposite = Proposal->PlacementPartIndex.Num() == Proposal->Placements.Num()
 		&& Proposal->PartRecipePaths.Num() > 0;
 	const bool bRan = bComposite
-		? FAIDAActionSeam::DryRunBuildParts(WorldContext, Proposal->PartRecipePaths, Proposal->PlacementPartIndex, Adjusted, DryRun)
-		: FAIDAActionSeam::DryRunBuild(WorldContext, Proposal->RecipeClassPath, Adjusted, DryRun);
+		? FAIDAActionSeam::DryRunBuildParts(WorldContext, Proposal->PartRecipePaths, Proposal->PlacementPartIndex, Adjusted, DryRun,
+			Proposal->RequesterId)
+		: FAIDAActionSeam::DryRunBuild(WorldContext, Proposal->RecipeClassPath, Adjusted, DryRun, Proposal->RequesterId);
 	if (!bRan || !DryRun.bOk)
 	{
 		OutMessage = FString::Printf(TEXT("adjustment blocked — %s; the proposal is unchanged"),
@@ -324,7 +326,7 @@ bool FAIDAActionEngine::TickManifold(UObject* WorldContext, const FAIDAActionsCo
 		FString Error;
 		if (FAIDAActionSeam::BuildConnectingRun(WorldContext, Proposal.TransportRecipePath, Proposal.bManifoldPipe,
 			From, FromDir, To, ToDir, Config.CostMode == TEXT("central"), Cost,
-			Proposal.AffectedEntityIds, BuiltActors, Error))
+			Proposal.AffectedEntityIds, BuiltActors, Error, Proposal.RequesterId))
 		{
 			MergeCost(Proposal.Cost, Cost); // the journaled refund covers the whole manifold
 			++RunBuiltCount;
@@ -483,7 +485,8 @@ bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsCon
 		TArray<FAIDACostItem> Cost;
 		FString Error;
 		if (FAIDAActionSeam::BuildWire(WorldContext, Proposal.WireRecipePath, A, B,
-			Config.CostMode == TEXT("central"), Cost, Proposal.AffectedEntityIds, BuiltActors, Error))
+			Config.CostMode == TEXT("central"), Cost, Proposal.AffectedEntityIds, BuiltActors, Error,
+			Proposal.RequesterId))
 		{
 			MergeCost(Proposal.Cost, Cost);
 			++RunBuiltCount;
@@ -732,11 +735,12 @@ void FAIDAActionEngine::FinishUndoJob(UObject* WorldContext, const FAIDAActionsC
 
 		if (Job.bDismantle)
 		{
-			// Undo of a dismantle: collect the earlier refund back. Best-effort — the items may
-			// have been spent; the rebuild still stands (report it, don't block).
-			if (Scaled.Num() > 0 && !FAIDAActionSeam::DeductCost(WorldContext, Scaled))
+			// Undo of a dismantle: collect the earlier refund back (central first, then the undo
+			// instigator's pockets). Best-effort — the items may have been spent; the rebuild
+			// still stands (report it, don't block).
+			if (Scaled.Num() > 0 && !FAIDAActionSeam::DeductCost(WorldContext, Scaled, UndoInstigatorId))
 			{
-				Line += TEXT("; the earlier refund could not be re-collected from central storage");
+				Line += TEXT("; the earlier refund could not be re-collected");
 			}
 		}
 		else

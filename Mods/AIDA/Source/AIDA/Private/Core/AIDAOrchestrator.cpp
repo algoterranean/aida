@@ -1438,7 +1438,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later."),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -1589,8 +1589,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 				const int32 AttemptTotal = Attempt.Num();
 				FAIDADryRunResult AttemptRun;
 				const bool bRan = bComposite
-					? FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, AttemptPartIndex, Attempt, AttemptRun)
-					: FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Attempt, AttemptRun);
+					? FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, AttemptPartIndex, Attempt, AttemptRun, Ctx.PlayerId)
+					: FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Attempt, AttemptRun, Ctx.PlayerId);
 				if (!bRan)
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(AttemptRun.Error, {}));
@@ -1647,7 +1647,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 			if (Config.Actions.CostMode == TEXT("central") && !DryRun.bAffordable)
 			{
-				FString Msg = TEXT("not affordable from central storage (dimensional depot): needs ");
+				FString Msg = TEXT("not affordable from central storage (dimensional depot) plus your inventory: needs ");
 				for (int32 i = 0; i < DryRun.Cost.Num(); ++i)
 				{
 					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), DryRun.Cost[i].Amount, *DryRun.Cost[i].Item);
@@ -1687,7 +1687,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 						}
 						// Pole dry-run: cost tally + validation. Hard-invalid poles are NOT fatal —
 						// they get skipped at execute and their wires report loudly.
-						FAIDAActionSeam::DryRunBuild(this, Power.PoleRecipePath, PowerPlan.Poles, PoleDryRun);
+						FAIDAActionSeam::DryRunBuild(this, Power.PoleRecipePath, PowerPlan.Poles, PoleDryRun, Ctx.PlayerId);
 						bAutoPower = true;
 					}
 				}
@@ -1710,9 +1710,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 					}
 					if (!bMerged) { TotalCost.Add(Item); }
 				}
-				if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, TotalCost))
+				if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, TotalCost, Ctx.PlayerId))
 				{
-					FString Msg = TEXT("not affordable from central storage with the power kit included: needs ");
+					FString Msg = TEXT("not affordable from central storage + your inventory with the power kit included: needs ");
 					for (int32 i = 0; i < TotalCost.Num(); ++i)
 					{
 						Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), TotalCost[i].Amount, *TotalCost[i].Item);
@@ -2044,7 +2044,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				Stage(FString::Printf(TEXT("planned %d attachment(s) at %.0f m (yaw=%d axis=%s) — dry-running"),
 					Plan.Attachments.Num(), UsedStandoffM, Plan.YawDeg, *Plan.RowAxis.ToCompactString()));
 
-				if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun))
+				if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun, Ctx.PlayerId))
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
 				}
@@ -2100,7 +2100,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			}
 			if (Config.Actions.CostMode == TEXT("central") && !DryRun.bAffordable)
 			{
-				FString Msg = TEXT("attachments not affordable from central storage (dimensional depot): needs ");
+				FString Msg = TEXT("attachments not affordable from central storage (dimensional depot) plus your inventory: needs ");
 				for (int32 i = 0; i < DryRun.Cost.Num(); ++i)
 				{
 					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), DryRun.Cost[i].Amount, *DryRun.Cost[i].Item);
@@ -2264,7 +2264,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 					}
 				}
 				FAIDADryRunResult AttemptRun;
-				if (!FAIDAActionSeam::DryRunBuild(this, Power.PoleRecipePath, AttemptPlan.Poles, AttemptRun))
+				if (!FAIDAActionSeam::DryRunBuild(this, Power.PoleRecipePath, AttemptPlan.Poles, AttemptRun, Ctx.PlayerId))
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(AttemptRun.Error, {}));
 				}
@@ -2296,7 +2296,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (Config.Actions.CostMode == TEXT("central") && !PoleDryRun.bAffordable)
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-					FString::Printf(TEXT("%d pole(s) not affordable from central storage (dimensional depot)"), Plan.Poles.Num()), {}));
+					FString::Printf(TEXT("%d pole(s) not affordable from central storage (dimensional depot) plus your inventory"), Plan.Poles.Num()), {}));
 			}
 
 			FAIDAProposal Proposal;
@@ -2406,10 +2406,10 @@ void UAIDAOrchestrator::RegisterActionTools()
 
 			TArray<FAIDACostItem> Cost;
 			FAIDAActionSeam::TallyRecipeCost(this, Sign.RecipeClassPath, Targets.Num(), Cost);
-			if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, Cost))
+			if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, Cost, Ctx.PlayerId))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-					FString::Printf(TEXT("%d sign(s) not affordable from central storage (dimensional depot)"), Targets.Num()), {}));
+					FString::Printf(TEXT("%d sign(s) not affordable from central storage (dimensional depot) plus your inventory"), Targets.Num()), {}));
 			}
 
 			// Sign spots as placements: the ghost preview, pending caps, and upfront cost reuse the
