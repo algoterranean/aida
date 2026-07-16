@@ -526,8 +526,10 @@ bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& Play
 
 bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
 	const FString& RecipeClassPath, int32& InOutYawDeg,
-	int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm)
+	int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm,
+	TArray<FVector>* OutAlternateOrigins)
 {
+	if (OutAlternateOrigins) { OutAlternateOrigins->Reset(); }
 	UWorld* World = ResolveWorld(WorldContext);
 	FHitResult Hit;
 	FVector ViewLocation = FVector::ZeroVector;
@@ -617,6 +619,23 @@ bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FStri
 			OutOriginCm += GrowthAxis * ((CountAlong - 1) * StepAlong); // +axis expansion must END at the anchor
 		}
 		OutOriginCm -= bAlongX ? CenterY : CenterX;
+
+		// Fallback anchors for the caller to dry-run when the toward-player bet loses (top faces
+		// only — see the header note). Same anchor cell, different spans: centered, then away.
+		if (OutAlternateOrigins && !bSideAim && CountAlong > 1)
+		{
+			const FVector UnsignedAxis = bAlongX ? AxisX : AxisY;
+			const FVector Perp = bAlongX ? CenterY : CenterX;
+			const FVector Centered = Anchor - UnsignedAxis * (((CountAlong - 1) / 2) * StepAlong) - Perp;
+			FVector Away = Anchor - Perp;
+			if (Sign > 0.0)
+			{
+				Away -= UnsignedAxis * ((CountAlong - 1) * StepAlong); // mirror of the Sign<0 case above
+			}
+			OutAlternateOrigins->AddUnique(Centered);
+			OutAlternateOrigins->AddUnique(Away);
+			OutAlternateOrigins->Remove(OutOriginCm); // paranoia: never duplicate the primary
+		}
 	}
 
 	UE_LOG(LogAIDA, Log, TEXT("[actions][dbg] aim origin snapped %s -> %s (anchored %s) yaw=%d structure=%d normal=%s"),

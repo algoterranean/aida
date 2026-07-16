@@ -41,10 +41,18 @@ public:
 	 * The grid geometry (counts + effective steps, cm) chooses the anchor corner: aiming past a tile
 	 * edge grows the grid OUTWARD on that side (one cell clear of an aimed structure); an ambiguous
 	 * axis centers on the aim. Falls back to the raw aim point.
+	 *
+	 * OutAlternateOrigins (optional): fallback anchors for TOP-FACE aims, preference-ordered —
+	 * centered on the aim, then growing away from the player. A top-face growth direction is a bet
+	 * (the HUB / a platform edge may stand that way while the aimed cell itself is fine); callers
+	 * dry-run the candidates in order instead of failing on the first bet. Side-face and terrain
+	 * aims add none (a reversed side-face grid would sit INSIDE the aimed structure, and clipping
+	 * never blocks — so it must never be offered).
 	 */
 	static bool ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
 		const FString& RecipeClassPath, int32& InOutYawDeg,
-		int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm);
+		int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm,
+		TArray<FVector>* OutAlternateOrigins = nullptr);
 
 	/**
 	 * Ground height (cm) under a point, via the same build-gun-channel trace placements use.

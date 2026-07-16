@@ -1280,20 +1280,30 @@ void UAIDAOrchestrator::RegisterActionTools()
 			// No origin = "where the requesting player is aiming", SNAPPED like the build gun (extends
 			// an aimed structure tile-perfectly / aligns to the world grid), falling back to their
 			// position — players mean "build it THERE", and it keeps the grid off their feet.
-			if (!Spec.bHasOrigin)
+			// Candidate origins, most-preferred first. Explicit origin = exactly one. Aim-derived
+			// origins add the resolver's alternates (top-face aims: centered on the aim, then away
+			// from the player) — a growth direction is a bet, and it can lose to whatever stands
+			// that way while the aimed cell itself is fine (live-verify: tile 0 landed on the HUB,
+			// then off the platform edge, and the model told the player the ground was "too uneven").
+			// The dry-run, not the bet, picks the anchor.
+			TArray<FVector> OriginCandidatesCm;
+			const bool bAimDerivedOrigin = !Spec.bHasOrigin;
+			if (bAimDerivedOrigin)
 			{
 				// Effective steps (the same footprint clamp ExpandGrid applies) drive the anchor math.
 				const double StepXCm = FMath::Max(Spec.Grid.StepXM, Recipe.FootprintXM) * 100.0;
 				const double StepYCm = FMath::Max(Spec.Grid.StepYM, Recipe.FootprintYM) * 100.0;
 				FVector AimCm;
+				TArray<FVector> Alternates;
 				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, /*InOut*/ Spec.YawDeg,
-					Spec.Grid.CountX, Spec.Grid.CountY, StepXCm, StepYCm, AimCm))
+					Spec.Grid.CountX, Spec.Grid.CountY, StepXCm, StepYCm, AimCm, &Alternates))
 				{
-					Spec.OriginM = AimCm / 100.0; // world cm -> spec metres (yaw now carries the snapped orientation)
+					OriginCandidatesCm.Add(AimCm); // yaw now carries the snapped orientation
+					OriginCandidatesCm.Append(Alternates);
 				}
 				else if (Ctx.bHasLocation)
 				{
-					Spec.OriginM = Ctx.Location / 100.0;
+					OriginCandidatesCm.Add(Ctx.Location);
 				}
 				else
 				{
@@ -1301,44 +1311,100 @@ void UAIDAOrchestrator::RegisterActionTools()
 						TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'origin' {x,y in metres}"), {}));
 				}
 				Spec.bHasOrigin = true;
+			}
+			else
+			{
+				OriginCandidatesCm.Add(Spec.OriginM * AIDAMetersToCm);
+			}
 
-				// Write the resolved origin back into the stored/journaled spec — the record (and any
-				// later re-parse) must carry the concrete position, not "wherever the player is".
+			// Grids are FLAT at the origin's height by default; followTerrain drops each tile to its
+			// own ground (the "trace the ground" request) by adjusting placement Z up front — the
+			// journal then records exactly what gets built.
+			const auto ExpandAt = [&](const FVector& OriginCm)
+			{
+				Spec.OriginM = OriginCm / AIDAMetersToCm;
+				TArray<FTransform> Expanded = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
+				if (Spec.bFollowTerrain)
+				{
+					for (FTransform& Placement : Expanded)
+					{
+						double GroundZ;
+						if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
+						{
+							FVector Location = Placement.GetLocation();
+							Location.Z = GroundZ;
+							Placement.SetLocation(Location);
+						}
+					}
+				}
+				return Expanded;
+			};
+
+			TArray<FTransform> Placements;
+			FAIDADryRunResult DryRun;
+			TArray<FTransform> FallbackPlacements;   // first candidate that validates but clips
+			FAIDADryRunResult FallbackDryRun;
+			FVector FallbackOriginCm = FVector::ZeroVector;
+			FAIDADryRunResult FirstFailRun;          // the PREFERRED candidate's failures for the report
+			int32 FirstFailTotal = 0;
+			bool bPlaced = false;
+			bool bHaveFallback = false;
+			bool bHaveFirstFail = false;
+			for (const FVector& OriginCm : OriginCandidatesCm)
+			{
+				TArray<FTransform> Attempt = ExpandAt(OriginCm);
+				const int32 AttemptTotal = Attempt.Num();
+				FAIDADryRunResult AttemptRun;
+				if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Attempt, AttemptRun))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(AttemptRun.Error, {}));
+				}
+				if (AttemptRun.bOk && AttemptRun.ClippingCount == 0)
+				{
+					Placements = MoveTemp(Attempt);
+					DryRun = MoveTemp(AttemptRun);
+					bPlaced = true; // Spec.OriginM holds this candidate (set in ExpandAt)
+					break;
+				}
+				if (AttemptRun.bOk && !bHaveFallback)
+				{
+					FallbackPlacements = MoveTemp(Attempt);
+					FallbackDryRun = AttemptRun;
+					FallbackOriginCm = OriginCm;
+					bHaveFallback = true;
+				}
+				else if (!AttemptRun.bOk && !bHaveFirstFail)
+				{
+					FirstFailRun = MoveTemp(AttemptRun);
+					FirstFailTotal = AttemptTotal;
+					bHaveFirstFail = true;
+				}
+			}
+			if (!bPlaced && bHaveFallback)
+			{
+				// Every candidate clips somewhere; the most-preferred valid one wins (clipping is
+				// advisory — the player judges via the ghosts, or nudges).
+				Placements = MoveTemp(FallbackPlacements);
+				DryRun = MoveTemp(FallbackDryRun);
+				Spec.OriginM = FallbackOriginCm / AIDAMetersToCm;
+				bPlaced = true;
+			}
+			if (!bPlaced)
+			{
+				const FString Msg = FString::Printf(TEXT("%d of %d placements invalid (every anchor tried)"),
+					FirstFailRun.Failures.Num(), FirstFailTotal);
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, FirstFailRun.Failures));
+			}
+
+			// Write the CHOSEN origin back into the stored/journaled spec — the record (and any
+			// later re-parse) must carry the concrete position, not "wherever the player was aiming".
+			if (bAimDerivedOrigin)
+			{
 				const TSharedRef<FJsonObject> Origin = MakeShared<FJsonObject>();
 				Origin->SetField(TEXT("x"), AIDANumber(Spec.OriginM.X));
 				Origin->SetField(TEXT("y"), AIDANumber(Spec.OriginM.Y));
 				Origin->SetField(TEXT("z"), AIDANumber(Spec.OriginM.Z));
 				(*SpecObj)->SetObjectField(TEXT("origin"), Origin);
-			}
-
-			TArray<FTransform> Placements = AIDAActionSpec::ExpandGrid(Spec, Recipe.FootprintXM, Recipe.FootprintYM);
-
-			// Grids are FLAT at the origin's height by default; followTerrain drops each tile to its
-			// own ground (the "trace the ground" request) by adjusting placement Z here, up front —
-			// the journal then records exactly what gets built.
-			if (Spec.bFollowTerrain)
-			{
-				for (FTransform& Placement : Placements)
-				{
-					double GroundZ;
-					if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
-					{
-						FVector Location = Placement.GetLocation();
-						Location.Z = GroundZ;
-						Placement.SetLocation(Location);
-					}
-				}
-			}
-
-			FAIDADryRunResult DryRun;
-			if (!FAIDAActionSeam::DryRunBuild(this, Recipe.RecipeClassPath, Placements, DryRun))
-			{
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
-			}
-			if (!DryRun.bOk)
-			{
-				const FString Msg = FString::Printf(TEXT("%d of %d placements invalid"), DryRun.Failures.Num(), Placements.Num());
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
 			}
 			if (Config.Actions.CostMode == TEXT("central") && !DryRun.bAffordable)
 			{
