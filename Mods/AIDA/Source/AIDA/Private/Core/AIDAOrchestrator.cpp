@@ -602,7 +602,21 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 		{
 			StateLine += TEXT(" One approved proposal is executing right now.");
 		}
-		StateLine += TEXT(" Never claim you must wait for a previous proposal — just call propose_build; if a limit applies, the tool error will say so.");
+		if (RecentProposalOutcomes.Num() > 0)
+		{
+			const int64 NowUtc = FDateTime::UtcNow().ToUnixTimestamp();
+			TArray<FString> Recent;
+			for (int32 i = RecentProposalOutcomes.Num() - 1; i >= 0 && Recent.Num() < 5; --i)
+			{
+				const int64 AgeMin = FMath::Max<int64>(0, (NowUtc - RecentProposalOutcomes[i].Key) / 60);
+				Recent.Add(FString::Printf(TEXT("%s (%lld min ago)"), *RecentProposalOutcomes[i].Value, AgeMin));
+			}
+			StateLine += FString::Printf(TEXT(" Recently resolved: %s."), *FString::Join(Recent, TEXT("; ")));
+		}
+		StateLine += TEXT(" THIS LIST IS THE ONLY TRUTH ABOUT THE QUEUE: anything not listed as pending here"
+			" is NOT pending — never re-list earlier proposals from the conversation as a pending queue;"
+			" they are in 'recently resolved' (or gone). Never claim you must wait for a previous proposal"
+			" — just call the propose tool; if a limit applies, the tool error will say so.");
 		SystemPrompt += StateLine;
 	}
 	LLMClient->SetSystemPrompt(SystemPrompt);
@@ -1114,6 +1128,18 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 	if (!R || !Proposal)
 	{
 		return;
+	}
+
+	// Terminal transitions feed the prompt's LIVE PROPOSAL STATE "recently resolved" list — the
+	// model must never re-report an executed/expired proposal as pending (live-verify: it recited
+	// a stale 5-deep 'pending' queue from conversation memory after everything had built).
+	if (Proposal->State == EAIDAProposalState::Executed || Proposal->State == EAIDAProposalState::Failed
+		|| Proposal->State == EAIDAProposalState::Rejected || Proposal->State == EAIDAProposalState::Expired
+		|| Proposal->State == EAIDAProposalState::Undone)
+	{
+		RecentProposalOutcomes.Add({ FDateTime::UtcNow().ToUnixTimestamp(),
+			FString::Printf(TEXT("%s: %s"), *AIDAActionSpec::StateToString(Proposal->State), *Proposal->Summary) });
+		while (RecentProposalOutcomes.Num() > 8) { RecentProposalOutcomes.RemoveAt(0); }
 	}
 
 	FAIDAProposalView View;

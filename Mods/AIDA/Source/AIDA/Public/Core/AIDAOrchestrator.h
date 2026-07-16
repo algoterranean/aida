@@ -233,6 +233,10 @@ private:
 	void OnSnapshotTimer();
 	FTimerHandle SnapshotTimer;
 
+	/** Terminal proposal outcomes (utc, "state: summary") feeding the prompt's LIVE PROPOSAL STATE
+	 *  "recently resolved" list — the model must never re-report a resolved proposal as pending. */
+	TArray<TPair<int64, FString>> RecentProposalOutcomes;
+
 	//~ Login-anchored snapshot (P7 Slice 0 polish): one per player join, so "since I last logged in"
 	//~ has a clean baseline. Bound server-side to the global PostLogin event; unbound in Deinitialize.
 	void OnPlayerPostLogin(class AGameModeBase* GameMode, class APlayerController* NewPlayer);
