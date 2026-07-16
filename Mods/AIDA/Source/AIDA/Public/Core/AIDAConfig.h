@@ -18,7 +18,10 @@ struct FAIDAProviderConfig
 	/** SERVER-ONLY. Never replicate, never log — redact everywhere. */
 	UPROPERTY() FString ApiKey;
 	UPROPERTY() FString Model;
-	UPROPERTY() int32 MaxOutputTokens = 1024;
+	/** 1024 starved spec-v2 composites: a detailed multi-part build spec is several KB of tool-call
+	 *  JSON, and a reply truncated mid-call dispatches with empty arguments. Keep this generous —
+	 *  it is a CAP, not a spend; 32768 fits every current Claude model (haiku 4.5 caps at 64K). */
+	UPROPERTY() int32 MaxOutputTokens = 32768;
 	UPROPERTY() FString VisionModel;
 };
 

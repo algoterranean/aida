@@ -73,10 +73,10 @@ void UAIDAChatWidget::NativeConstruct()
 	// --- Layout + font tuning (driven here so the BP stays a pure, positionless view) ---
 	// Tweakables (slate units ~= design px). Bump ToolbarClearance if the input row overlaps the hotbar.
 	constexpr float Margin          = 20.f;  // outer margin from screen edges
-	constexpr float InputHeight     = 44.f;  // height of the input box / Send button row
-	constexpr float SendWidth       = 140.f; // width of the Send button
-	constexpr float AttachWidth     = 44.f;  // width of the attach (+) button left of the input box
-	constexpr float RowGap          = 12.f;  // gap between transcript, input box, and Send button
+	constexpr float InputHeight     = 26.f;  // height of the input box / Send button row
+	constexpr float SendWidth       = 64.f;  // width of the Send button
+	constexpr float AttachWidth     = 30.f;  // width of the attach (+) button left of the input box
+	constexpr float RowGap          = 8.f;   // gap between transcript, input box, and Send button
 	constexpr float ToolbarClearance= 96.f;  // approx Satisfactory hotbar height to clear at the bottom
 	constexpr float FontSize        = 10.f;  // small, like the native chat
 	constexpr float TabBarHeight    = 26.f;  // tab strip along the top
@@ -128,6 +128,18 @@ void UAIDAChatWidget::NativeConstruct()
 			InputBox->WidgetStyle.SetFocusedForegroundColor(FSlateColor(FLinearColor::Black));
 			InputBox->SynchronizeProperties();
 		}
+
+		// The BP's Send label ships with the engine's large default font; pull it down to match.
+		if (SendButton)
+		{
+			for (int32 i = 0; i < SendButton->GetChildrenCount(); ++i)
+			{
+				if (UTextBlock* SendLabel = Cast<UTextBlock>(SendButton->GetChildAt(i)))
+				{
+					SendLabel->SetFont(Font);
+				}
+			}
+		}
 	}
 
 	// Rich-text transcript for markdown rendering, constructed in C++ under the scroll box so the BP
@@ -161,7 +173,7 @@ void UAIDAChatWidget::NativeConstruct()
 	BuildProposalPanel(GameFont, FontSize);
 
 	// Attach button + pending-attachment chip row (Phase 5).
-	BuildAttachmentRow(GameFont, FontSize, Margin, BottomInset, InputHeight, RowGap, RightAnchor);
+	BuildAttachmentRow(GameFont, FontSize, Margin, BottomInset, InputHeight, AttachWidth, RowGap, RightAnchor);
 
 	// Create the default conversation tab and render it (more tabs appear as conversations arrive).
 	EnsureConversation(CurrentConversationId);
@@ -871,7 +883,7 @@ void UAIDAChatWidget::RebuildTabBar()
 //~ ─────────────────────── Phase 5: reference-image attachments ───────────────────────
 
 void UAIDAChatWidget::BuildAttachmentRow(UFont* GameFont, float FontSize, float Margin,
-	float BottomInset, float InputHeight, float RowGap, float RightAnchor)
+	float BottomInset, float InputHeight, float AttachWidth, float RowGap, float RightAnchor)
 {
 	UPanelWidget* RootPanel = Cast<UPanelWidget>(GetRootWidget());
 	if (!RootPanel || !WidgetTree)
@@ -901,7 +913,7 @@ void UAIDAChatWidget::BuildAttachmentRow(UFont* GameFont, float FontSize, float 
 	{
 		BtnSlot->SetAnchors(FAnchors(0.f, 1.f, 0.f, 1.f));
 		BtnSlot->SetAlignment(FVector2D(0.f, 1.f));
-		BtnSlot->SetOffsets(FMargin(Margin, -BottomInset, 44.f, InputHeight));
+		BtnSlot->SetOffsets(FMargin(Margin, -BottomInset, AttachWidth, InputHeight));
 	}
 
 	// Chip row: hugs the top edge of the input row (overlaying the transcript's last pixels is fine

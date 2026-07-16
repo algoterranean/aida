@@ -2527,6 +2527,32 @@ void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode
 			Assistant.ToolCalls = Result.ToolCalls;
 			Messages->Add(Assistant);
 
+			// A reply cut off by the output-token limit MID-TOOL-CALL arrives with truncated (usually
+			// empty) arguments. Dispatching those yields nonsense errors ("missing spec object") the
+			// model can't diagnose — live-verify showed it retrying the same oversized composite spec
+			// ten times. Tell it exactly what happened instead, so it compacts or splits the call.
+			if (Result.StopReason == TEXT("max_tokens") || Result.StopReason == TEXT("length"))
+			{
+				UE_LOG(LogAIDA, Warning, TEXT("[tools] reply hit the output-token limit mid-tool-call — %d call(s) NOT dispatched."),
+					Result.ToolCalls.Num());
+				FAIDAChatMessage TruncTurn;
+				TruncTurn.Role = TEXT("user");
+				for (const FAIDAToolCall& Call : Result.ToolCalls)
+				{
+					FAIDAToolResultPart Part;
+					Part.ToolCallId = Call.Id;
+					Part.bIsError = true;
+					Part.Content = TEXT("NOT EXECUTED: your reply hit the provider's output-token limit before this tool call's"
+						" arguments finished streaming. Make the call much more COMPACT and retry: use grid repeats"
+						" (countX/countY) instead of listing similar parts one by one, drop optional fields, and if it is"
+						" still large, split the build into two or three smaller proposals.");
+					TruncTurn.ToolResults.Add(MoveTemp(Part));
+				}
+				Messages->Add(MoveTemp(TruncTurn));
+				O->RunToolLoop(Messages, Requester, RoundsLeft - 1, OnDelta, OnDone, OnError);
+				return;
+			}
+
 			// Dispatch each call (permission-gated by the tool's declared tier), collecting one
 			// tool_result per call into a single follow-up user turn.
 			FAIDAChatMessage ToolTurn;

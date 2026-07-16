@@ -8,7 +8,7 @@
     "baseUrl": "http://localhost:11434/v1",      // OpenAI, Anthropic, or Ollama/LAN. Ollama shown (free, local).
     "apiKey": "",                                // SERVER-ONLY. Leave empty for keyless local endpoints.
     "model": "llama3.1",
-    "maxOutputTokens": 1024,
+    "maxOutputTokens": 32768,                    // a CAP, not a spend — big composite build specs are several KB of tool-call JSON; truncation mid-call loses the whole call
     "visionModel": ""                            // optional: model used for requests carrying reference images (empty = "model")
   },
   "limits": {

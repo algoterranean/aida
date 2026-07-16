@@ -295,7 +295,7 @@ private:
 
 	/** Build the attach button + (initially empty) chip row around the input box. */
 	void BuildAttachmentRow(class UFont* GameFont, float FontSize, float Margin, float BottomInset,
-		float InputHeight, float RowGap, float RightAnchor);
+		float InputHeight, float AttachWidth, float RowGap, float RightAnchor);
 
 	UFUNCTION()
 	void HandleAttachClicked();
