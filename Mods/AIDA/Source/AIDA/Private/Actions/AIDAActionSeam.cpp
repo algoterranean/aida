@@ -28,6 +28,7 @@
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
 #include "Buildables/FGBuildable.h"
+#include "Buildables/FGBuildableConveyorBase.h"
 #include "Hologram/FGHologram.h"
 #include "ItemAmount.h"
 #include "Resources/FGBuildingDescriptor.h"
@@ -47,6 +48,32 @@ namespace
 	UWorld* ResolveWorld(UObject* WorldContext)
 	{
 		return GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
+	}
+
+	/**
+	 * Ground trace that refuses to land on conveyors: belts/lifts are never "ground", and worse — a
+	 * conveyor hit actor makes attachment holograms run their snap-to-belt spline math against our
+	 * location-overridden hit (live-verify: proposing a manifold on a floor with belts running
+	 * beneath it froze the game). Re-traces below each conveyor hit, bounded.
+	 */
+	bool TraceGroundIgnoringConveyors(UWorld* World, const FVector& Start, const FVector& End,
+		const FCollisionQueryParams& InParams, FHitResult& OutHit)
+	{
+		FCollisionQueryParams Params(InParams);
+		for (int32 Guard = 0; Guard < 4; ++Guard)
+		{
+			if (!World->LineTraceSingleByChannel(OutHit, Start, End, AIDABuildGunChannel, Params))
+			{
+				return false;
+			}
+			AActor* HitActor = OutHit.GetActor();
+			if (!HitActor || !HitActor->IsA<AFGBuildableConveyorBase>())
+			{
+				return true;
+			}
+			Params.AddIgnoredActor(HitActor);
+		}
+		return false;
 	}
 
 	FString DescriptorName(TSubclassOf<UFGItemDescriptor> ItemClass)
@@ -232,13 +259,13 @@ namespace
 
 			// First from just above the intended plane (so a roof over the area doesn't win) …
 			const FVector End = Target - FVector(0.0, 0.0, 50000.0);   // down to 500 m below (canyons)
-			bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 300.0), End, AIDABuildGunChannel, Params);
+			bHaveHit = TraceGroundIgnoringConveyors(World, Target + FVector(0.0, 0.0, 300.0), End, Params, Hit);
 			if (!bHaveHit)
 			{
 				// … but on rising ground a far tile's terrain can sit ABOVE start+3 m — the ray then
 				// begins underground and misses (live-verify: one uphill corner of an otherwise valid
 				// grid). Retry from 50 m up before giving up.
-				bHaveHit = World->LineTraceSingleByChannel(Hit, Target + FVector(0.0, 0.0, 5000.0), End, AIDABuildGunChannel, Params);
+				bHaveHit = TraceGroundIgnoringConveyors(World, Target + FVector(0.0, 0.0, 5000.0), End, Params, Hit);
 			}
 		}
 		if (!bHaveHit && InOutTemplateHit && InOutTemplateHit->GetActor())
@@ -569,11 +596,12 @@ bool FAIDAActionSeam::ProbeGroundZ(UObject* WorldContext, const FVector& AtCm, d
 		if (APawn* Pawn = It->Get() ? It->Get()->GetPawn() : nullptr) { Params.AddIgnoredActor(Pawn); }
 	}
 
-	// Low first (roofs over the area must not win), then from high on rising terrain.
+	// Low first (roofs over the area must not win), then from high on rising terrain. Conveyors are
+	// never ground — a manifold's trunk points must land on the floor, not a belt running under it.
 	const FVector End = AtCm - FVector(0.0, 0.0, 10000.0);
 	FHitResult Hit;
-	if (!World->LineTraceSingleByChannel(Hit, AtCm + FVector(0.0, 0.0, 300.0), End, AIDABuildGunChannel, Params) &&
-		!World->LineTraceSingleByChannel(Hit, AtCm + FVector(0.0, 0.0, 5000.0), End, AIDABuildGunChannel, Params))
+	if (!TraceGroundIgnoringConveyors(World, AtCm + FVector(0.0, 0.0, 300.0), End, Params, Hit) &&
+		!TraceGroundIgnoringConveyors(World, AtCm + FVector(0.0, 0.0, 5000.0), End, Params, Hit))
 	{
 		return false;
 	}
@@ -1483,6 +1511,12 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 		FromNormal = FromConn->GetConnectorNormal();
 		ToNormal = ToConn->GetConnectorNormal();
 	}
+
+	// Flushed breadcrumb: this function drives engine hologram code with synthetic input — if it
+	// ever hangs the game, the log must show which run and endpoints were in flight.
+	UE_LOG(LogAIDA, Log, TEXT("[actions][mf] run %s(%s) -> %s(%s)"),
+		*GetNameSafe(FromActor), *FromLoc.ToCompactString(), *GetNameSafe(ToActor), *ToLoc.ToCompactString());
+	GLog->Flush();
 
 	// Drive the spline hologram through the build gun's own two-step flow: place + snap the start,
 	// advance the build step, place + snap the end. BOTH snaps are load-bearing — an unsnapped end

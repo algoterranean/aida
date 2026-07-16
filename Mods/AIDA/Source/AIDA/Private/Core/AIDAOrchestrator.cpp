@@ -1290,6 +1290,14 @@ void UAIDAOrchestrator::RegisterActionTools()
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
 		{
+			// Flushed stage markers: a hang inside this call must leave its last stage in the LOG
+			// FILE, not a buffer (live-verify: the game froze during a propose with an empty log tail).
+			const auto Stage = [](const FString& What)
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[actions][mf] %s"), *What);
+				GLog->Flush();
+			};
+
 			SweepProposals();
 
 			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
@@ -1301,6 +1309,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
+			Stage(FString::Printf(TEXT("parsed kind=%s direction=%s transport=%s machines=%s"),
+				Spec.bPipe ? TEXT("pipe") : TEXT("belt"), Spec.bOutput ? TEXT("out") : TEXT("in"),
+				*Spec.Transport, *Spec.Machines.Buildable));
 
 			// Transport (belt/pipe) and attachment (splitter/merger/junction) both resolve like any
 			// buildable — unlocked recipes only, suggestions on a miss.
@@ -1359,11 +1370,14 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 			}
 
+			Stage(FString::Printf(TEXT("recipes+center resolved (attachment=%s center=%.0f,%.0f) — resolving ports"),
+				*AttachmentName, Spec.Machines.CenterM.X, Spec.Machines.CenterM.Y));
 			TArray<FAIDAManifoldPort> Ports;
 			int32 SkippedConnected = 0;
 			FString MachineName;
 			FAIDAActionSeam::ResolveMachinePorts(this, Spec.Machines, Spec.bPipe, Spec.bOutput, Spec.PortIndex,
 				Ports, SkippedConnected, MachineName);
+			Stage(FString::Printf(TEXT("ports resolved: %d (skipped-connected %d) — planning"), Ports.Num(), SkippedConnected));
 			if (Ports.Num() == 0)
 			{
 				const FString Msg = SkippedConnected > 0
@@ -1398,6 +1412,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 				SortedPorts.Add(Ports[PortIdx]);
 			}
 
+			Stage(FString::Printf(TEXT("planned %d attachment(s) yaw=%d axis=%s — probing ground"),
+				Plan.Attachments.Num(), Plan.YawDeg, *Plan.RowAxis.ToCompactString()));
+
 			// Attachments stand on the floor under each trunk point; belts auto-route the height.
 			for (FTransform& Placement : Plan.Attachments)
 			{
@@ -1409,6 +1426,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 					Placement.SetLocation(Location);
 				}
 			}
+			Stage(TEXT("ground probed — dry-running attachments"));
 
 			FAIDADryRunResult DryRun;
 			if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun))
@@ -1431,6 +1449,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
 
+			Stage(TEXT("dry-run done — storing + publishing"));
 			const int32 RunCount = 2 * SortedPorts.Num() - 1;
 			FAIDAProposal Proposal;
 			Proposal.Id = FGuid::NewGuid();
@@ -1465,6 +1484,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			PublishProposal(Proposal.Id);
 			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — attachments cost %s; runs charged as built. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
+			Stage(TEXT("published — done"));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
 		}
