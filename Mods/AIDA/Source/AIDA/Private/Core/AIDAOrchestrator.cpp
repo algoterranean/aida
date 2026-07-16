@@ -8,6 +8,7 @@
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDAPromptPack.h"
 #include "Tools/AIDARecipeTools.h"
+#include "Recipes/AIDAFactoryPlanner.h"
 #include "Tools/AIDANotesTools.h"
 #include "Tools/AIDASnapshotTools.h"
 #include "Tools/AIDAToolJson.h"
@@ -93,6 +94,9 @@ namespace
 		"and which building makes it. Use for 'how is X made / what does X need', not live factory data.\n"
 		"- lookup_building(name?): static building reference — a production building's power draw (and, for "
 		"generators, power output).\n"
+		"- plan_factory(item, rate_per_min): computed production plan — machines per step, exact clocks, "
+		"belt/pipe mark, power, raw inputs. ALWAYS use this instead of doing recipe arithmetic yourself "
+		"when the player asks what it takes to make N/min of something.\n"
 		"- tag_node(resource, purity?, label?): drop a labeled marker on the map at the nearest untapped "
 		"node of a resource to the player. This WRITES a shared map marker — only use it when the player "
 		"asks you to mark/tag/find-and-mark a node.\n"
@@ -814,6 +818,27 @@ void UAIDAOrchestrator::RegisterTools()
 			UWorld* World = GetWorld();
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			return FAIDAToolResult::Ok(AIDARecipeTools::BuildBuildingJson(RecipeCatalog.GetBuildings(World, Now), Name));
+		}
+	});
+
+	// P7 Slice 5 (math half): deterministic production planner over the unlocked recipe catalog.
+	Tools.Register({
+		TEXT("plan_factory"),
+		TEXT("Plan production of an item at a target rate: per-step machine counts, exact clocks, belt/pipe mark per edge, power, and raw-resource needs, from the unlocked recipes. Use for 'how many machines/what do I need for N per minute of X' — the numbers are computed, not estimated. Then relay the plan; building it is a separate propose_build step."),
+		TEXT(R"({"type":"object","properties":{"item":{"type":"string","description":"Item to produce (e.g. \"Heavy Modular Frame\")."},"rate_per_min":{"type":"number","description":"Target output rate in items per minute (fluids: m3 per minute)."}},"required":["item","rate_per_min"]})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			FString Item;
+			Args->TryGetStringField(TEXT("item"), Item);
+			double Rate = 0.0;
+			Args->TryGetNumberField(TEXT("rate_per_min"), Rate);
+
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactoryPlan Plan = FAIDAFactoryPlanner::Plan(Item, Rate,
+				RecipeCatalog.GetRecipes(World, Now), RecipeCatalog.GetBuildings(World, Now));
+			return FAIDAToolResult::Ok(FAIDAFactoryPlanner::BuildPlanJson(Plan));
 		}
 	});
 

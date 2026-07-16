@@ -21,3 +21,12 @@ TSharedRef<FJsonValue> AIDANumber(double Value)
 	if (Text.EndsWith(TEXT(".0"))) { Text.LeftChopInline(2); } // whole number -> no trailing ".0"
 	return MakeShared<FJsonValueNumberString>(Text);
 }
+
+TSharedRef<FJsonValue> AIDANumber2(double Value)
+{
+	const double Rounded = FMath::RoundToDouble(Value * 100.0) / 100.0;
+	FString Text = FString::Printf(TEXT("%.2f"), Rounded);
+	if (Text.EndsWith(TEXT("0"))) { Text.LeftChopInline(1); }
+	if (Text.EndsWith(TEXT(".0"))) { Text.LeftChopInline(2); }
+	return MakeShared<FJsonValueNumberString>(Text);
+}

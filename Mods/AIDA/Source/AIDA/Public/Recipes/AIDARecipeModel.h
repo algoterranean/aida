@@ -14,6 +14,7 @@ struct FAIDAItemAmount
 {
 	FString Item;
 	double Amount = 0.0;
+	bool bFluid = false;   // liquid/gas: moves by pipe, amounts in m³
 };
 
 /** A crafting recipe: what it consumes/produces, how long a craft takes, and which buildings run it. */

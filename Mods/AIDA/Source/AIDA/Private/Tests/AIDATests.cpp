@@ -16,6 +16,7 @@
 #include "Tools/AIDAFactoryTools.h"
 #include "Tools/AIDAMapTools.h"
 #include "Tools/AIDARecipeTools.h"
+#include "Recipes/AIDAFactoryPlanner.h"
 #include "Tools/AIDAPromptPack.h"
 #include "Memory/AIDASidecarStore.h"
 #include "Tools/AIDANotesTools.h"
@@ -970,6 +971,135 @@ bool FAIDAFactoryBottleneckTest::RunTest(const FString&)
 		const FAIDABottleneckResult R = FAIDAFactoryAggregator::FindBottleneck(Snap, TEXT("IronIngot"));
 		TestTrue(TEXT("power-limited"), R.Kind == EAIDABottleneck::Power);
 		TestEqual(TEXT("overloaded circuit id"), R.LimitingDetail, FString(TEXT("1")));
+	}
+	return true;
+}
+
+namespace
+{
+	FAIDARecipeInfo AIDAMakeTestRecipe(const FString& Name, double Duration, const FString& Building,
+		std::initializer_list<FAIDAItemAmount> Ins, std::initializer_list<FAIDAItemAmount> Outs)
+	{
+		FAIDARecipeInfo R;
+		R.RecipeName = Name;
+		R.DurationSeconds = Duration;
+		R.ProducedIn = { Building };
+		R.Ingredients = Ins;
+		R.Products = Outs;
+		return R;
+	}
+
+	/** Screw chain: Ore -> Ingot (Smelter) -> Rod (Constructor) -> Screw ×4 (Constructor), plus belts. */
+	void AIDAMakeTestCatalog(TArray<FAIDARecipeInfo>& Recipes, TArray<FAIDABuildingInfo>& Buildings)
+	{
+		Recipes = {
+			AIDAMakeTestRecipe(TEXT("Iron Ingot"), 2.0, TEXT("Smelter"),
+				{ { TEXT("Iron Ore"), 1.0 } }, { { TEXT("Iron Ingot"), 1.0 } }),
+			AIDAMakeTestRecipe(TEXT("Iron Rod"), 4.0, TEXT("Constructor"),
+				{ { TEXT("Iron Ingot"), 1.0 } }, { { TEXT("Iron Rod"), 1.0 } }),
+			AIDAMakeTestRecipe(TEXT("Screw"), 6.0, TEXT("Constructor"),
+				{ { TEXT("Iron Rod"), 1.0 } }, { { TEXT("Screw"), 4.0 } }),
+			AIDAMakeTestRecipe(TEXT("Alternate: Cast Screw"), 24.0, TEXT("Constructor"),
+				{ { TEXT("Iron Ingot"), 5.0 } }, { { TEXT("Screw"), 20.0 } }),
+		};
+
+		FAIDABuildingInfo Smelter; Smelter.Name = TEXT("Smelter");
+		Smelter.PowerConsumptionMW = 4.0; Smelter.PowerExponent = 1.321928;
+		Smelter.FootprintXM = 6.0; Smelter.FootprintYM = 9.0;
+		FAIDABuildingInfo Ctor; Ctor.Name = TEXT("Constructor");
+		Ctor.PowerConsumptionMW = 4.0; Ctor.PowerExponent = 1.321928;
+		Ctor.FootprintXM = 8.0; Ctor.FootprintYM = 10.0;
+		FAIDABuildingInfo Mk1; Mk1.Name = TEXT("Conveyor Belt Mk.1"); Mk1.BeltItemsPerMin = 60.0;
+		FAIDABuildingInfo Mk3; Mk3.Name = TEXT("Conveyor Belt Mk.3"); Mk3.BeltItemsPerMin = 270.0;
+		FAIDABuildingInfo Pipe; Pipe.Name = TEXT("Pipeline"); Pipe.PipeM3PerMin = 300.0;
+		Buildings = { Smelter, Ctor, Mk1, Mk3, Pipe };
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryPlannerTest, "AIDA.Planner.PlanFactory",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryPlannerTest::RunTest(const FString&)
+{
+	TArray<FAIDARecipeInfo> Recipes;
+	TArray<FAIDABuildingInfo> Buildings;
+	AIDAMakeTestCatalog(Recipes, Buildings);
+
+	// 240 screws/min: 6 Screw constructors @100% (40/min each), 60 rods -> 4 @100%, 60 ingots -> 2 @100%.
+	{
+		const FAIDAFactoryPlan P = FAIDAFactoryPlanner::Plan(TEXT("Screw"), 240.0, Recipes, Buildings);
+		TestTrue(TEXT("no error"), P.Error.IsEmpty());
+		TestEqual(TEXT("three steps"), P.Steps.Num(), 3);
+		TestEqual(TEXT("twelve machines total"), P.TotalMachines, 12);
+		AIDA_TEST_NEAR("power at 100% is 12 x 4 MW", P.TotalPowerMW, 48.0);
+		if (P.Steps.Num() == 3)
+		{
+			TestEqual(TEXT("target step first"), P.Steps[0].Item, FString(TEXT("Screw")));
+			TestEqual(TEXT("screw machines"), P.Steps[0].Machines, 6);
+			AIDA_TEST_NEAR("screw clock 100%", P.Steps[0].Clock, 1.0);
+			TestEqual(TEXT("standard recipe chosen"), P.Steps[0].Recipe, FString(TEXT("Screw")));
+			TestEqual(TEXT("alternate listed"), P.Steps[0].AlternateRecipes.Num(), 1);
+			TestEqual(TEXT("screws ride a Mk.3"), P.Steps[0].Transport, FString(TEXT("Conveyor Belt Mk.3")));
+			TestEqual(TEXT("rod step"), P.Steps[1].Item, FString(TEXT("Iron Rod")));
+			TestEqual(TEXT("rod machines"), P.Steps[1].Machines, 4);
+			TestEqual(TEXT("rods fit a Mk.1"), P.Steps[1].Transport, FString(TEXT("Conveyor Belt Mk.1")));
+			TestEqual(TEXT("ingot machines"), P.Steps[2].Machines, 2);
+		}
+		TestEqual(TEXT("one raw input"), P.RawInputs.Num(), 1);
+		if (P.RawInputs.Num() == 1)
+		{
+			TestEqual(TEXT("raw is ore"), P.RawInputs[0].Item, FString(TEXT("Iron Ore")));
+			AIDA_TEST_NEAR("ore rate", P.RawInputs[0].RatePerMin, 60.0);
+		}
+
+		const TSharedPtr<FJsonObject> J = AIDAParseTestJson(FAIDAFactoryPlanner::BuildPlanJson(P));
+		if (TestNotNull(TEXT("plan json parses"), J.Get()))
+		{
+			TestEqual(TEXT("json machines"), J->GetIntegerField(TEXT("totalMachines")), 12);
+			const TArray<TSharedPtr<FJsonValue>>* Steps = nullptr;
+			TestTrue(TEXT("json steps"), J->TryGetArrayField(TEXT("steps"), Steps) && Steps && Steps->Num() == 3);
+		}
+	}
+
+	// Non-round rate: 250 screws -> 7 machines, clock 250/280, power scales sub-linearly.
+	{
+		const FAIDAFactoryPlan P = FAIDAFactoryPlanner::Plan(TEXT("Screw"), 250.0, Recipes, Buildings);
+		if (TestTrue(TEXT("plans"), P.Error.IsEmpty() && P.Steps.Num() == 3))
+		{
+			TestEqual(TEXT("seven screw machines"), P.Steps[0].Machines, 7);
+			AIDA_TEST_NEAR("exact clock", P.Steps[0].Clock, 250.0 / 280.0);
+			const double Expected = 7.0 * 4.0 * FMath::Pow(250.0 / 280.0, 1.321928);
+			TestTrue(TEXT("clock^exponent power"), FMath::IsNearlyEqual(P.Steps[0].PowerMW, Expected, 1e-6));
+		}
+	}
+
+	// Fluids ride pipes; fluid raws flagged. One-recipe catalog: Water + Ore -> Slurry (fluid out).
+	{
+		TArray<FAIDARecipeInfo> FluidRecipes = {
+			AIDAMakeTestRecipe(TEXT("Slurry"), 3.0, TEXT("Refinery"),
+				{ { TEXT("Ore"), 2.0 }, { TEXT("Water"), 2.5, true } }, { { TEXT("Slurry"), 3.0, true } }),
+		};
+		const FAIDAFactoryPlan P = FAIDAFactoryPlanner::Plan(TEXT("Slurry"), 120.0, FluidRecipes, Buildings);
+		if (TestTrue(TEXT("fluid plan works"), P.Error.IsEmpty() && P.Steps.Num() == 1))
+		{
+			TestEqual(TEXT("slurry rides a pipeline"), P.Steps[0].Transport, FString(TEXT("Pipeline")));
+			const FAIDAPlanResource* Water = P.RawInputs.FindByPredicate(
+				[](const FAIDAPlanResource& R) { return R.Item == TEXT("Water"); });
+			TestTrue(TEXT("water raw is fluid"), Water && Water->bFluid);
+			AIDA_TEST_NEAR("water rate", Water ? Water->RatePerMin : -1.0, 100.0);
+		}
+	}
+
+	// Unknown item -> error; recipe cycle -> truncation note, no hang.
+	{
+		const FAIDAFactoryPlan P = FAIDAFactoryPlanner::Plan(TEXT("Unobtainium"), 10.0, Recipes, Buildings);
+		TestTrue(TEXT("unknown item errors"), !P.Error.IsEmpty());
+
+		TArray<FAIDARecipeInfo> Cyclic = {
+			AIDAMakeTestRecipe(TEXT("A"), 1.0, TEXT("Constructor"), { { TEXT("B"), 1.0 } }, { { TEXT("A"), 1.0 } }),
+			AIDAMakeTestRecipe(TEXT("B"), 1.0, TEXT("Constructor"), { { TEXT("A"), 1.0 } }, { { TEXT("B"), 1.0 } }),
+		};
+		const FAIDAFactoryPlan C = FAIDAFactoryPlanner::Plan(TEXT("A"), 10.0, Cyclic, Buildings);
+		TestTrue(TEXT("cycle terminates with a note"), C.Error.IsEmpty() && C.Notes.Num() > 0);
 	}
 	return true;
 }

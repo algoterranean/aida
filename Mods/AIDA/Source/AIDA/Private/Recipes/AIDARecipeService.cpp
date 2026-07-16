@@ -37,6 +37,14 @@ namespace
 		return Amount;
 	}
 
+	/** Liquids and gases move by pipe; the planner picks transport per edge off this flag. */
+	bool IsFluid(TSubclassOf<UFGItemDescriptor> ItemClass)
+	{
+		if (!ItemClass) { return false; }
+		const EResourceForm Form = UFGItemDescriptor::GetForm(ItemClass);
+		return Form == EResourceForm::RF_LIQUID || Form == EResourceForm::RF_GAS;
+	}
+
 	bool IsBuildingDescriptor(TSubclassOf<UFGItemDescriptor> ItemClass)
 	{
 		return ItemClass && ItemClass->IsChildOf(UFGBuildingDescriptor::StaticClass());
@@ -200,11 +208,11 @@ void FAIDARecipeCatalog::ExtractInto(UObject* WorldContext, TArray<FAIDARecipeIn
 
 		for (const FItemAmount& Product : Products)
 		{
-			if (Product.ItemClass) { Info.Products.Add({ ItemName(Product.ItemClass), CraftAmount(Product) }); }
+			if (Product.ItemClass) { Info.Products.Add({ ItemName(Product.ItemClass), CraftAmount(Product), IsFluid(Product.ItemClass) }); }
 		}
 		for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(WorldContext, Recipe))
 		{
-			if (Ingredient.ItemClass) { Info.Ingredients.Add({ ItemName(Ingredient.ItemClass), CraftAmount(Ingredient) }); }
+			if (Ingredient.ItemClass) { Info.Ingredients.Add({ ItemName(Ingredient.ItemClass), CraftAmount(Ingredient), IsFluid(Ingredient.ItemClass) }); }
 		}
 		for (const TSubclassOf<UObject>& Producer : UFGRecipe::GetProducedIn(Recipe))
 		{

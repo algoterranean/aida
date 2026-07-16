@@ -18,3 +18,6 @@ FString AIDAToCompactJson(const TSharedRef<FJsonObject>& Object);
  * form; keeps tool JSON compact and readable. Assign with FJsonObject::SetField.
  */
 TSharedRef<FJsonValue> AIDANumber(double Value);
+
+/** Same as AIDANumber but two decimal places — for values where 0.1 is too coarse (clock percents). */
+TSharedRef<FJsonValue> AIDANumber2(double Value);
