@@ -1064,6 +1064,100 @@ bool FAIDALogisticsGraphTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryDiagnosticsTest, "AIDA.Factory.Diagnostics",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryDiagnosticsTest::RunTest(const FString&)
+{
+	FAIDAFactorySnapshot Snap;
+
+	// 1: healthy constructor (all ports connected). 2: splitter feeding nothing. 3: idle assembler
+	// with an open input. 4: pipe junction with one connection. 5: splitter fully wired.
+	FAIDAMachine Healthy = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Constructor"));
+	Healthy.Outputs = { { TEXT("Iron Plate"), 120.0 } };
+	Healthy.InPortsTotal = 1; Healthy.InPortsConnected = 1;
+	Healthy.OutPortsTotal = 1; Healthy.OutPortsConnected = 1;
+	Snap.Machines.Add(Healthy);
+
+	FAIDAMachine DeadSplitter = AIDAMakeTestMachine(2, FVector(1000, 0, 0), TEXT("Splitter"));
+	DeadSplitter.bLogisticsOnly = true;
+	DeadSplitter.InPortsTotal = 1; DeadSplitter.InPortsConnected = 1;
+	DeadSplitter.OutPortsTotal = 3; DeadSplitter.OutPortsConnected = 0;
+	Snap.Machines.Add(DeadSplitter);
+
+	FAIDAMachine IdleAssembler = AIDAMakeTestMachine(3, FVector(2000, 0, 0), TEXT("Assembler"));
+	IdleAssembler.bProducing = false;
+	IdleAssembler.InPortsTotal = 2; IdleAssembler.InPortsConnected = 1;
+	IdleAssembler.OutPortsTotal = 1; IdleAssembler.OutPortsConnected = 1;
+	Snap.Machines.Add(IdleAssembler);
+
+	FAIDAMachine LonelyJunction = AIDAMakeTestMachine(4, FVector(3000, 0, 0), TEXT("PipelineJunction"));
+	LonelyJunction.bLogisticsOnly = true;
+	LonelyJunction.AnyPortsTotal = 4; LonelyJunction.AnyPortsConnected = 1;
+	Snap.Machines.Add(LonelyJunction);
+
+	FAIDAMachine WiredSplitter = AIDAMakeTestMachine(5, FVector(4000, 0, 0), TEXT("Splitter"));
+	WiredSplitter.bLogisticsOnly = true;
+	WiredSplitter.InPortsTotal = 1; WiredSplitter.InPortsConnected = 1;
+	WiredSplitter.OutPortsTotal = 3; WiredSplitter.OutPortsConnected = 2; // one spare out is normal
+	Snap.Machines.Add(WiredSplitter);
+
+	Snap.Edges.Add({ 1, 0, TEXT("Iron Plate"), 120.0 }); // belt from the constructor leads nowhere
+
+	const FAIDADisconnectedReport R = FAIDAFactoryAggregator::FindDisconnected(Snap);
+	TestEqual(TEXT("four findings"), R.Findings.Num(), 4);
+	TestEqual(TEXT("three logistics nodes checked"), R.NodesChecked, 3);
+	TestEqual(TEXT("two machines checked"), R.MachinesChecked, 2);
+	int32 DanglingNodes = 0, DanglingEdges = 0, OpenPorts = 0;
+	for (const FAIDADisconnectedFinding& F : R.Findings)
+	{
+		switch (F.Kind)
+		{
+		case EAIDADisconnectKind::DanglingNode: ++DanglingNodes; break;
+		case EAIDADisconnectKind::DanglingEdge: ++DanglingEdges; break;
+		case EAIDADisconnectKind::OpenPorts: ++OpenPorts; break;
+		}
+	}
+	TestEqual(TEXT("dead splitter + lonely junction"), DanglingNodes, 2);
+	TestEqual(TEXT("one dangling belt"), DanglingEdges, 1);
+	TestEqual(TEXT("idle assembler's open input"), OpenPorts, 1);
+	TestTrue(TEXT("definite breaks sort before advisories"),
+		R.Findings.Num() == 4 && R.Findings[3].Kind == EAIDADisconnectKind::OpenPorts);
+	const TSharedPtr<FJsonObject> J = AIDAParseTestJson(AIDAFactoryTools::BuildDisconnectedJson(R));
+	TestTrue(TEXT("disconnected json parses"), J.IsValid() && J->GetIntegerField(TEXT("findings")) == 4);
+
+	// Belt mismatch: 10 → 11 @270, 11 → 12 @60 (the choke), 12 → 13 @270; plus producer 14 making
+	// 120/min onto a 60 belt to 15.
+	{
+		FAIDAFactorySnapshot Mismatch;
+		for (int32 Id = 10; Id <= 15; ++Id)
+		{
+			FAIDAMachine Node = AIDAMakeTestMachine(Id, FVector(Id * 100, 0, 0),
+				(Id == 11 || Id == 12) ? TEXT("Splitter") : TEXT("Machine"));
+			Node.bLogisticsOnly = (Id == 11 || Id == 12);
+			Mismatch.Machines.Add(Node);
+		}
+		Mismatch.Machines[4].Outputs = { { TEXT("Screw"), 120.0 } }; // id 14
+		Mismatch.Edges.Add({ 10, 11, TEXT(""), 270.0 });
+		Mismatch.Edges.Add({ 11, 12, TEXT(""), 60.0 });
+		Mismatch.Edges.Add({ 12, 13, TEXT(""), 270.0 });
+		Mismatch.Edges.Add({ 14, 15, TEXT(""), 60.0 });
+
+		const TArray<FAIDABeltMismatch> Slow = FAIDAFactoryAggregator::FindBeltMismatch(Mismatch);
+		TestEqual(TEXT("two mismatches"), Slow.Num(), 2);
+		if (Slow.Num() == 2)
+		{
+			TestEqual(TEXT("sandwiched slow belt first (bigger choke)"), Slow[0].FromNode, 11);
+			AIDA_TEST_NEAR("edge rate", Slow[0].EdgePerMin, 60.0);
+			AIDA_TEST_NEAR("upstream rate", Slow[0].UpstreamPerMin, 270.0);
+			TestEqual(TEXT("undersized producer belt second"), Slow[1].FromNode, 14);
+			AIDA_TEST_NEAR("producer rate", Slow[1].ProducerPerMin, 120.0);
+		}
+		const TSharedPtr<FJsonObject> MJ = AIDAParseTestJson(AIDAFactoryTools::BuildBeltMismatchJson(Slow));
+		TestTrue(TEXT("mismatch json parses"), MJ.IsValid() && MJ->GetIntegerField(TEXT("mismatches")) == 2);
+	}
+	return true;
+}
+
 namespace
 {
 	FAIDARecipeInfo AIDAMakeTestRecipe(const FString& Name, double Duration, const FString& Building,

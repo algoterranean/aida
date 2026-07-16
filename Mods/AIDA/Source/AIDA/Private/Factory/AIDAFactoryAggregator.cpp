@@ -363,6 +363,188 @@ FAIDABottleneckResult FAIDAFactoryAggregator::FindBottleneck(const FAIDAFactoryS
 	return Result;
 }
 
+namespace
+{
+	/** id -> (class, location) across every node kind sharing the id space (machines + containers). */
+	struct FAIDANodeDirectory
+	{
+		TMap<int32, TPair<FString, FVector>> Entries;
+
+		explicit FAIDANodeDirectory(const FAIDAFactorySnapshot& Snapshot)
+		{
+			for (const FAIDAMachine& M : Snapshot.Machines) { Entries.Add(M.Id, { M.BuildingClass, M.Location }); }
+			for (const FAIDAContainerInfo& C : Snapshot.Containers) { Entries.Add(C.Id, { C.BuildingClass, C.Location }); }
+		}
+
+		FString ClassOf(int32 Id) const { const auto* E = Entries.Find(Id); return E ? E->Key : FString(); }
+		FVector LocationOf(int32 Id) const { const auto* E = Entries.Find(Id); return E ? E->Value : FVector::ZeroVector; }
+	};
+}
+
+FAIDADisconnectedReport FAIDAFactoryAggregator::FindDisconnected(const FAIDAFactorySnapshot& Snapshot)
+{
+	FAIDADisconnectedReport Report;
+	const FAIDANodeDirectory Directory(Snapshot);
+
+	for (const FAIDAMachine& M : Snapshot.Machines)
+	{
+		if (M.bLogisticsOnly)
+		{
+			++Report.NodesChecked;
+			// A splitter/merger with one whole side unconnected does nothing; a pipe attachment
+			// (all PCT_ANY ports) needs at least two connections to pass anything through.
+			const bool bNoInputs = M.InPortsTotal > 0 && M.InPortsConnected == 0;
+			const bool bNoOutputs = M.OutPortsTotal > 0 && M.OutPortsConnected == 0;
+			const bool bPipeIsolated = M.InPortsTotal == 0 && M.OutPortsTotal == 0
+				&& M.AnyPortsTotal > 0 && M.AnyPortsConnected <= 1;
+			if (!bNoInputs && !bNoOutputs && !bPipeIsolated) { continue; }
+
+			FAIDADisconnectedFinding F;
+			F.Kind = EAIDADisconnectKind::DanglingNode;
+			F.NodeId = M.Id;
+			F.BuildingClass = M.BuildingClass;
+			F.Location = M.Location;
+			F.InOpen = M.InPortsTotal - M.InPortsConnected;
+			F.OutOpen = M.OutPortsTotal - M.OutPortsConnected;
+			F.AnyOpen = M.AnyPortsTotal - M.AnyPortsConnected;
+			if (bNoInputs && bNoOutputs) { F.Detail = TEXT("nothing connected on either side"); }
+			else if (bNoInputs) { F.Detail = TEXT("nothing feeds it"); }
+			else if (bNoOutputs) { F.Detail = TEXT("it feeds nothing — items stop here"); }
+			else { F.Detail = FString::Printf(TEXT("only %d of %d pipe ports connected"), M.AnyPortsConnected, M.AnyPortsTotal); }
+			Report.Findings.Add(MoveTemp(F));
+			continue;
+		}
+
+		++Report.MachinesChecked;
+		const int32 InOpen = M.InPortsTotal - M.InPortsConnected;
+		const int32 OutOpen = M.OutPortsTotal - M.OutPortsConnected;
+		const int32 AnyOpen = M.AnyPortsTotal - M.AnyPortsConnected;
+		if (InOpen <= 0 && OutOpen <= 0 && AnyOpen <= 0) { continue; }
+
+		FAIDADisconnectedFinding F;
+		F.Kind = EAIDADisconnectKind::OpenPorts;
+		F.NodeId = M.Id;
+		F.BuildingClass = M.BuildingClass;
+		F.Location = M.Location;
+		F.bProducing = M.bProducing;
+		F.InOpen = FMath::Max(0, InOpen);
+		F.OutOpen = FMath::Max(0, OutOpen);
+		F.AnyOpen = FMath::Max(0, AnyOpen);
+		F.Detail = FString::Printf(TEXT("%d unconnected port(s)%s"), F.InOpen + F.OutOpen + F.AnyOpen,
+			M.bProducing ? TEXT("") : TEXT(" and it is not producing"));
+		Report.Findings.Add(MoveTemp(F));
+	}
+
+	for (const FAIDAConveyorEdge& E : Snapshot.Edges)
+	{
+		++Report.EdgesChecked;
+		if (E.FromMachine != 0 && E.ToMachine != 0) { continue; }
+
+		FAIDADisconnectedFinding F;
+		F.Kind = EAIDADisconnectKind::DanglingEdge;
+		F.NodeId = E.FromMachine != 0 ? E.FromMachine : E.ToMachine;
+		F.BuildingClass = Directory.ClassOf(F.NodeId);
+		F.Location = Directory.LocationOf(F.NodeId);
+		F.bPipe = E.bPipe;
+		F.PerMinute = E.PerMinute;
+		F.Detail = E.ToMachine == 0
+			? FString::Printf(TEXT("a %s from this %s leads nowhere"), E.bPipe ? TEXT("pipe") : TEXT("belt"), *F.BuildingClass)
+			: FString::Printf(TEXT("a %s into this %s comes from nothing"), E.bPipe ? TEXT("pipe") : TEXT("belt"), *F.BuildingClass);
+		Report.Findings.Add(MoveTemp(F));
+	}
+
+	// Definite breaks first (dangling nodes/runs), then open-port advisories, idle machines up front.
+	Report.Findings.Sort([](const FAIDADisconnectedFinding& A, const FAIDADisconnectedFinding& B)
+	{
+		const auto Rank = [](const FAIDADisconnectedFinding& F)
+		{
+			return F.Kind == EAIDADisconnectKind::OpenPorts ? 1 : 0;
+		};
+		if (Rank(A) != Rank(B)) { return Rank(A) < Rank(B); }
+		if (A.bProducing != B.bProducing) { return !A.bProducing; }
+		const int32 OpenA = A.InOpen + A.OutOpen + A.AnyOpen, OpenB = B.InOpen + B.OutOpen + B.AnyOpen;
+		if (OpenA != OpenB) { return OpenA > OpenB; }
+		return A.NodeId < B.NodeId;
+	});
+	return Report;
+}
+
+TArray<FAIDABeltMismatch> FAIDAFactoryAggregator::FindBeltMismatch(const FAIDAFactorySnapshot& Snapshot,
+	const FAIDAAggregatorConfig& Config)
+{
+	const FAIDANodeDirectory Directory(Snapshot);
+	TMap<int32, const FAIDAMachine*> MachineById;
+	for (const FAIDAMachine& M : Snapshot.Machines) { MachineById.Add(M.Id, &M); }
+
+	// Fastest link into / out of each node, belts and pipes tracked apart (they never compare).
+	const auto EdgeKey = [](int32 Node, bool bPipe) { return (static_cast<int64>(Node) << 1) | (bPipe ? 1 : 0); };
+	TMap<int64, double> MaxIntoNode, MaxOutOfNode;
+	for (const FAIDAConveyorEdge& E : Snapshot.Edges)
+	{
+		if (E.ToMachine != 0)
+		{
+			double& Max = MaxIntoNode.FindOrAdd(EdgeKey(E.ToMachine, E.bPipe));
+			Max = FMath::Max(Max, E.PerMinute);
+		}
+		if (E.FromMachine != 0)
+		{
+			double& Max = MaxOutOfNode.FindOrAdd(EdgeKey(E.FromMachine, E.bPipe));
+			Max = FMath::Max(Max, E.PerMinute);
+		}
+	}
+
+	TArray<FAIDABeltMismatch> Mismatches;
+	for (const FAIDAConveyorEdge& E : Snapshot.Edges)
+	{
+		if (E.FromMachine == 0 || E.ToMachine == 0) { continue; } // dangling is find_disconnected's beat
+
+		const double Upstream = MaxIntoNode.FindRef(EdgeKey(E.FromMachine, E.bPipe));
+		const double Downstream = MaxOutOfNode.FindRef(EdgeKey(E.ToMachine, E.bPipe));
+
+		// A producer's single fastest output is what one belt must carry (sums would over-flag
+		// machines whose outputs leave through different ports).
+		double ProducerRate = 0.0;
+		if (const FAIDAMachine* const* Source = MachineById.Find(E.FromMachine))
+		{
+			if (!(*Source)->bLogisticsOnly)
+			{
+				for (const FAIDAItemRate& R : (*Source)->Outputs) { ProducerRate = FMath::Max(ProducerRate, R.PerMinute); }
+			}
+		}
+
+		const bool bSlowerThanNeighbors = Upstream > E.PerMinute + Config.RateTolerance
+			&& Downstream > E.PerMinute + Config.RateTolerance;
+		const bool bSlowerThanProducer = ProducerRate > E.PerMinute + Config.RateTolerance;
+		if (!bSlowerThanNeighbors && !bSlowerThanProducer) { continue; }
+
+		FAIDABeltMismatch M;
+		M.FromNode = E.FromMachine;
+		M.ToNode = E.ToMachine;
+		M.FromClass = Directory.ClassOf(E.FromMachine);
+		M.ToClass = Directory.ClassOf(E.ToMachine);
+		M.Location = (Directory.LocationOf(E.FromMachine) + Directory.LocationOf(E.ToMachine)) * 0.5;
+		M.EdgePerMin = E.PerMinute;
+		M.UpstreamPerMin = Upstream;
+		M.DownstreamPerMin = Downstream;
+		M.ProducerPerMin = ProducerRate;
+		M.bPipe = E.bPipe;
+		M.Detail = bSlowerThanNeighbors
+			? TEXT("slower than both its neighbors — it throttles the path")
+			: TEXT("slower than its producer's output rate");
+		Mismatches.Add(MoveTemp(M));
+	}
+
+	// Biggest choke first: how much faster the surrounding traffic is than this link.
+	Mismatches.Sort([](const FAIDABeltMismatch& A, const FAIDABeltMismatch& B)
+	{
+		const double LossA = FMath::Max3(A.UpstreamPerMin, A.DownstreamPerMin, A.ProducerPerMin) - A.EdgePerMin;
+		const double LossB = FMath::Max3(B.UpstreamPerMin, B.DownstreamPerMin, B.ProducerPerMin) - B.EdgePerMin;
+		if (LossA != LossB) { return LossA > LossB; }
+		return A.FromNode < B.FromNode;
+	});
+	return Mismatches;
+}
+
 FAIDAClockAdviceReport FAIDAFactoryAggregator::BuildClockAdvice(const TArray<FAIDAMachine>& Machines,
 	const FAIDAAggregatorConfig& Config)
 {

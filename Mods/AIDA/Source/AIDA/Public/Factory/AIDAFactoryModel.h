@@ -175,6 +175,53 @@ enum class EAIDABottleneck : uint8
 	OutputBackedUp // producers are idle though inputs and power are fine (output full / demand-limited)
 };
 
+/** What a find_disconnected finding points at (P7 Slice 1). */
+enum class EAIDADisconnectKind : uint8
+{
+	DanglingNode,   // splitter/merger/pipe attachment with nothing on one whole side
+	DanglingEdge,   // belt/pipe run whose far end attaches to nothing
+	OpenPorts       // machine with unconnected input/output ports
+};
+
+struct FAIDADisconnectedFinding
+{
+	EAIDADisconnectKind Kind = EAIDADisconnectKind::OpenPorts;
+	int32 NodeId = 0;                // the node itself, or a dangling edge's anchored end
+	FString BuildingClass;
+	FVector Location = FVector::ZeroVector;
+	bool bProducing = true;
+	int32 InOpen = 0;                // unconnected port counts (node/machine findings)
+	int32 OutOpen = 0;
+	int32 AnyOpen = 0;
+	bool bPipe = false;              // edge findings
+	double PerMinute = 0.0;          // edge findings: the dangling run's capacity
+	FString Detail;                  // one-line human hint
+};
+
+struct FAIDADisconnectedReport
+{
+	TArray<FAIDADisconnectedFinding> Findings; // definite problems first
+	int32 NodesChecked = 0;                    // logistics nodes examined
+	int32 MachinesChecked = 0;                 // producing machines examined
+	int32 EdgesChecked = 0;
+};
+
+/** One suspiciously slow link (P7 Slice 1): a belt/pipe slower than the traffic around it. */
+struct FAIDABeltMismatch
+{
+	int32 FromNode = 0;
+	int32 ToNode = 0;
+	FString FromClass;
+	FString ToClass;
+	FVector Location = FVector::ZeroVector; // midpoint of the endpoints we know
+	double EdgePerMin = 0.0;
+	double UpstreamPerMin = 0.0;            // fastest link into FromNode (0 = none)
+	double DownstreamPerMin = 0.0;          // fastest link out of ToNode (0 = none)
+	double ProducerPerMin = 0.0;            // source machine's total output rate (0 = n/a)
+	bool bPipe = false;
+	FString Detail;
+};
+
 /** One machine's underclock recommendation (P7 Slice 1): it idles enough that a lower clock saves power. */
 struct FAIDAClockAdvice
 {

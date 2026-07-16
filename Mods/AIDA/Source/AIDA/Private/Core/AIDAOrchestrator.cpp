@@ -87,6 +87,10 @@ namespace
 		"- find_bottleneck(item): why an item's production is limited (starved input, power, or backed up).\n"
 		"- get_clock_advice(): machines worth underclocking — current vs suggested clock and the MW each "
 		"change saves. Use for 'where am I wasting energy / what should I underclock'.\n"
+		"- find_disconnected(): logistics breaks — dangling splitters/mergers, belts/pipes ending in "
+		"nothing, machines with open ports. Use for 'is anything disconnected / nothing is arriving'.\n"
+		"- find_belt_mismatch(): slow belts/pipes sandwiched in faster paths or undersized for their "
+		"producer. Use for 'slow belts mixed in / throughput is mysteriously low'.\n"
 		"- get_container_contents(item?, radius_m?): storage containers and what they hold (per-item "
 		"counts, nearest first). Use for 'what's in these containers / where is my X stored'.\n"
 		"- get_resource_nodes(resource?, untapped_only?): map resource nodes by purity and occupancy.\n"
@@ -691,6 +695,35 @@ void UAIDAOrchestrator::RegisterTools()
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
 			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildBottleneckJson(FAIDAFactoryAggregator::FindBottleneck(Snapshot, Item)));
+		}
+	});
+
+	// P7 Slice 1: logistics diagnostics over the Slice 0 graph.
+	Tools.Register({
+		TEXT("find_disconnected"),
+		TEXT("Find logistics breaks: splitters/mergers with a whole side unconnected, belts/pipes whose far end attaches to nothing, and machines with open ports. Use for 'is anything disconnected / why is nothing arriving'. Locations are in metres."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildDisconnectedJson(FAIDAFactoryAggregator::FindDisconnected(Snapshot)));
+		}
+	});
+
+	Tools.Register({
+		TEXT("find_belt_mismatch"),
+		TEXT("Find slow links: belts/pipes slower than both their neighbors on a path (they throttle it) or slower than the machine feeding them. Use for 'slow belts mixed with fast belts / why is throughput low'. Biggest choke first."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildBeltMismatchJson(FAIDAFactoryAggregator::FindBeltMismatch(Snapshot)));
 		}
 	});
 

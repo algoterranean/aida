@@ -15,6 +15,8 @@ namespace
 	constexpr int32 MaxClockAdviceEntries = 20;
 	constexpr int32 MaxContainers = 25;
 	constexpr int32 MaxItemsPerContainer = 10;
+	constexpr int32 MaxDisconnectedFindings = 25;
+	constexpr int32 MaxBeltMismatches = 20;
 
 	/** Centroid humanized to whole metres (world units are cm), as [x, y] — Z dropped for the overview. */
 	TArray<TSharedPtr<FJsonValue>> CentroidMetres(const FVector& Centroid)
@@ -232,6 +234,71 @@ FString AIDAFactoryTools::BuildClockAdviceJson(const FAIDAClockAdviceReport& Rep
 		Root->SetNumberField(TEXT("stoppedMachines"), Report.StoppedMachines);
 		Root->SetStringField(TEXT("stoppedHint"), TEXT("machines at zero productivity are stopped, not underclock candidates — use find_bottleneck"));
 	}
+	return AIDAToCompactJson(Root);
+}
+
+FString AIDAFactoryTools::BuildDisconnectedJson(const FAIDADisconnectedReport& Report)
+{
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("findings"), Report.Findings.Num());
+	Root->SetNumberField(TEXT("nodesChecked"), Report.NodesChecked);
+	Root->SetNumberField(TEXT("machinesChecked"), Report.MachinesChecked);
+	Root->SetNumberField(TEXT("edgesChecked"), Report.EdgesChecked);
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	const int32 Shown = FMath::Min(Report.Findings.Num(), MaxDisconnectedFindings);
+	for (int32 i = 0; i < Shown; ++i)
+	{
+		const FAIDADisconnectedFinding& F = Report.Findings[i];
+		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		switch (F.Kind)
+		{
+		case EAIDADisconnectKind::DanglingNode: O->SetStringField(TEXT("kind"), TEXT("dangling_node")); break;
+		case EAIDADisconnectKind::DanglingEdge: O->SetStringField(TEXT("kind"), F.bPipe ? TEXT("dangling_pipe") : TEXT("dangling_belt")); break;
+		case EAIDADisconnectKind::OpenPorts:    O->SetStringField(TEXT("kind"), TEXT("open_ports")); break;
+		}
+		if (!F.BuildingClass.IsEmpty()) { O->SetStringField(TEXT("building"), F.BuildingClass); }
+		O->SetNumberField(TEXT("nodeId"), F.NodeId);
+		O->SetArrayField(TEXT("location_m"), CentroidMetres(F.Location));
+		O->SetStringField(TEXT("detail"), F.Detail);
+		if (F.Kind == EAIDADisconnectKind::OpenPorts)
+		{
+			O->SetBoolField(TEXT("producing"), F.bProducing);
+			if (F.InOpen > 0) { O->SetNumberField(TEXT("openInputs"), F.InOpen); }
+			if (F.OutOpen > 0) { O->SetNumberField(TEXT("openOutputs"), F.OutOpen); }
+			if (F.AnyOpen > 0) { O->SetNumberField(TEXT("openPipePorts"), F.AnyOpen); }
+		}
+		if (F.Kind == EAIDADisconnectKind::DanglingEdge) { O->SetField(TEXT("perMin"), AIDANumber(F.PerMinute)); }
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("findingList"), Arr);
+	if (Report.Findings.Num() > Shown) { Root->SetNumberField(TEXT("findingsOmitted"), Report.Findings.Num() - Shown); }
+	return AIDAToCompactJson(Root);
+}
+
+FString AIDAFactoryTools::BuildBeltMismatchJson(const TArray<FAIDABeltMismatch>& Mismatches)
+{
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("mismatches"), Mismatches.Num());
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	const int32 Shown = FMath::Min(Mismatches.Num(), MaxBeltMismatches);
+	for (int32 i = 0; i < Shown; ++i)
+	{
+		const FAIDABeltMismatch& M = Mismatches[i];
+		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("link"), FString::Printf(TEXT("%s -> %s"), *M.FromClass, *M.ToClass));
+		O->SetArrayField(TEXT("location_m"), CentroidMetres(M.Location));
+		O->SetBoolField(TEXT("pipe"), M.bPipe);
+		O->SetField(TEXT("perMin"), AIDANumber(M.EdgePerMin));
+		if (M.UpstreamPerMin > 0.0) { O->SetField(TEXT("upstreamPerMin"), AIDANumber(M.UpstreamPerMin)); }
+		if (M.DownstreamPerMin > 0.0) { O->SetField(TEXT("downstreamPerMin"), AIDANumber(M.DownstreamPerMin)); }
+		if (M.ProducerPerMin > 0.0) { O->SetField(TEXT("producerPerMin"), AIDANumber(M.ProducerPerMin)); }
+		O->SetStringField(TEXT("detail"), M.Detail);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("mismatchList"), Arr);
+	if (Mismatches.Num() > Shown) { Root->SetNumberField(TEXT("mismatchesOmitted"), Mismatches.Num() - Shown); }
 	return AIDAToCompactJson(Root);
 }
 

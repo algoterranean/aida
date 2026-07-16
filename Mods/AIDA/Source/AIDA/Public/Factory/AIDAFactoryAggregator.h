@@ -70,6 +70,21 @@ public:
 		const FAIDAAggregatorConfig& Config = FAIDAAggregatorConfig());
 
 	/**
+	 * find_disconnected (P7 Slice 1): logistics nodes with a whole side unconnected (a splitter feeding
+	 * nothing), belt/pipe runs whose far end dangles, and machines with open ports. Pure reads of the
+	 * port counts and edges Slice 0 extracts; definite problems sort before open-port advisories.
+	 */
+	static FAIDADisconnectedReport FindDisconnected(const FAIDAFactorySnapshot& Snapshot);
+
+	/**
+	 * find_belt_mismatch (P7 Slice 1): links slower than BOTH the fastest link into their source and
+	 * the fastest link out of their sink (a slow belt sandwiched in fast traffic), and links slower
+	 * than their source machine's total output rate (an undersized outfeed).
+	 */
+	static TArray<FAIDABeltMismatch> FindBeltMismatch(const FAIDAFactorySnapshot& Snapshot,
+		const FAIDAAggregatorConfig& Config = FAIDAAggregatorConfig());
+
+	/**
 	 * Underclock advisor (P7 Slice 1): power-drawing producers whose productivity shows they idle more
 	 * than the threshold get a suggested clock of Clock×Productivity (rounded UP to a whole percent, so
 	 * throughput is never under-provisioned) and an estimated MW saving via the clock^exponent power law.

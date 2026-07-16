@@ -29,6 +29,12 @@ namespace AIDAFactoryTools
 	/** get_clock_advice: underclock recommendations, biggest MW saving first, with the savable total. */
 	FString BuildClockAdviceJson(const FAIDAClockAdviceReport& Report);
 
+	/** find_disconnected: dangling nodes/runs first, then open-port machines, with checked totals. */
+	FString BuildDisconnectedJson(const FAIDADisconnectedReport& Report);
+
+	/** find_belt_mismatch: links slower than their surroundings, biggest choke first. */
+	FString BuildBeltMismatchJson(const TArray<FAIDABeltMismatch>& Mismatches);
+
 	/**
 	 * get_container_contents: storage containers with per-item totals. ItemFilter (substring, optional)
 	 * narrows to containers holding the item; RadiusMetres (>0, needs bHasLocation) narrows around the
