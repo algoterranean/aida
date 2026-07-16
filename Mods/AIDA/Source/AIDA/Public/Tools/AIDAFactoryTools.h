@@ -25,4 +25,15 @@ namespace AIDAFactoryTools
 
 	/** find_bottleneck: a status, a plain-language explanation, and the supporting numbers. */
 	FString BuildBottleneckJson(const FAIDABottleneckResult& Result);
+
+	/** get_clock_advice: underclock recommendations, biggest MW saving first, with the savable total. */
+	FString BuildClockAdviceJson(const FAIDAClockAdviceReport& Report);
+
+	/**
+	 * get_container_contents: storage containers with per-item totals. ItemFilter (substring, optional)
+	 * narrows to containers holding the item; RadiusMetres (>0, needs bHasLocation) narrows around the
+	 * player, and containers sort nearest-first when a location is known.
+	 */
+	FString BuildContainerContentsJson(const TArray<FAIDAContainerInfo>& Containers, const FString& ItemFilter,
+		const FVector& PlayerLocation, bool bHasLocation, double RadiusMetres);
 }

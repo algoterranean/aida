@@ -20,6 +20,7 @@
 #include "Subsystem/SubsystemActorManager.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "GameFramework/Pawn.h"
@@ -83,6 +84,10 @@ namespace
 		"- get_item_balance(item?): net production vs consumption per item; deficits first.\n"
 		"- inspect_cluster(id): one cluster's building census, net inputs/outputs, and efficiency.\n"
 		"- find_bottleneck(item): why an item's production is limited (starved input, power, or backed up).\n"
+		"- get_clock_advice(): machines worth underclocking — current vs suggested clock and the MW each "
+		"change saves. Use for 'where am I wasting energy / what should I underclock'.\n"
+		"- get_container_contents(item?, radius_m?): storage containers and what they hold (per-item "
+		"counts, nearest first). Use for 'what's in these containers / where is my X stored'.\n"
 		"- get_resource_nodes(resource?, untapped_only?): map resource nodes by purity and occupancy.\n"
 		"- lookup_recipe(item?): static recipe reference — inputs/outputs (amount + per-minute), craft time, "
 		"and which building makes it. Use for 'how is X made / what does X need', not live factory data.\n"
@@ -248,6 +253,11 @@ void UAIDAOrchestrator::Deinitialize()
 		IConsoleManager::Get().UnregisterConsoleObject(UndoCommand);
 		UndoCommand = nullptr;
 	}
+	if (PostLoginHandle.IsValid())
+	{
+		FGameModeEvents::GameModePostLoginEvent.Remove(PostLoginHandle);
+		PostLoginHandle.Reset();
+	}
 	LLMClient.Reset();
 	Session.Reset();
 
@@ -289,6 +299,13 @@ void UAIDAOrchestrator::RegisterRelayClass()
 			const float IntervalSeconds = FMath::Max(1, Config.Snapshots.IntervalMinutes) * 60.f;
 			World->GetTimerManager().SetTimer(SnapshotTimer, this, &UAIDAOrchestrator::OnSnapshotTimer,
 				IntervalSeconds, /*bLoop=*/true);
+		}
+
+		// P7 Slice 0 polish: a snapshot anchored at each player join, so "what changed since I last
+		// logged in" compares against a baseline taken exactly then (labels sort it out from 'auto').
+		if (!PostLoginHandle.IsValid())
+		{
+			PostLoginHandle = FGameModeEvents::GameModePostLoginEvent.AddUObject(this, &UAIDAOrchestrator::OnPlayerPostLogin);
 		}
 	}
 
@@ -670,6 +687,42 @@ void UAIDAOrchestrator::RegisterTools()
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
 			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildBottleneckJson(FAIDAFactoryAggregator::FindBottleneck(Snapshot, Item)));
+		}
+	});
+
+	// P7 Slice 1: underclock advisor — pure math over the cached snapshot.
+	Tools.Register({
+		TEXT("get_clock_advice"),
+		TEXT("Find machines worth underclocking: producers that idle enough that a lower clock saves power. Returns per-machine current vs suggested clock and the MW saved, biggest saving first. Use for 'where am I wasting energy / where should I underclock'."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildClockAdviceJson(FAIDAFactoryAggregator::BuildClockAdvice(Snapshot.Machines)));
+		}
+	});
+
+	// P7 Slice 3 read side: storage container contents.
+	Tools.Register({
+		TEXT("get_container_contents"),
+		TEXT("List storage containers and what they hold (per-item counts, slots used). Optional 'item' narrows to containers holding it; optional 'radius_m' narrows to containers within that distance of the player. Nearest containers first."),
+		TEXT(R"({"type":"object","properties":{"item":{"type":"string","description":"Optional item name (substring) the container must hold (e.g. \"Iron Plate\")."},"radius_m":{"type":"number","description":"Optional radius in metres around the player."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			FString Item;
+			Args->TryGetStringField(TEXT("item"), Item);
+			double RadiusM = 0.0;
+			Args->TryGetNumberField(TEXT("radius_m"), RadiusM);
+
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildContainerContentsJson(
+				Snapshot.Containers, Item, Ctx.Location, Ctx.bHasLocation, RadiusM));
 		}
 	});
 
@@ -2148,6 +2201,14 @@ void UAIDAOrchestrator::TakeSnapshot(const FString& Label)
 void UAIDAOrchestrator::OnSnapshotTimer()
 {
 	TakeSnapshot(TEXT("auto"));
+}
+
+void UAIDAOrchestrator::OnPlayerPostLogin(AGameModeBase* GameMode, APlayerController* NewPlayer)
+{
+	// The PostLogin event is global — only react to joins into our own world.
+	if (!GameMode || GameMode->GetWorld() != GetWorld()) { return; }
+	const FString Who = NewPlayer && NewPlayer->PlayerState ? NewPlayer->PlayerState->GetPlayerName() : FString();
+	TakeSnapshot(Who.IsEmpty() ? TEXT("login") : FString::Printf(TEXT("login:%s"), *Who));
 }
 
 void UAIDAOrchestrator::Snapshot(const TArray<FString>& Args)

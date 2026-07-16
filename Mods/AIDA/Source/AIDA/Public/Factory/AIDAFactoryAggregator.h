@@ -12,6 +12,16 @@ struct FAIDAAggregatorConfig
 	int32 MinClusterPoints = 1;
 	/** Rates whose magnitude is below this are treated as zero when netting production vs consumption. */
 	double RateTolerance = 1e-3;
+
+	/** Recommend an underclock only when a machine idles at least this fraction of the time (productivity ≤ 1-this). */
+	double UnderclockIdleThreshold = 0.10;
+	/**
+	 * Power ∝ clock^this. Every vanilla production building uses log2(2.5) ≈ 1.321928 (the per-buildable
+	 * `mPowerConsumptionExponent` has no public getter, so the game-wide value is applied uniformly).
+	 */
+	double PowerExponent = 1.321928;
+	/** Never suggest a clock below this potential (game minimum is 1%). */
+	double MinSuggestedClock = 0.01;
 };
 
 /**
@@ -57,5 +67,15 @@ public:
 	 * power circuit, or idle-with-inputs (output backed up). Upstream is preferred as the root cause.
 	 */
 	static FAIDABottleneckResult FindBottleneck(const FAIDAFactorySnapshot& Snapshot, const FString& Item,
+		const FAIDAAggregatorConfig& Config = FAIDAAggregatorConfig());
+
+	/**
+	 * Underclock advisor (P7 Slice 1): power-drawing producers whose productivity shows they idle more
+	 * than the threshold get a suggested clock of Clock×Productivity (rounded UP to a whole percent, so
+	 * throughput is never under-provisioned) and an estimated MW saving via the clock^exponent power law.
+	 * Machines at zero productivity are counted as stopped instead — that's a bottleneck, not a clock issue.
+	 * The saving assumes PowerMW is the producing draw; for a machine sampled mid-idle it's conservative.
+	 */
+	static FAIDAClockAdviceReport BuildClockAdvice(const TArray<FAIDAMachine>& Machines,
 		const FAIDAAggregatorConfig& Config = FAIDAAggregatorConfig());
 };

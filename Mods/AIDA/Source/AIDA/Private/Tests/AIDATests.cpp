@@ -974,6 +974,137 @@ bool FAIDAFactoryBottleneckTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryClockAdviceTest, "AIDA.Factory.ClockAdvice",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryClockAdviceTest::RunTest(const FString&)
+{
+	TArray<FAIDAMachine> Machines;
+
+	// Half-idle constructor at 100%: suggest 50%, saving 30 - 30*(0.5^log2(2.5)) = 30 - 30*0.4 = 18 MW.
+	FAIDAMachine HalfIdle = AIDAMakeTestMachine(1, FVector::ZeroVector, TEXT("Constructor"));
+	HalfIdle.Outputs = { { TEXT("IronPlate"), 20.0 } };
+	HalfIdle.Clock = 1.0f; HalfIdle.Productivity = 0.5f; HalfIdle.PowerMW = 30.0;
+	Machines.Add(HalfIdle);
+
+	// Slightly-idle smelter (97%): above the 90% threshold -> no advice.
+	FAIDAMachine Busy = AIDAMakeTestMachine(2, FVector::ZeroVector, TEXT("Smelter"));
+	Busy.Outputs = { { TEXT("IronIngot"), 30.0 } };
+	Busy.Clock = 1.0f; Busy.Productivity = 0.97f; Busy.PowerMW = 4.0;
+	Machines.Add(Busy);
+
+	// Stopped assembler: zero productivity is a bottleneck, not an underclock candidate.
+	FAIDAMachine Stopped = AIDAMakeTestMachine(3, FVector::ZeroVector, TEXT("Assembler"));
+	Stopped.Outputs = { { TEXT("Screw"), 40.0 } };
+	Stopped.Clock = 1.0f; Stopped.Productivity = 0.0f; Stopped.PowerMW = 15.0;
+	Machines.Add(Stopped);
+
+	// Generator (negative PowerMW) and a mostly-idle machine with a small draw: generator skipped,
+	// small machine advised but sorted below the big saving.
+	FAIDAMachine Gen = AIDAMakeTestMachine(4, FVector::ZeroVector, TEXT("CoalGenerator"));
+	Gen.Outputs = { { TEXT("Power"), 0.0 } };
+	Gen.Clock = 1.0f; Gen.Productivity = 0.5f; Gen.PowerMW = -75.0;
+	Machines.Add(Gen);
+
+	FAIDAMachine Small = AIDAMakeTestMachine(5, FVector::ZeroVector, TEXT("Constructor"));
+	Small.Outputs = { { TEXT("Wire"), 30.0 } };
+	Small.Clock = 0.5f; Small.Productivity = 0.503f; Small.PowerMW = 2.0;
+	Machines.Add(Small);
+
+	const FAIDAClockAdviceReport R = FAIDAFactoryAggregator::BuildClockAdvice(Machines);
+
+	TestEqual(TEXT("two machines advised"), R.Advice.Num(), 2);
+	TestEqual(TEXT("one stopped machine counted"), R.StoppedMachines, 1);
+	if (R.Advice.Num() == 2)
+	{
+		TestEqual(TEXT("biggest saving first"), R.Advice[0].MachineId, 1);
+		AIDA_TEST_NEAR("suggested clock is productivity", R.Advice[0].SuggestedClock, 0.5);
+		TestTrue(TEXT("saved ~18 MW"), FMath::IsNearlyEqual(R.Advice[0].SavedMW, 18.0, 0.05));
+
+		// 0.5 * 0.503 = 0.2515 -> rounded UP to 26%.
+		TestEqual(TEXT("small machine second"), R.Advice[1].MachineId, 5);
+		AIDA_TEST_NEAR("suggestion rounds up to a whole percent", R.Advice[1].SuggestedClock, 0.26);
+	}
+	TestTrue(TEXT("total is the sum of savings"),
+		FMath::IsNearlyEqual(R.TotalSavableMW, R.Advice.Num() == 2 ? R.Advice[0].SavedMW + R.Advice[1].SavedMW : -1.0, 1e-9));
+
+	const TSharedPtr<FJsonObject> J = AIDAParseTestJson(AIDAFactoryTools::BuildClockAdviceJson(R));
+	if (TestNotNull(TEXT("clock advice json parses"), J.Get()))
+	{
+		TestEqual(TEXT("advised count"), J->GetIntegerField(TEXT("advised")), 2);
+		TestEqual(TEXT("stopped machines surfaced"), J->GetIntegerField(TEXT("stoppedMachines")), 1);
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (TestTrue(TEXT("advice array present"), J->TryGetArrayField(TEXT("advice"), Arr) && Arr && Arr->Num() == 2))
+		{
+			const TSharedPtr<FJsonObject> First = (*Arr)[0]->AsObject();
+			TestEqual(TEXT("clock_pct"), First->GetIntegerField(TEXT("clock_pct")), 100);
+			TestEqual(TEXT("suggested_pct"), First->GetIntegerField(TEXT("suggested_pct")), 50);
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryContainerContentsTest, "AIDA.Factory.ContainerContents",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryContainerContentsTest::RunTest(const FString&)
+{
+	TArray<FAIDAContainerInfo> Containers;
+
+	FAIDAContainerInfo Near;
+	Near.Id = 1; Near.BuildingClass = TEXT("StorageContainerMk1");
+	Near.Location = FVector(1000, 0, 0); // 10 m out
+	Near.SlotsUsed = 2; Near.SlotsTotal = 24;
+	Near.Contents = { { TEXT("Iron Plate"), 200 }, { TEXT("Screw"), 50 } };
+	Containers.Add(Near);
+
+	FAIDAContainerInfo Far;
+	Far.Id = 2; Far.BuildingClass = TEXT("StorageContainerMk2");
+	Far.Location = FVector(50000, 0, 0); // 500 m out
+	Far.SlotsUsed = 1; Far.SlotsTotal = 48;
+	Far.Contents = { { TEXT("Copper Sheet"), 75 } };
+	Containers.Add(Far);
+
+	const FVector Player = FVector::ZeroVector;
+
+	// No filters: both, nearest first.
+	{
+		const TSharedPtr<FJsonObject> J = AIDAParseTestJson(
+			AIDAFactoryTools::BuildContainerContentsJson(Containers, FString(), Player, true, 0.0));
+		if (TestNotNull(TEXT("json parses"), J.Get()))
+		{
+			TestEqual(TEXT("both containers"), J->GetIntegerField(TEXT("containers")), 2);
+			const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+			if (TestTrue(TEXT("list present"), J->TryGetArrayField(TEXT("containerList"), Arr) && Arr && Arr->Num() == 2))
+			{
+				const TSharedPtr<FJsonObject> First = (*Arr)[0]->AsObject();
+				TestEqual(TEXT("nearest first"), First->GetIntegerField(TEXT("id")), 1);
+				TestEqual(TEXT("distance humanized to metres"), First->GetIntegerField(TEXT("distance_m")), 10);
+				const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
+				if (TestTrue(TEXT("contents present"), First->TryGetArrayField(TEXT("contents"), Items) && Items && Items->Num() == 2))
+				{
+					TestEqual(TEXT("dominant item first"), (*Items)[0]->AsObject()->GetStringField(TEXT("item")), FString(TEXT("Iron Plate")));
+				}
+			}
+		}
+	}
+
+	// Item filter matches case-insensitively on a substring.
+	{
+		const TSharedPtr<FJsonObject> J = AIDAParseTestJson(
+			AIDAFactoryTools::BuildContainerContentsJson(Containers, TEXT("copper"), Player, true, 0.0));
+		TestTrue(TEXT("item filter narrows to the mk2 box"),
+			J.IsValid() && J->GetIntegerField(TEXT("containers")) == 1);
+	}
+
+	// Radius filter drops the far container.
+	{
+		const TSharedPtr<FJsonObject> J = AIDAParseTestJson(
+			AIDAFactoryTools::BuildContainerContentsJson(Containers, FString(), Player, true, 100.0));
+		TestTrue(TEXT("radius filter keeps only the near box"),
+			J.IsValid() && J->GetIntegerField(TEXT("containers")) == 1);
+	}
+	return true;
+}
+
 static FAIDAResourceNode AIDAMakeTestNode(const FString& Resource, const FString& Purity, bool bOccupied)
 {
 	FAIDAResourceNode N;

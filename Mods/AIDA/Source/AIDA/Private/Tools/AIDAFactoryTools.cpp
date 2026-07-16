@@ -12,6 +12,9 @@ namespace
 	constexpr int32 MaxDeficits = 5;
 	constexpr int32 MaxItemsInBalance = 40;
 	constexpr int32 MaxMachineIdsInCluster = 60;
+	constexpr int32 MaxClockAdviceEntries = 20;
+	constexpr int32 MaxContainers = 25;
+	constexpr int32 MaxItemsPerContainer = 10;
 
 	/** Centroid humanized to whole metres (world units are cm), as [x, y] — Z dropped for the overview. */
 	TArray<TSharedPtr<FJsonValue>> CentroidMetres(const FVector& Centroid)
@@ -197,6 +200,106 @@ FString AIDAFactoryTools::BuildClusterJson(const FAIDAFactoryAggregates& Aggrega
 	Root->SetArrayField(TEXT("machineIds"), Ids);
 	if (Cluster->MachineIds.Num() > Shown) { Root->SetNumberField(TEXT("machineIdsOmitted"), Cluster->MachineIds.Num() - Shown); }
 
+	return AIDAToCompactJson(Root);
+}
+
+FString AIDAFactoryTools::BuildClockAdviceJson(const FAIDAClockAdviceReport& Report)
+{
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("advised"), Report.Advice.Num());
+	Root->SetField(TEXT("totalSavable_MW"), AIDANumber(Report.TotalSavableMW));
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	const int32 Shown = FMath::Min(Report.Advice.Num(), MaxClockAdviceEntries);
+	for (int32 i = 0; i < Shown; ++i)
+	{
+		const FAIDAClockAdvice& A = Report.Advice[i];
+		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetNumberField(TEXT("machineId"), A.MachineId);
+		O->SetStringField(TEXT("building"), A.BuildingClass);
+		if (!A.Recipe.IsEmpty()) { O->SetStringField(TEXT("recipe"), A.Recipe); }
+		O->SetArrayField(TEXT("location_m"), CentroidMetres(A.Location));
+		O->SetNumberField(TEXT("clock_pct"), FMath::RoundToInt(A.Clock * 100.f));
+		O->SetNumberField(TEXT("productivity_pct"), FMath::RoundToInt(A.Productivity * 100.f));
+		O->SetNumberField(TEXT("suggested_pct"), FMath::RoundToInt(A.SuggestedClock * 100.f));
+		O->SetField(TEXT("saves_MW"), AIDANumber(A.SavedMW));
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("advice"), Arr);
+	if (Report.Advice.Num() > Shown) { Root->SetNumberField(TEXT("adviceOmitted"), Report.Advice.Num() - Shown); }
+	if (Report.StoppedMachines > 0)
+	{
+		Root->SetNumberField(TEXT("stoppedMachines"), Report.StoppedMachines);
+		Root->SetStringField(TEXT("stoppedHint"), TEXT("machines at zero productivity are stopped, not underclock candidates — use find_bottleneck"));
+	}
+	return AIDAToCompactJson(Root);
+}
+
+FString AIDAFactoryTools::BuildContainerContentsJson(const TArray<FAIDAContainerInfo>& Containers,
+	const FString& ItemFilter, const FVector& PlayerLocation, bool bHasLocation, double RadiusMetres)
+{
+	// Filter: item substring, then radius around the player (when we know where they are).
+	TArray<const FAIDAContainerInfo*> Picked;
+	for (const FAIDAContainerInfo& C : Containers)
+	{
+		if (!ItemFilter.IsEmpty())
+		{
+			const bool bHolds = C.Contents.ContainsByPredicate(
+				[&ItemFilter](const FAIDAItemCount& I) { return I.Item.Contains(ItemFilter, ESearchCase::IgnoreCase); });
+			if (!bHolds) { continue; }
+		}
+		if (RadiusMetres > 0.0 && bHasLocation
+			&& FVector::Dist(C.Location, PlayerLocation) > RadiusMetres * 100.0) { continue; }
+		Picked.Add(&C);
+	}
+
+	// Nearest-first when the player's position is known; stable id order otherwise.
+	if (bHasLocation)
+	{
+		Picked.Sort([&PlayerLocation](const FAIDAContainerInfo& A, const FAIDAContainerInfo& B)
+		{
+			return FVector::DistSquared(A.Location, PlayerLocation) < FVector::DistSquared(B.Location, PlayerLocation);
+		});
+	}
+	else
+	{
+		Picked.Sort([](const FAIDAContainerInfo& A, const FAIDAContainerInfo& B) { return A.Id < B.Id; });
+	}
+
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("containers"), Picked.Num());
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	const int32 Shown = FMath::Min(Picked.Num(), MaxContainers);
+	for (int32 i = 0; i < Shown; ++i)
+	{
+		const FAIDAContainerInfo& C = *Picked[i];
+		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetNumberField(TEXT("id"), C.Id);
+		O->SetStringField(TEXT("building"), C.BuildingClass);
+		O->SetArrayField(TEXT("location_m"), CentroidMetres(C.Location));
+		if (bHasLocation)
+		{
+			O->SetField(TEXT("distance_m"), AIDANumber(FMath::RoundToDouble(FVector::Dist(C.Location, PlayerLocation) / 100.0)));
+		}
+		O->SetNumberField(TEXT("slotsUsed"), C.SlotsUsed);
+		O->SetNumberField(TEXT("slotsTotal"), C.SlotsTotal);
+
+		TArray<TSharedPtr<FJsonValue>> Items;
+		const int32 ItemsShown = FMath::Min(C.Contents.Num(), MaxItemsPerContainer);
+		for (int32 j = 0; j < ItemsShown; ++j)
+		{
+			const TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+			IO->SetStringField(TEXT("item"), C.Contents[j].Item);
+			IO->SetNumberField(TEXT("count"), C.Contents[j].Count);
+			Items.Add(MakeShared<FJsonValueObject>(IO));
+		}
+		O->SetArrayField(TEXT("contents"), Items);
+		if (C.Contents.Num() > ItemsShown) { O->SetNumberField(TEXT("itemsOmitted"), C.Contents.Num() - ItemsShown); }
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("containerList"), Arr);
+	if (Picked.Num() > Shown) { Root->SetNumberField(TEXT("containersOmitted"), Picked.Num() - Shown); }
 	return AIDAToCompactJson(Root);
 }
 

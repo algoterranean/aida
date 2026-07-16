@@ -358,6 +358,50 @@ FAIDABottleneckResult FAIDAFactoryAggregator::FindBottleneck(const FAIDAFactoryS
 	return Result;
 }
 
+FAIDAClockAdviceReport FAIDAFactoryAggregator::BuildClockAdvice(const TArray<FAIDAMachine>& Machines,
+	const FAIDAAggregatorConfig& Config)
+{
+	FAIDAClockAdviceReport Report;
+
+	for (const FAIDAMachine& M : Machines)
+	{
+		// Only power-drawing producers: generators (PowerMW < 0) and non-producing buildables don't underclock.
+		if (M.PowerMW <= Config.RateTolerance || M.Outputs.Num() == 0 || M.Clock <= 0.0f) { continue; }
+
+		if (M.Productivity <= 0.0f)
+		{
+			++Report.StoppedMachines;
+			continue;
+		}
+		if (static_cast<double>(M.Productivity) > 1.0 - Config.UnderclockIdleThreshold) { continue; }
+
+		// Match the clock to observed uptime, rounded UP to a whole percent so throughput never drops.
+		const double Raw = FMath::Max(Config.MinSuggestedClock, static_cast<double>(M.Clock) * static_cast<double>(M.Productivity));
+		const double Suggested = FMath::CeilToDouble(Raw * 100.0) / 100.0;
+		if (Suggested >= static_cast<double>(M.Clock) - 0.005) { continue; }
+
+		FAIDAClockAdvice Advice;
+		Advice.MachineId = M.Id;
+		Advice.BuildingClass = M.BuildingClass;
+		Advice.Recipe = M.Recipe;
+		Advice.Location = M.Location;
+		Advice.Clock = M.Clock;
+		Advice.Productivity = M.Productivity;
+		Advice.PowerMW = M.PowerMW;
+		Advice.SuggestedClock = static_cast<float>(Suggested);
+		Advice.SavedMW = M.PowerMW * (1.0 - FMath::Pow(Suggested / static_cast<double>(M.Clock), Config.PowerExponent));
+		Report.TotalSavableMW += Advice.SavedMW;
+		Report.Advice.Add(MoveTemp(Advice));
+	}
+
+	Report.Advice.Sort([](const FAIDAClockAdvice& A, const FAIDAClockAdvice& B)
+	{
+		if (A.SavedMW != B.SavedMW) { return A.SavedMW > B.SavedMW; }
+		return A.MachineId < B.MachineId;
+	});
+	return Report;
+}
+
 FAIDAFactoryAggregates FAIDAFactoryAggregator::Aggregate(const FAIDAFactorySnapshot& Snapshot,
 	const FAIDAAggregatorConfig& Config)
 {

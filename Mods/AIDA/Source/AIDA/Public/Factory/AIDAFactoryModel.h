@@ -62,12 +62,31 @@ struct FAIDAPowerCircuitStats
 	double BatteryDrainSeconds = -1.0; // time-to-empty; <0 = not draining / no batteries
 };
 
+/** One item kind inside a container, aggregated across its stacks. */
+struct FAIDAItemCount
+{
+	FString Item;
+	int32 Count = 0;
+};
+
+/** A storage container: where it is and what it holds (P7 Slice 3, read side). */
+struct FAIDAContainerInfo
+{
+	int32 Id = 0;                    // stable index within a snapshot (separate space from machine ids)
+	FString BuildingClass;           // "StorageContainerMk1", "StorageContainerMk2", ...
+	FVector Location = FVector::ZeroVector;
+	int32 SlotsUsed = 0;
+	int32 SlotsTotal = 0;
+	TArray<FAIDAItemCount> Contents; // per-item totals, largest count first
+};
+
 /** The normalized snapshot the extractor produces; the aggregator's sole input. */
 struct FAIDAFactorySnapshot
 {
 	TArray<FAIDAMachine> Machines;
 	TArray<FAIDAConveyorEdge> Edges;
 	TArray<FAIDAPowerCircuitStats> Circuits;
+	TArray<FAIDAContainerInfo> Containers;
 };
 
 // ----------------------------------------------------------------------------------------------------
@@ -140,6 +159,28 @@ enum class EAIDABottleneck : uint8
 	Upstream,      // a producer input is itself in factory-wide deficit (see LimitingDetail)
 	Power,         // producers sit on an overloaded circuit (LimitingDetail = circuit id)
 	OutputBackedUp // producers are idle though inputs and power are fine (output full / demand-limited)
+};
+
+/** One machine's underclock recommendation (P7 Slice 1): it idles enough that a lower clock saves power. */
+struct FAIDAClockAdvice
+{
+	int32 MachineId = 0;
+	FString BuildingClass;
+	FString Recipe;
+	FVector Location = FVector::ZeroVector;
+	float Clock = 1.0f;              // current potential, 1.0 = 100%
+	float Productivity = 1.0f;       // recent uptime fraction [0,1]
+	double PowerMW = 0.0;            // current draw at Clock
+	float SuggestedClock = 1.0f;     // recommended potential (rounded up to a whole percent)
+	double SavedMW = 0.0;            // estimated draw reduction at the suggested clock
+};
+
+/** get_clock_advice output: per-machine recommendations plus the headline totals. */
+struct FAIDAClockAdviceReport
+{
+	TArray<FAIDAClockAdvice> Advice; // biggest saving first
+	double TotalSavableMW = 0.0;     // sum of Advice[].SavedMW
+	int32 StoppedMachines = 0;       // power-drawing producers at zero productivity (a bottleneck, not a clock problem)
 };
 
 struct FAIDABottleneckResult

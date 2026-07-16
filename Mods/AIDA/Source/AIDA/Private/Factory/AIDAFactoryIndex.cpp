@@ -6,6 +6,8 @@
 #include "Buildables/FGBuildableFactory.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildableResourceExtractor.h"
+#include "Buildables/FGBuildableStorage.h"
+#include "FGInventoryComponent.h"
 #include "Resources/FGExtractableResourceInterface.h"
 #include "FGRecipe.h"
 #include "ItemAmount.h"
@@ -53,6 +55,7 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 	Out.Machines.Reset();
 	Out.Edges.Reset();
 	Out.Circuits.Reset();
+	Out.Containers.Reset();
 
 	AFGBuildableSubsystem* Subsystem = AFGBuildableSubsystem::Get(WorldContext);
 	if (!Subsystem)
@@ -97,6 +100,38 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 					if (Ingredient.ItemClass) { Machine.Inputs.Add({ ExtractItemKey(Ingredient.ItemClass), PerMinuteFor(Ingredient, Cycle) }); }
 				}
 			}
+		}
+		else if (AFGBuildableStorage* Storage = Cast<AFGBuildableStorage>(Factory))
+		{
+			// P7 Slice 3 read side: containers go in their own snapshot list, not Machines.
+			if (UFGInventoryComponent* Inventory = Storage->GetStorageInventory())
+			{
+				FAIDAContainerInfo Container;
+				Container.Id = Out.Containers.Num() + 1;
+				Container.BuildingClass = CleanBuildableName(Buildable);
+				Container.Location = Buildable->GetActorLocation();
+				Container.SlotsTotal = Inventory->GetSizeLinear();
+
+				TMap<FString, int32> Totals;
+				for (int32 Idx = 0; Idx < Inventory->GetSizeLinear(); ++Idx)
+				{
+					FInventoryStack Stack;
+					if (!Inventory->GetStackFromIndex(Idx, Stack) || !Stack.HasItems()) { continue; }
+					++Container.SlotsUsed;
+					Totals.FindOrAdd(ExtractItemKey(Stack.Item.GetItemClass())) += Stack.NumItems;
+				}
+				for (const TPair<FString, int32>& Pair : Totals)
+				{
+					Container.Contents.Add({ Pair.Key, Pair.Value });
+				}
+				Container.Contents.Sort([](const FAIDAItemCount& A, const FAIDAItemCount& B)
+				{
+					if (A.Count != B.Count) { return A.Count > B.Count; }
+					return A.Item < B.Item;
+				});
+				Out.Containers.Add(MoveTemp(Container));
+			}
+			continue;
 		}
 		else if (AFGBuildableResourceExtractor* Extractor = Cast<AFGBuildableResourceExtractor>(Factory))
 		{
@@ -149,8 +184,8 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 		Out.Circuits.Add(MoveTemp(Report));
 	}
 
-	UE_LOG(LogAIDA, Log, TEXT("[index] extracted %d machines (%d/%d extractors resolved a resource), %d power circuits (edges deferred)."),
-		Out.Machines.Num(), ExtractorWithResource, ExtractorCount, Out.Circuits.Num());
+	UE_LOG(LogAIDA, Log, TEXT("[index] extracted %d machines (%d/%d extractors resolved a resource), %d containers, %d power circuits (edges deferred)."),
+		Out.Machines.Num(), ExtractorWithResource, ExtractorCount, Out.Containers.Num(), Out.Circuits.Num());
 }
 
 const FAIDAFactorySnapshot& FAIDAFactoryIndex::GetSnapshot(UObject* WorldContext, double NowSeconds, double TtlSeconds)

@@ -233,6 +233,11 @@ private:
 	void OnSnapshotTimer();
 	FTimerHandle SnapshotTimer;
 
+	//~ Login-anchored snapshot (P7 Slice 0 polish): one per player join, so "since I last logged in"
+	//~ has a clean baseline. Bound server-side to the global PostLogin event; unbound in Deinitialize.
+	void OnPlayerPostLogin(class AGameModeBase* GameMode, class APlayerController* NewPlayer);
+	FDelegateHandle PostLoginHandle;
+
 	//~ Phase 4 executor time-slicer: 10 Hz, running only while a proposal executes.
 	UFUNCTION()
 	void OnActionTimer();
