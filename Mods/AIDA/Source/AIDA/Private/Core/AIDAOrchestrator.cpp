@@ -1423,15 +1423,21 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Points.Add({ Port.PosCm, Port.NormalCm });
 			}
-			// Plan at the requested standoff, and when the near lane is blocked (a pipe-junction row
-			// already hugging the machines, any obstruction) STEP THE ROW OUTWARD and retry instead
-			// of failing — a machine that needs both belt and pipe manifolds gets pipes close in and
-			// splitters/mergers further back, without anyone doing lane math.
+			// Plan at the requested standoff, stepping the row outward while its lane is blocked OR
+			// clipping — a machine needing both belt and pipe manifolds gets pipes close in and
+			// splitters/mergers behind, without anyone doing lane math. Clipping is ADVISORY only
+			// (user rule: it never rejects a build): when no clean lane exists in range, the nearest
+			// VALID lane is proposed anyway and the summary says it clips — the player judges via
+			// the ghosts. Only hard blockers on every attempt fail the proposal.
 			const double FootprintM = FMath::Max(Attachment.FootprintXM, Attachment.FootprintYM);
 			FAIDAManifoldPlan Plan;
 			FAIDADryRunResult DryRun;
 			double UsedStandoffM = Spec.StandoffM;
+			FAIDAManifoldPlan NearestValidPlan;
+			FAIDADryRunResult NearestValidDryRun;
+			double NearestValidStandoffM = -1.0;
 			bool bPlaced = false;
+			bool bClips = false;
 			for (int32 Attempt = 0; Attempt < 4; ++Attempt)
 			{
 				UsedStandoffM = Spec.StandoffM + Attempt * 3.0;
@@ -1461,13 +1467,28 @@ void UAIDAOrchestrator::RegisterActionTools()
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
 				}
-				if (DryRun.bOk)
+				if (DryRun.bOk && DryRun.ClippingCount == 0)
 				{
 					bPlaced = true;
 					break;
 				}
-				Stage(FString::Printf(TEXT("%d placement(s) blocked at %.0f m — stepping the row out"),
-					DryRun.Failures.Num(), UsedStandoffM));
+				if (DryRun.bOk && NearestValidStandoffM < 0.0)
+				{
+					NearestValidPlan = Plan;
+					NearestValidDryRun = DryRun;
+					NearestValidStandoffM = UsedStandoffM;
+				}
+				Stage(FString::Printf(TEXT("%.0f m lane: %d blocked, %d clipping — stepping the row out"),
+					UsedStandoffM, DryRun.Failures.Num(), DryRun.ClippingCount));
+			}
+			if (!bPlaced && NearestValidStandoffM >= 0.0)
+			{
+				// No clipping-free lane in range: the nearest valid one wins, clipping and all.
+				Plan = MoveTemp(NearestValidPlan);
+				DryRun = MoveTemp(NearestValidDryRun);
+				UsedStandoffM = NearestValidStandoffM;
+				bPlaced = true;
+				bClips = true;
 			}
 			if (!bPlaced)
 			{
@@ -1525,6 +1546,11 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (UsedStandoffM != Spec.StandoffM)
 			{
 				Proposal.Summary += FString::Printf(TEXT(" [row stepped out to %.0f m]"), UsedStandoffM);
+			}
+			if (bClips)
+			{
+				// Manifolds can't be nudged (anchored to ports) — the escape hatch is a re-propose.
+				Proposal.Summary += TEXT(" [clips nearby structures — reject and ask for a different standoff if unwanted]");
 			}
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();

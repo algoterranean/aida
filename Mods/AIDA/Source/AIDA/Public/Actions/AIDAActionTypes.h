@@ -157,6 +157,9 @@ struct FAIDADryRunResult
 	TArray<FAIDAPlacementFailure> Failures;
 	TArray<FAIDACostItem> Cost;            // total for all placements
 	bool bAffordable = false;              // vs central storage (callers ignore under costMode "free")
+	/** Placements that would clip existing structures/entities. ADVISORY ONLY — clipping never
+	 *  blocks a build (user rule); manifold rows use it to prefer a clean lane. */
+	int32 ClippingCount = 0;
 };
 
 /** Outcome of resolving a dismantle selector against live buildables (count + refund tally). */

@@ -169,15 +169,30 @@ namespace
 		Items.Add({ Name, Amount, ItemClass ? ItemClass->GetPathName() : FString() });
 	}
 
+	/** The user's placement philosophy: CLIPPING NEVER REJECTS A BUILD. If it can physically be
+	 *  placed, propose it — the player picks the spot / nudges the ghost to their preferred clipping
+	 *  level. This covers the whole encroaching family: hard + soft clearance, and transient bodies
+	 *  (player/creature/vehicle standing in the spot). Reported as advisory, never as a failure. */
+	bool IsClippingDisqualifier(const TSubclassOf<UFGConstructDisqualifier>& Disqualifier)
+	{
+		return Disqualifier
+			&& (Disqualifier->IsChildOf(UFGCDEncroachingClearance::StaticClass())
+				|| Disqualifier->IsChildOf(UFGCDEncroachingSoftClearance::StaticClass())
+				|| Disqualifier->IsChildOf(UFGCDEncroachingPlayer::StaticClass())
+				|| Disqualifier->IsChildOf(UFGCDEncroachingCreature::StaticClass())
+				|| Disqualifier->IsChildOf(UFGCDEncroachingVehicle::StaticClass()));
+	}
+
 	/** The dry-run/execute disqualifier filter: Unaffordable is ours to judge (central storage /
-	 *  costMode), Initializing is a first-tick readiness flag, and soft clearance ("clipping may
-	 *  occur") is the build gun's yellow WARNING state — it never blocks a player build either. */
+	 *  costMode), Initializing is a first-tick readiness flag, and clipping (see above) is the
+	 *  player's call, never a rejection. Everything else (floor, aim, snap rules, identical
+	 *  overlapping duplicate, spline shape limits) genuinely blocks. */
 	bool IsBlockingDisqualifier(const TSubclassOf<UFGConstructDisqualifier>& Disqualifier)
 	{
 		return Disqualifier
 			&& !Disqualifier->IsChildOf(UFGCDUnaffordable::StaticClass())
 			&& !Disqualifier->IsChildOf(UFGCDInitializing::StaticClass())
-			&& !Disqualifier->IsChildOf(UFGCDEncroachingSoftClearance::StaticClass());
+			&& !IsClippingDisqualifier(Disqualifier);
 	}
 
 	/**
@@ -236,7 +251,8 @@ namespace
 	 *  AFTER Construct() when constructing. bVerboseLog dumps the full state. */
 	bool PlaceAndValidate(AFGHologram* Hologram, const FTransform& Placement, UFGInventoryComponent* Inventory,
 		TSubclassOf<UFGConstructDisqualifier>* OutBlocking = nullptr, bool bVerboseLog = false,
-		FHitResult* InOutTemplateHit = nullptr, AFGBuildable** OutTempFloor = nullptr)
+		FHitResult* InOutTemplateHit = nullptr, AFGBuildable** OutTempFloor = nullptr,
+		bool* OutClipping = nullptr)
 	{
 		const FVector Target = Placement.GetLocation();
 
@@ -343,18 +359,22 @@ namespace
 				UE_LOG(LogAIDA, Log, TEXT("[actions][dbg]   - %s (%s)%s"),
 					*GetNameSafe(Disqualifier.Get()),
 					*UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString(),
-					IsBlockingDisqualifier(Disqualifier) ? TEXT(" [BLOCKING]") : TEXT(" [filtered]"));
+					IsBlockingDisqualifier(Disqualifier) ? TEXT(" [BLOCKING]")
+						: (IsClippingDisqualifier(Disqualifier) ? TEXT(" [clipping — advisory]") : TEXT(" [filtered]")));
 			}
 		}
 
 		bool bValid = true;
 		for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
 		{
-			if (IsBlockingDisqualifier(Disqualifier))
+			if (OutClipping && IsClippingDisqualifier(Disqualifier))
+			{
+				*OutClipping = true;
+			}
+			if (bValid && IsBlockingDisqualifier(Disqualifier))
 			{
 				if (OutBlocking) { *OutBlocking = Disqualifier; }
 				bValid = false;
-				break;
 			}
 		}
 		if (!OutTempFloor && TempFloor)
@@ -659,14 +679,20 @@ bool FAIDAActionSeam::DryRunBuild(UObject* WorldContext, const FString& RecipeCl
 	for (int32 Index = 0; Index < Placements.Num(); ++Index)
 	{
 		TSubclassOf<UFGConstructDisqualifier> Blocking;
+		bool bClipping = false;
 		// Verbose diagnostics for the first placements only (a 200-tile grid must not spam the log).
-		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking, /*bVerboseLog*/ Index < 2, &TemplateHit))
+		if (!PlaceAndValidate(Hologram, Placements[Index], Inventory, &Blocking, /*bVerboseLog*/ Index < 2,
+			&TemplateHit, /*OutTempFloor*/ nullptr, &bClipping))
 		{
 			FAIDAPlacementFailure Failure;
 			Failure.Index = Index;
 			Failure.AtM = Placements[Index].GetLocation() / AIDAMetersToCm;
 			Failure.Reason = UFGConstructDisqualifier::GetDisqualifyingText(Blocking).ToString();
 			Out.Failures.Add(MoveTemp(Failure));
+		}
+		else if (bClipping)
+		{
+			++Out.ClippingCount; // advisory (never a failure): manifold rows prefer a clean lane
 		}
 	}
 
