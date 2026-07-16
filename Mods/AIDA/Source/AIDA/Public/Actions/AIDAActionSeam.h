@@ -150,6 +150,26 @@ public:
 		TArray<FAIDAManifoldPort>& OutPorts, int32& OutSkippedConnected, FString& OutMachineName);
 
 	/**
+	 * Deterministic lane assignment for a manifold row (user rule: don't probe — every port on a
+	 * machine side gets its OWN row). From the first machine matching the selector: pipe ports of
+	 * this direction occupy the inner lanes (0..P-1, they hug the machines), belt ports the outer
+	 * ones (P..P+B-1); this manifold's lane = its port's ordinal. Counts use ALL ports of the side
+	 * (connected or not) so the lane is stable across re-runs. False when no machine matches.
+	 */
+	static bool ResolveManifoldLane(UObject* WorldContext, const FAIDADismantleSpec& Selector,
+		bool bPipe, bool bOutput, int32 PortIndex, int32& OutLane, int32& OutRowsOnSide);
+
+	/**
+	 * How many of these placements would bodily overlap an EXISTING conveyor/pipeline attachment
+	 * (splitter, merger, junction, pump)? The engine's clearance flags miss this — attachment
+	 * clearance boxes are tiny and soft, so a splitter interpenetrating a pipe junction validates
+	 * clean (live-verify: belt and pipe manifold rows landed in the same lane). Centers closer than
+	 * the two half-footprints (2D, same floor) count as overlap; the manifold planner treats any
+	 * overlap as "lane occupied" and steps the row outward.
+	 */
+	static int32 CountAttachmentOverlaps(UObject* WorldContext, const TArray<FTransform>& Placements, double FootprintCm);
+
+	/**
 	 * Build ONE connecting run (belt or pipe) between two live actors' ports, exactly like the build
 	 * gun: spawn the spline hologram, place at the from-port, DoMultiStepPlacement, place at the
 	 * to-port — BOTH ends must report IsConnectionSnapped (an unsnapped end would silently construct

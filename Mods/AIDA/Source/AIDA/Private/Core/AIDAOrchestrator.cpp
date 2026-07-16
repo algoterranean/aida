@@ -144,10 +144,11 @@ namespace
 		"inputs, 'out' collects outputs; 'both ends' or 'inputs and outputs' means TWO calls, one 'in' and "
 		"one 'out'. Omit machines.center to use the machines the player is looking at ('these assemblers', "
 		"'this row') — that is almost always right; only ask when you truly cannot tell which machine TYPE "
-		"they mean. Machines already connected on that port are skipped automatically. When machines need "
-		"BOTH belt and pipe manifolds on the same side (refineries etc.), propose the PIPE manifolds FIRST: "
-		"pipes hug the machines, and a later manifold's row automatically steps further out when its lane "
-		"is occupied.\n"
+		"they mean. Machines already connected on that port are skipped automatically. Every port on a "
+		"machine side gets its OWN row distance automatically (pipes hug the machines, belt rows sit "
+		"further out, a second belt input gets the next row) — when machines need several manifolds "
+		"(refineries: belt + pipe, both sides), just propose each one; any order works, rows won't "
+		"collide.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
 		"/aida undo (or /aida undo N) in this chat. Players decide proposals with the on-screen card or "
@@ -1545,7 +1546,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
 	Tools.Register({
 		TEXT("propose_manifold"),
-		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build."),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -1680,24 +1681,36 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Points.Add({ Port.PosCm, Port.NormalCm });
 			}
-			// Plan at the requested standoff, stepping the row outward while its lane is blocked OR
-			// clipping — a machine needing both belt and pipe manifolds gets pipes close in and
-			// splitters/mergers behind, without anyone doing lane math. Clipping is ADVISORY only
-			// (user rule: it never rejects a build): when no clean lane exists in range, the nearest
-			// VALID lane is proposed anyway and the summary says it clips — the player judges via
-			// the ghosts. Only hard blockers on every attempt fail the proposal.
+			// DETERMINISTIC LANES (user rule: don't discover offsets by probing): every port on the
+			// machine side owns a row — pipes hug the machines (inner lanes), belts sit outside, a
+			// second belt input gets its own row further out. This manifold's base standoff is its
+			// lane's distance; proposal ORDER between belt/pipe manifolds no longer matters.
 			const double FootprintM = FMath::Max(Attachment.FootprintXM, Attachment.FootprintYM);
+			int32 Lane = 0, RowsOnSide = 1;
+			FAIDAActionSeam::ResolveManifoldLane(this, Spec.Machines, Spec.bPipe, Spec.bOutput, Spec.PortIndex, Lane, RowsOnSide);
+			const double LaneWidthM = FMath::Max(4.0, FootprintM) + 1.0;
+			const double BaseStandoffM = Spec.StandoffM + Lane * LaneWidthM;
+			Stage(FString::Printf(TEXT("lane %d of %d on this side -> base standoff %.0f m"), Lane, RowsOnSide, BaseStandoffM));
+
+			// Still step outward on trouble (safety net for hand-built clutter the lane math can't
+			// know): a lane is dirty when placements hard-block, clip, or would bodily OVERLAP an
+			// existing splitter/merger/junction (attachment clearance boxes are too small/soft for
+			// the engine's clipping flags to catch that). Clipping stays ADVISORY (user rule) — when
+			// no clean lane exists in range, the nearest valid non-overlapping lane wins (clips and
+			// all), overlap only as the last resort, and the summary says so.
 			FAIDAManifoldPlan Plan;
 			FAIDADryRunResult DryRun;
-			double UsedStandoffM = Spec.StandoffM;
+			double UsedStandoffM = BaseStandoffM;
 			FAIDAManifoldPlan NearestValidPlan;
 			FAIDADryRunResult NearestValidDryRun;
 			double NearestValidStandoffM = -1.0;
+			bool bNearestValidOverlaps = false;
 			bool bPlaced = false;
 			bool bClips = false;
+			bool bOverlaps = false;
 			for (int32 Attempt = 0; Attempt < 4; ++Attempt)
 			{
-				UsedStandoffM = Spec.StandoffM + Attempt * 3.0;
+				UsedStandoffM = BaseStandoffM + Attempt * 3.0;
 				Plan = AIDAActionSpec::PlanManifold(Points, Spec.bOutput, Spec.bPipe,
 					UsedStandoffM, FootprintM, /*MaxRunM*/ 56.0);
 				if (!Plan.Error.IsEmpty())
@@ -1724,28 +1737,33 @@ void UAIDAOrchestrator::RegisterActionTools()
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
 				}
-				if (DryRun.bOk && DryRun.ClippingCount == 0)
+				const int32 Overlaps = FAIDAActionSeam::CountAttachmentOverlaps(this, Plan.Attachments, FootprintM * 100.0);
+				if (DryRun.bOk && DryRun.ClippingCount == 0 && Overlaps == 0)
 				{
 					bPlaced = true;
 					break;
 				}
-				if (DryRun.bOk && NearestValidStandoffM < 0.0)
+				// Fallback bookkeeping: a non-overlapping lane always beats an overlapping one.
+				if (DryRun.bOk && (NearestValidStandoffM < 0.0 || (bNearestValidOverlaps && Overlaps == 0)))
 				{
 					NearestValidPlan = Plan;
 					NearestValidDryRun = DryRun;
 					NearestValidStandoffM = UsedStandoffM;
+					bNearestValidOverlaps = Overlaps > 0;
 				}
-				Stage(FString::Printf(TEXT("%.0f m lane: %d blocked, %d clipping — stepping the row out"),
-					UsedStandoffM, DryRun.Failures.Num(), DryRun.ClippingCount));
+				Stage(FString::Printf(TEXT("%.0f m lane: %d blocked, %d clipping, %d overlapping — stepping the row out"),
+					UsedStandoffM, DryRun.Failures.Num(), DryRun.ClippingCount, Overlaps));
 			}
 			if (!bPlaced && NearestValidStandoffM >= 0.0)
 			{
-				// No clipping-free lane in range: the nearest valid one wins, clipping and all.
+				// No fully clean lane in range: the preferred fallback (recorded non-overlapping
+				// when one existed) wins, clipping and all.
 				Plan = MoveTemp(NearestValidPlan);
 				DryRun = MoveTemp(NearestValidDryRun);
 				UsedStandoffM = NearestValidStandoffM;
 				bPlaced = true;
 				bClips = true;
+				bOverlaps = bNearestValidOverlaps;
 			}
 			if (!bPlaced)
 			{
@@ -1753,10 +1771,13 @@ void UAIDAOrchestrator::RegisterActionTools()
 					DryRun.Failures.Num(), Plan.Attachments.Num(), UsedStandoffM);
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
 			}
-			if (UsedStandoffM != Spec.StandoffM)
+			// The stored/journaled spec carries the BASE standoff that actually validated (actual row
+			// distance minus the lane offset) — a spec copied into a later propose re-derives the same
+			// row through the lane math instead of stacking the lane offset twice.
+			const double EffectiveBaseM = UsedStandoffM - Lane * LaneWidthM;
+			if (EffectiveBaseM != Spec.StandoffM)
 			{
-				// The stored/journaled spec must carry the standoff that actually validated.
-				(*SpecObj)->SetNumberField(TEXT("standoffM"), UsedStandoffM);
+				(*SpecObj)->SetNumberField(TEXT("standoffM"), EffectiveBaseM);
 			}
 
 			// Reorder the ports to the plan's sort so everything downstream is index-aligned.
@@ -1800,7 +1821,11 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Proposal.Summary += FString::Printf(TEXT(" [%d machine(s) already connected, skipped]"), SkippedConnected);
 			}
-			if (UsedStandoffM != Spec.StandoffM)
+			if (Lane > 0)
+			{
+				Proposal.Summary += FString::Printf(TEXT(" [lane %d: row at %.0f m]"), Lane + 1, UsedStandoffM);
+			}
+			else if (UsedStandoffM != Spec.StandoffM)
 			{
 				Proposal.Summary += FString::Printf(TEXT(" [row stepped out to %.0f m]"), UsedStandoffM);
 			}
@@ -1808,6 +1833,10 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				// Manifolds can't be nudged (anchored to ports) — the escape hatch is a re-propose.
 				Proposal.Summary += TEXT(" [clips nearby structures — reject and ask for a different standoff if unwanted]");
+			}
+			if (bOverlaps)
+			{
+				Proposal.Summary += TEXT(" [OVERLAPS existing splitters/junctions — no clear lane in range; reject and ask for a larger standoffM unless intended]");
 			}
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();

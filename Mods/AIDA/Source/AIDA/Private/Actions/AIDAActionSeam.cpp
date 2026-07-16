@@ -32,6 +32,8 @@
 #include "FGRecipeManager.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildableConveyorAttachment.h"
+#include "Buildables/FGBuildablePipelineAttachment.h"
 #include "Buildables/FGBuildableStorage.h"
 #include "Buildables/FGBuildableWidgetSign.h"
 #include "FGSignInterface.h"
@@ -2296,4 +2298,105 @@ bool FAIDAActionSeam::TallyRecipeCost(UObject* WorldContext, const FString& Reci
 		AddCost(Out, Ingredient.ItemClass, Ingredient.Amount * Count);
 	}
 	return true;
+}
+
+int32 FAIDAActionSeam::CountAttachmentOverlaps(UObject* WorldContext, const TArray<FTransform>& Placements, double FootprintCm)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem || Placements.Num() == 0) { return 0; }
+
+	// Existing attachment bodies, once. Their half-width is ~2 m across the family (splitters,
+	// mergers, junctions, pumps); ours comes from the caller's footprint. A small tolerance keeps
+	// exactly-footprint-apart neighbours (a legal packed row) from counting as overlap.
+	TArray<FVector> Existing;
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (!IsValid(Buildable)) { continue; }
+		if (Buildable->IsA<AFGBuildableConveyorAttachment>() || Buildable->IsA<AFGBuildablePipelineAttachment>())
+		{
+			Existing.Add(Buildable->GetActorLocation());
+		}
+	}
+	if (Existing.Num() == 0) { return 0; }
+
+	constexpr double OtherHalfCm = 200.0;
+	constexpr double ToleranceCm = 25.0;
+	constexpr double SameFloorCm = 300.0;
+	const double Threshold = FootprintCm * 0.5 + OtherHalfCm - ToleranceCm;
+	const double ThresholdSq = Threshold * Threshold;
+
+	int32 Overlaps = 0;
+	for (const FTransform& Placement : Placements)
+	{
+		const FVector At = Placement.GetLocation();
+		for (const FVector& Other : Existing)
+		{
+			if (FMath::Abs(Other.Z - At.Z) > SameFloorCm) { continue; }
+			if (FVector::DistSquaredXY(At, Other) < ThresholdSq)
+			{
+				++Overlaps;
+				break; // one hit marks this placement; move on
+			}
+		}
+	}
+	return Overlaps;
+}
+
+bool FAIDAActionSeam::ResolveManifoldLane(UObject* WorldContext, const FAIDADismantleSpec& Selector,
+	bool bPipe, bool bOutput, int32 PortIndex, int32& OutLane, int32& OutRowsOnSide)
+{
+	OutLane = 0;
+	OutRowsOnSide = 1;
+
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	const FString WantedName = NormalizeName(Selector.Buildable);
+	if (!Subsystem || WantedName.IsEmpty()) { return false; }
+
+	const FVector CenterCm = Selector.CenterM * AIDAMetersToCm;
+	const double RadiusSq = FMath::Square(Selector.RadiusM * AIDAMetersToCm);
+
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (!IsValid(Buildable)) { continue; }
+		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+		if (!NormalizeName(BuildableDisplayName(Buildable)).Contains(WantedName)) { continue; }
+
+		// Census of the whole side — connected ports count too, so the lane never shifts between
+		// runs as ports fill up.
+		int32 PipePorts = 0;
+		{
+			TInlineComponentArray<UFGPipeConnectionComponent*> Connections;
+			Buildable->GetComponents(Connections);
+			for (const UFGPipeConnectionComponent* Conn : Connections)
+			{
+				if (Conn && Conn->GetPipeConnectionType() ==
+					(bOutput ? EPipeConnectionType::PCT_PRODUCER : EPipeConnectionType::PCT_CONSUMER))
+				{
+					++PipePorts;
+				}
+			}
+		}
+		int32 BeltPorts = 0;
+		{
+			TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
+			Buildable->GetComponents(Connections);
+			for (const UFGFactoryConnectionComponent* Conn : Connections)
+			{
+				if (Conn && Conn->GetDirection() ==
+					(bOutput ? EFactoryConnectionDirection::FCD_OUTPUT : EFactoryConnectionDirection::FCD_INPUT))
+				{
+					++BeltPorts;
+				}
+			}
+		}
+
+		OutRowsOnSide = FMath::Max(1, PipePorts + BeltPorts);
+		OutLane = bPipe
+			? FMath::Clamp(PortIndex, 0, FMath::Max(0, PipePorts - 1))
+			: PipePorts + FMath::Clamp(PortIndex, 0, FMath::Max(0, BeltPorts - 1));
+		return true;
+	}
+	return false;
 }
