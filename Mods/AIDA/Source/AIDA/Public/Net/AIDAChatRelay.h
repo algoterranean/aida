@@ -9,6 +9,9 @@
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAIDAOnMsgBeginDelegate, const FAIDAMessageHeader&, Header);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FAIDAOnMsgChunkDelegate, const FGuid&, Id, const FString&, Delta);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAIDAOnMsgEndDelegate, const FGuid&, Id);
+//~ Phase 5 upload progress (owning client only — fired via the player's RCO, not multicast).
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FAIDAOnUploadAckDelegate, int32, UpToSeq);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FAIDAOnUploadResultDelegate, bool, bOk, const FGuid&, ImageId, const FString&, Error);
 
 /**
  * Server-authoritative, always-relevant replicated subsystem actor (SpawnOnServer_Replicate).
@@ -61,6 +64,12 @@ public:
 	/** Client→server: request the recent transcript (call on widget construct / late join). */
 	UFUNCTION(BlueprintCallable, Category = "AIDA")
 	void RequestRecentTranscript();
+
+	//~ Phase 5: chunked image upload + multimodal send, via the local player's RCO (widget send path).
+	void BeginImageUpload(const FString& MediaType, int32 TotalBytes, int32 ChunkCount);
+	void SendImageUploadChunk(int32 Seq, const TArray<uint8>& Data);
+	void CommitImageUpload(uint32 Crc32);
+	void SubmitChatWithImages(const FString& Text, const FGuid& ConversationId, const TArray<FGuid>& ImageIds);
 	//~ End client view
 
 	/** Fired on the client when a message header first arrives. */
@@ -74,6 +83,14 @@ public:
 	/** Fired on the client when a message completes (hash verified, or after recovery). */
 	UPROPERTY(BlueprintAssignable, Category = "AIDA")
 	FAIDAOnMsgEndDelegate OnMsgEnd;
+
+	/** Fired on the owning client as upload chunks are acked (-1 = session opened; Phase 5). */
+	UPROPERTY(BlueprintAssignable, Category = "AIDA")
+	FAIDAOnUploadAckDelegate OnUploadAck;
+
+	/** Fired on the owning client with the terminal upload outcome (Phase 5). */
+	UPROPERTY(BlueprintAssignable, Category = "AIDA")
+	FAIDAOnUploadResultDelegate OnUploadResult;
 
 	//~ Replicated RPCs (reliable). Public so UHT can generate them; call only via the Server* API.
 	UFUNCTION(NetMulticast, Reliable)

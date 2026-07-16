@@ -19,11 +19,13 @@ uint32 FAIDASessionManager::HashBody(const FString& Body)
 	return FCrc::StrCrc32(*Body);
 }
 
-void FAIDASessionManager::Store(const FAIDAMessageHeader& Header, const FString& Body)
+void FAIDASessionManager::Store(const FAIDAMessageHeader& Header, const FString& Body,
+	const TArray<FGuid>& ImageIds)
 {
 	FAIDATranscriptEntry Entry;
 	Entry.Header = Header;
 	Entry.Body = Body;
+	Entry.ImageIds = ImageIds;
 	const int32 Index = Transcript.Add(MoveTemp(Entry));
 	IndexById.Add(Header.Id, Index);
 	Prune();
@@ -53,15 +55,17 @@ FAIDATranscriptEntry* FAIDASessionManager::Find(const FGuid& Id)
 	return nullptr;
 }
 
-FGuid FAIDASessionManager::PostPlayerMessage(const FString& Author, const FString& Text, const FGuid& ConversationId)
+FGuid FAIDASessionManager::PostPlayerMessage(const FString& Author, const FString& Text, const FGuid& ConversationId,
+	const TArray<FGuid>& ImageIds)
 {
 	FAIDAMessageHeader Header;
 	Header.Id = FGuid::NewGuid();
 	Header.ConversationId = ConversationId;
 	Header.Author = Author;
 	Header.Kind = EAIDAMsgKind::Player;
+	Header.ImageCount = ImageIds.Num();
 
-	Store(Header, Text);
+	Store(Header, Text, ImageIds);
 
 	if (AAIDAChatRelay* R = Relay.Get())
 	{

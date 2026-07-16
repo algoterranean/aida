@@ -31,7 +31,33 @@ namespace
 
 		const TSharedRef<FJsonObject> M = MakeShared<FJsonObject>();
 		M->SetStringField(TEXT("role"), Msg.Role);
-		M->SetStringField(TEXT("content"), Msg.Content);
+		if (Msg.Images.Num() > 0)
+		{
+			// Multimodal user turn: content becomes a part array (image_url data URLs, then text).
+			TArray<TSharedPtr<FJsonValue>> Parts;
+			for (const FAIDAImagePart& Img : Msg.Images)
+			{
+				const TSharedRef<FJsonObject> Url = MakeShared<FJsonObject>();
+				Url->SetStringField(TEXT("url"),
+					FString::Printf(TEXT("data:%s;base64,%s"), *Img.MediaType, *Img.Base64Data));
+				const TSharedRef<FJsonObject> P = MakeShared<FJsonObject>();
+				P->SetStringField(TEXT("type"), TEXT("image_url"));
+				P->SetObjectField(TEXT("image_url"), Url);
+				Parts.Add(MakeShared<FJsonValueObject>(P));
+			}
+			if (!Msg.Content.IsEmpty())
+			{
+				const TSharedRef<FJsonObject> P = MakeShared<FJsonObject>();
+				P->SetStringField(TEXT("type"), TEXT("text"));
+				P->SetStringField(TEXT("text"), Msg.Content);
+				Parts.Add(MakeShared<FJsonValueObject>(P));
+			}
+			M->SetArrayField(TEXT("content"), Parts);
+		}
+		else
+		{
+			M->SetStringField(TEXT("content"), Msg.Content);
+		}
 		if (Msg.ToolCalls.Num() > 0)
 		{
 			TArray<TSharedPtr<FJsonValue>> Calls;

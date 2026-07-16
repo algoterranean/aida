@@ -327,3 +327,48 @@ void AAIDAChatRelay::RequestRecentTranscript()
 		RCO->ServerRequestRecentTranscript();
 	}
 }
+
+void AAIDAChatRelay::BeginImageUpload(const FString& MediaType, int32 TotalBytes, int32 ChunkCount)
+{
+	if (UAIDARemoteCallObject* RCO = GetLocalRCO())
+	{
+		RCO->ServerBeginImageUpload(MediaType, TotalBytes, ChunkCount);
+	}
+	else
+	{
+		OnUploadResult.Broadcast(false, FGuid(), TEXT("no local RCO available"));
+	}
+}
+
+void AAIDAChatRelay::SendImageUploadChunk(int32 Seq, const TArray<uint8>& Data)
+{
+	if (UAIDARemoteCallObject* RCO = GetLocalRCO())
+	{
+		RCO->ServerImageUploadChunk(Seq, Data);
+	}
+}
+
+void AAIDAChatRelay::CommitImageUpload(uint32 Crc32)
+{
+	if (UAIDARemoteCallObject* RCO = GetLocalRCO())
+	{
+		RCO->ServerCommitImageUpload(Crc32);
+	}
+}
+
+void AAIDAChatRelay::SubmitChatWithImages(const FString& Text, const FGuid& ConversationId, const TArray<FGuid>& ImageIds)
+{
+	if (ImageIds.Num() == 0)
+	{
+		SubmitChat(Text, ConversationId);
+		return;
+	}
+	if (UAIDARemoteCallObject* RCO = GetLocalRCO())
+	{
+		RCO->ServerSendChatWithImages(Text, ConversationId, ImageIds);
+	}
+	else
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[relay] SubmitChatWithImages: no local RCO available."));
+	}
+}

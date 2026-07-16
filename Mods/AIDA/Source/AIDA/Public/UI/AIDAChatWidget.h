@@ -19,6 +19,32 @@ class UTextBlock;
 /** Broadcast whenever the rendered transcript string changes (for optional BP text bindings). */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnAIDATranscriptChanged, const FString&, Transcript);
 
+/** A small button that carries a list index and reports clicks via a native delegate (chip ✕). */
+UCLASS()
+class UAIDAIndexButton : public UButton
+{
+	GENERATED_BODY()
+
+public:
+	int32 Index = INDEX_NONE;
+
+	DECLARE_MULTICAST_DELEGATE_OneParam(FAIDAOnIndexClicked, int32);
+	FAIDAOnIndexClicked OnIndexClickedNative;
+
+	void InitIndex(int32 InIndex)
+	{
+		Index = InIndex;
+		if (!OnClicked.IsAlreadyBound(this, &UAIDAIndexButton::Forward))
+		{
+			OnClicked.AddDynamic(this, &UAIDAIndexButton::Forward);
+		}
+	}
+
+private:
+	UFUNCTION()
+	void Forward() { OnIndexClickedNative.Broadcast(Index); }
+};
+
 /** A tab button that carries its conversation id and reports clicks via a native delegate. */
 UCLASS()
 class UAIDATabButton : public UButton
@@ -238,4 +264,58 @@ private:
 	void HandleApproveClicked();
 	UFUNCTION()
 	void HandleRejectClicked();
+
+	//~ Phase 5 attachments (docs/PHASE5.md §5). Reference images picked from disk, normalized to
+	//~ JPEG client-side, uploaded in ack-paced chunks, then referenced by id on the next send.
+	struct FPendingAttachment
+	{
+		FString FileName;
+		TArray<uint8> Jpeg;      // normalized payload (cleared once committed server-side)
+		FGuid ImageId;           // set by the server's upload result; valid = ready to send
+		int32 ChunkCount = 0;
+		int32 NextChunk = 0;     // next chunk to put on the wire
+		bool bUploading = false;
+		bool bFailed = false;
+		FString Error;
+	};
+	TMap<FGuid, TArray<FPendingAttachment>> PendingAttachments; // conversation id -> its chips
+
+	/** Client-side long-edge target for normalization (matches the uploads.maxDimension default). */
+	static constexpr int32 kClientMaxImageDim = 1568;
+	/** Client-side cap on chips per conversation (server enforces uploads.maxImagesPerMessage). */
+	static constexpr int32 kMaxAttachmentsPerMessage = 4;
+	/** Chunks allowed in flight beyond the last ack (reliable-buffer safety, docs/PHASE5.md §3). */
+	static constexpr int32 kUploadWindow = 2;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> AttachButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UHorizontalBox> AttachmentChips;
+
+	/** Build the attach button + (initially empty) chip row around the input box. */
+	void BuildAttachmentRow(class UFont* GameFont, float FontSize, float Margin, float BottomInset,
+		float InputHeight, float RowGap, float RightAnchor);
+
+	UFUNCTION()
+	void HandleAttachClicked();
+
+	/** Load + normalize a file from the client's disk and queue it as a chip on the current tab. */
+	void StartAttach(const FString& FilePath);
+
+	/** Kick the next queued attachment's upload if none is in flight (one per player, server rule). */
+	void StartNextUpload();
+
+	/** The attachment currently uploading, or null. */
+	FPendingAttachment* FindUploading(FGuid* OutConversation = nullptr);
+
+	/** Re-render the chip row for the current conversation. */
+	void RebuildAttachmentChips();
+
+	void HandleChipRemoveClicked(int32 Index);
+
+	UFUNCTION()
+	void HandleUploadAck(int32 UpToSeq);
+	UFUNCTION()
+	void HandleUploadResult(bool bOk, const FGuid& ImageId, const FString& Error);
 };

@@ -43,8 +43,16 @@ public class AIDA : ModuleRules
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			"AbstractInstance"             // resolve lightweight-instance aim hits to real buildables (Actions/)
+			"AbstractInstance",            // resolve lightweight-instance aim hits to real buildables (Actions/)
+			"ImageWrapper"                 // Phase 5: decode/validate uploads (server) + normalize attachments (client)
 		});
+
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			// Phase 5 attach dialog: Win32 GetOpenFileNameW (DesktopPlatform is a Developer module
+			// and does not link in the Shipping game target).
+			PublicSystemLibraries.Add("Comdlg32.lib");
+		}
 
 		DynamicallyLoadedModuleNames.AddRange(new string[] {
 			// ... add any modules that your module loads dynamically here ...

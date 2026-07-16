@@ -25,6 +25,16 @@ struct FAIDAToolResultPart
 	bool bIsError = false;
 };
 
+/**
+ * One image attached to a user turn (Phase 5). Base64Data is encoded once when the upload is
+ * committed server-side and reused verbatim on every request that replays the turn.
+ */
+struct FAIDAImagePart
+{
+	FString MediaType; // e.g. "image/jpeg" (client normalization re-encodes everything to JPEG)
+	FString Base64Data;
+};
+
 struct FAIDAChatMessage
 {
 	FString Role;    // "user" | "assistant"
@@ -34,6 +44,8 @@ struct FAIDAChatMessage
 	TArray<FAIDAToolCall> ToolCalls;
 	/** User turn: the tool_result blocks answering a prior assistant turn's tool_use blocks. */
 	TArray<FAIDAToolResultPart> ToolResults;
+	/** User turn: reference images preceding the text (Phase 5 vision). */
+	TArray<FAIDAImagePart> Images;
 };
 
 /** Wire tool definition sent to the model. InputSchemaJson is a JSON-Schema object string ("" => empty object). */

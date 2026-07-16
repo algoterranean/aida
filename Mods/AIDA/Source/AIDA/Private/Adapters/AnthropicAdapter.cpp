@@ -58,6 +58,30 @@ namespace
 			}
 			M->SetArrayField(TEXT("content"), Blocks);
 		}
+		else if (Msg.Images.Num() > 0)
+		{
+			// A user turn with reference images: image blocks first, then the text block.
+			TArray<TSharedPtr<FJsonValue>> Blocks;
+			for (const FAIDAImagePart& Img : Msg.Images)
+			{
+				const TSharedRef<FJsonObject> Src = MakeShared<FJsonObject>();
+				Src->SetStringField(TEXT("type"), TEXT("base64"));
+				Src->SetStringField(TEXT("media_type"), Img.MediaType);
+				Src->SetStringField(TEXT("data"), Img.Base64Data);
+				const TSharedRef<FJsonObject> B = MakeShared<FJsonObject>();
+				B->SetStringField(TEXT("type"), TEXT("image"));
+				B->SetObjectField(TEXT("source"), Src);
+				Blocks.Add(MakeShared<FJsonValueObject>(B));
+			}
+			if (!Msg.Content.IsEmpty())
+			{
+				const TSharedRef<FJsonObject> T = MakeShared<FJsonObject>();
+				T->SetStringField(TEXT("type"), TEXT("text"));
+				T->SetStringField(TEXT("text"), Msg.Content);
+				Blocks.Add(MakeShared<FJsonValueObject>(T));
+			}
+			M->SetArrayField(TEXT("content"), Blocks);
+		}
 		else
 		{
 			M->SetStringField(TEXT("content"), Msg.Content);

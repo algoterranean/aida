@@ -181,6 +181,74 @@ void UAIDARemoteCallObject::ServerAdjustProposal_Implementation(const FVector& D
 	}
 }
 
+bool UAIDARemoteCallObject::ServerBeginImageUpload_Validate(const FString& MediaType, int32 TotalBytes, int32 ChunkCount)
+{
+	// Structural sanity only; real caps (config, budgets) are enforced in the orchestrator.
+	return MediaType.Len() <= 64 && TotalBytes > 0 && ChunkCount > 0
+		&& ChunkCount <= FAIDAImageUploadAssembler::kMaxChunkCount;
+}
+
+void UAIDARemoteCallObject::ServerBeginImageUpload_Implementation(const FString& MediaType, int32 TotalBytes, int32 ChunkCount)
+{
+	UWorld* World = GetWorld();
+	UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr;
+	FString Error = TEXT("AIDA is not running on this server");
+	if (Orchestrator && Orchestrator->HandleImageUploadBegin(ResolveRequester(), MediaType, TotalBytes, ChunkCount, Error))
+	{
+		ClientImageUploadAck(-1); // session open — send the first window
+		return;
+	}
+	ClientImageUploadResult(false, FGuid(), Error);
+}
+
+bool UAIDARemoteCallObject::ServerImageUploadChunk_Validate(int32 Seq, const TArray<uint8>& Data)
+{
+	return Seq >= 0 && Seq < FAIDAImageUploadAssembler::kMaxChunkCount
+		&& Data.Num() > 0 && Data.Num() <= FAIDAImageUploadAssembler::kChunkBytes;
+}
+
+void UAIDARemoteCallObject::ServerImageUploadChunk_Implementation(int32 Seq, const TArray<uint8>& Data)
+{
+	UWorld* World = GetWorld();
+	UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr;
+	FString Error = TEXT("AIDA is not running on this server");
+	if (Orchestrator && Orchestrator->HandleImageUploadChunk(ResolveRequester(), Seq, Data, Error))
+	{
+		ClientImageUploadAck(Seq);
+		return;
+	}
+	ClientImageUploadResult(false, FGuid(), Error);
+}
+
+bool UAIDARemoteCallObject::ServerCommitImageUpload_Validate(uint32 Crc32)
+{
+	return true;
+}
+
+void UAIDARemoteCallObject::ServerCommitImageUpload_Implementation(uint32 Crc32)
+{
+	UWorld* World = GetWorld();
+	UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr;
+	FString Error = TEXT("AIDA is not running on this server");
+	FGuid ImageId;
+	const bool bOk = Orchestrator && Orchestrator->HandleImageUploadCommit(ResolveRequester(), Crc32, ImageId, Error);
+	ClientImageUploadResult(bOk, ImageId, bOk ? FString() : Error);
+}
+
+bool UAIDARemoteCallObject::ServerSendChatWithImages_Validate(const FString& Text, const FGuid& ConversationId, const TArray<FGuid>& ImageIds)
+{
+	return Text.Len() <= kMaxChatChars && ImageIds.Num() <= 8;
+}
+
+void UAIDARemoteCallObject::ServerSendChatWithImages_Implementation(const FString& Text, const FGuid& ConversationId, const TArray<FGuid>& ImageIds)
+{
+	UWorld* World = GetWorld();
+	if (UAIDAOrchestrator* Orchestrator = World ? World->GetSubsystem<UAIDAOrchestrator>() : nullptr)
+	{
+		Orchestrator->HandleChatRequest(ResolveRequester(), Text, ConversationId, ImageIds);
+	}
+}
+
 FAIDARequester UAIDARemoteCallObject::ResolveRequester() const
 {
 	FAIDARequester Requester;
@@ -219,5 +287,21 @@ void UAIDARemoteCallObject::ClientReceiveTranscript_Implementation(const TArray<
 	if (AAIDAChatRelay* Relay = FindLocalRelay(GetWorld()))
 	{
 		Relay->ClientApplyTranscript(Entries);
+	}
+}
+
+void UAIDARemoteCallObject::ClientImageUploadAck_Implementation(int32 UpToSeq)
+{
+	if (AAIDAChatRelay* Relay = FindLocalRelay(GetWorld()))
+	{
+		Relay->OnUploadAck.Broadcast(UpToSeq);
+	}
+}
+
+void UAIDARemoteCallObject::ClientImageUploadResult_Implementation(bool bOk, const FGuid& ImageId, const FString& Error)
+{
+	if (AAIDAChatRelay* Relay = FindLocalRelay(GetWorld()))
+	{
+		Relay->OnUploadResult.Broadcast(bOk, ImageId, Error);
 	}
 }

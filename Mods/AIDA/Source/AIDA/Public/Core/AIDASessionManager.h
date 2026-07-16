@@ -21,8 +21,10 @@ public:
 	/** The relay used for network fan-out. Weak: the actor's lifetime is the world's, not ours. */
 	void SetRelay(AAIDAChatRelay* InRelay);
 
-	/** Post a complete player line to a conversation: stores it and fans out Begin + body + End. */
-	FGuid PostPlayerMessage(const FString& Author, const FString& Text, const FGuid& ConversationId);
+	/** Post a complete player line to a conversation: stores it and fans out Begin + body + End.
+	 *  ImageIds (Phase 5) are stored on the entry for context building; clients only see the count. */
+	FGuid PostPlayerMessage(const FString& Author, const FString& Text, const FGuid& ConversationId,
+		const TArray<FGuid>& ImageIds = TArray<FGuid>());
 
 	/** Open a streaming AIDA reply in a conversation (fans out Begin with an empty body). */
 	FGuid BeginAIDAMessage(const FString& Author, const FGuid& ConversationId);
@@ -50,7 +52,8 @@ private:
 	TMap<FGuid, int32> IndexById;            // id → index into Transcript
 	int32 MaxMessages;
 
-	void Store(const FAIDAMessageHeader& Header, const FString& Body);
+	void Store(const FAIDAMessageHeader& Header, const FString& Body,
+		const TArray<FGuid>& ImageIds = TArray<FGuid>());
 	void Prune();
 	FAIDATranscriptEntry* Find(const FGuid& Id);
 	static uint32 HashBody(const FString& Body);

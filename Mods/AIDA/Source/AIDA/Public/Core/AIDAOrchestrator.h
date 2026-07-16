@@ -11,6 +11,7 @@
 #include "Map/AIDAMapService.h"       // TTL-cached resource-node scan
 #include "Recipes/AIDARecipeService.h" // TTL-cached static recipe + building catalog
 #include "Memory/AIDAMemory.h"          // Phase 3 persistence facade (in-save + sidecar)
+#include "Core/AIDAImageStore.h"        // Phase 5 reference-image store + chunked-upload assembler
 #include "Actions/AIDAActionEngine.h"   // Phase 4 proposal pipeline (store + approve/execute coordinator)
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
@@ -49,6 +50,24 @@ public:
 	//~ Server API — called from the per-player RCO (authority only). See Net/AIDARemoteCallObject.
 	/** Handle an inbound player chat line for a conversation: record it, then stream an AIDA reply out. */
 	void HandleChatRequest(const FAIDARequester& Requester, const FString& Text, const FGuid& ConversationId);
+
+	/**
+	 * Phase 5 multimodal chat: Text plus reference-image ids the requester uploaded earlier this
+	 * session. Ids are validated against the store (owner + liveness); the survivors ride the player
+	 * turn into the LLM as image content blocks (docs/PHASE5.md §1).
+	 */
+	void HandleChatRequest(const FAIDARequester& Requester, const FString& Text, const FGuid& ConversationId,
+		const TArray<FGuid>& ImageIds);
+
+	//~ Phase 5 chunked image upload (docs/PHASE5.md §3). Called synchronously from the RCO; a false
+	//~ return + OutError means the RCO should notify the owning client and consider the upload dead.
+	bool HandleImageUploadBegin(const FAIDARequester& Requester, const FString& MediaType,
+		int32 TotalBytes, int32 ChunkCount, FString& OutError);
+	bool HandleImageUploadChunk(const FAIDARequester& Requester, int32 Seq, const TArray<uint8>& Data,
+		FString& OutError);
+	bool HandleImageUploadCommit(const FAIDARequester& Requester, uint32 Crc32, FGuid& OutImageId,
+		FString& OutError);
+	bool AreUploadsEnabled() const { return bConfigLoaded && Config.Uploads.bEnabled; }
 
 	/** Authoritative full body for one message (recovery). False if it aged out of the transcript. */
 	bool GetMessageBody(const FGuid& Id, FAIDATranscriptEntry& OutEntry) const;
@@ -214,6 +233,9 @@ private:
 	static constexpr double PackTtlSeconds = 300.0;
 	FAIDAMemory Memory;
 	FAIDAActionEngine Actions;
+	//~ Phase 5: uploaded reference images (server RAM only) + per-player upload reassembly.
+	FAIDAImageStore ImageStore;
+	FAIDAImageUploadAssembler ImageUploads;
 	IConsoleCommand* PingCommand = nullptr;
 	IConsoleCommand* SayCommand = nullptr;
 	IConsoleCommand* ToolPingCommand = nullptr;

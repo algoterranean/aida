@@ -86,6 +86,25 @@ struct FAIDAActionsConfig
 };
 
 USTRUCT()
+struct FAIDAUploadsConfig
+{
+	GENERATED_BODY()
+
+	/** Master gate: off ⇒ upload RPCs refuse and the attach UI affordance is hidden. */
+	UPROPERTY() bool bEnabled = true;
+	/** Post-normalization per-image byte ceiling (server-checked on commit). */
+	UPROPERTY() int32 MaxImageBytes = 3 * 1024 * 1024;
+	UPROPERTY() int32 MaxImagesPerMessage = 4;
+	/** Cap on images attached across the whole history window of one LLM request (newest win). */
+	UPROPERTY() int32 MaxImagesPerRequest = 4;
+	/** Client downscale target (long edge, px); server rejects decoded images beyond 2× this. */
+	UPROPERTY() int32 MaxDimension = 1568;
+	UPROPERTY() int32 MaxStoredImages = 16;
+	/** TTL for uploads never referenced by a sent message; referenced images follow the transcript. */
+	UPROPERTY() int32 TtlSeconds = 600;
+};
+
+USTRUCT()
 struct FAIDAPromptsConfig
 {
 	GENERATED_BODY()
@@ -107,5 +126,6 @@ struct FAIDAConfig
 	UPROPERTY() FAIDAPrivacyConfig Privacy;
 	UPROPERTY() FAIDASnapshotsConfig Snapshots;
 	UPROPERTY() FAIDAActionsConfig Actions;
+	UPROPERTY() FAIDAUploadsConfig Uploads;
 	UPROPERTY() FAIDAPromptsConfig Prompts;
 };

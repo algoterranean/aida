@@ -1,6 +1,8 @@
 #include "UI/AIDAChatWidget.h"
 
 #include "AIDA.h"
+#include "Core/AIDAImageNormalize.h"
+#include "Core/AIDAImageStore.h" // FAIDAImageUploadAssembler::kChunkBytes (shared wire constant)
 #include "Net/AIDAChatRelay.h"
 #include "Net/AIDAProposalRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
@@ -23,7 +25,17 @@
 #include "Engine/World.h"
 #include "Styling/CoreStyle.h"
 #include "TimerManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "UI/AIDAMarkdown.h"
+
+#if PLATFORM_WINDOWS
+// Attach-file dialog: raw Win32 (DesktopPlatform is a Developer module — absent in Shipping).
+#include "Windows/WindowsHWrapper.h"
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <commdlg.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
 
 void UAIDAChatWidget::NativeConstruct()
 {
@@ -63,6 +75,7 @@ void UAIDAChatWidget::NativeConstruct()
 	constexpr float Margin          = 20.f;  // outer margin from screen edges
 	constexpr float InputHeight     = 44.f;  // height of the input box / Send button row
 	constexpr float SendWidth       = 140.f; // width of the Send button
+	constexpr float AttachWidth     = 44.f;  // width of the attach (+) button left of the input box
 	constexpr float RowGap          = 12.f;  // gap between transcript, input box, and Send button
 	constexpr float ToolbarClearance= 96.f;  // approx Satisfactory hotbar height to clear at the bottom
 	constexpr float FontSize        = 10.f;  // small, like the native chat
@@ -78,12 +91,12 @@ void UAIDAChatWidget::NativeConstruct()
 		CanvasSlot->SetAnchors(FAnchors(0.f, 0.f, RightAnchor, 1.f));
 		CanvasSlot->SetOffsets(FMargin(Margin, TranscriptTop, Margin, BottomInset + InputHeight + RowGap));
 	}
-	// Input box: bottom row of the left half, leaving room for the Send button on the right.
+	// Input box: bottom row of the left half, between the attach button and the Send button.
 	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(InputBox ? InputBox->Slot : nullptr))
 	{
 		CanvasSlot->SetAnchors(FAnchors(0.f, 1.f, RightAnchor, 1.f));
 		CanvasSlot->SetAlignment(FVector2D(0.f, 1.f));
-		CanvasSlot->SetOffsets(FMargin(Margin, -BottomInset, SendWidth + RowGap + Margin, InputHeight));
+		CanvasSlot->SetOffsets(FMargin(Margin + AttachWidth + RowGap, -BottomInset, SendWidth + RowGap + Margin, InputHeight));
 	}
 	// Send button: pinned to the right edge of the left half, aligned with the input row.
 	if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(SendButton ? SendButton->Slot : nullptr))
@@ -147,6 +160,9 @@ void UAIDAChatWidget::NativeConstruct()
 	// Proposal card (Phase 4): top of the unused right half, collapsed until a proposal is pending.
 	BuildProposalPanel(GameFont, FontSize);
 
+	// Attach button + pending-attachment chip row (Phase 5).
+	BuildAttachmentRow(GameFont, FontSize, Margin, BottomInset, InputHeight, RowGap, RightAnchor);
+
 	// Create the default conversation tab and render it (more tabs appear as conversations arrive).
 	EnsureConversation(CurrentConversationId);
 	RenderActiveConversation();
@@ -199,6 +215,8 @@ bool UAIDAChatWidget::TryBindRelay()
 	Found->OnMsgBegin.AddDynamic(this, &UAIDAChatWidget::HandleMsgBegin);
 	Found->OnMsgChunk.AddDynamic(this, &UAIDAChatWidget::HandleMsgChunk);
 	Found->OnMsgEnd.AddDynamic(this, &UAIDAChatWidget::HandleMsgEnd);
+	Found->OnUploadAck.AddDynamic(this, &UAIDAChatWidget::HandleUploadAck);
+	Found->OnUploadResult.AddDynamic(this, &UAIDAChatWidget::HandleUploadResult);
 
 	// Replay whatever transcript this client already assembled, then pull anything it missed (late join).
 	// Route through the Handle* path so the native default view and any BP view both get populated.
@@ -223,6 +241,8 @@ void UAIDAChatWidget::UnbindRelay()
 		R->OnMsgBegin.RemoveDynamic(this, &UAIDAChatWidget::HandleMsgBegin);
 		R->OnMsgChunk.RemoveDynamic(this, &UAIDAChatWidget::HandleMsgChunk);
 		R->OnMsgEnd.RemoveDynamic(this, &UAIDAChatWidget::HandleMsgEnd);
+		R->OnUploadAck.RemoveDynamic(this, &UAIDAChatWidget::HandleUploadAck);
+		R->OnUploadResult.RemoveDynamic(this, &UAIDAChatWidget::HandleUploadResult);
 	}
 	Relay.Reset();
 
@@ -508,6 +528,12 @@ void UAIDAChatWidget::HandleMsgBegin(const FAIDAMessageHeader& Header)
 		Msg.Id = Header.Id;
 		Msg.bSystem = bSystem;
 		Msg.Prefix = FString::Printf(TEXT("<%s>%s:</> "), Tag, *Header.Author);
+		if (Header.ImageCount > 0)
+		{
+			// Attachment marker only — pixels never replicate to other clients (docs/PHASE5.md).
+			Msg.Prefix += FString::Printf(TEXT("[+%d image%s] "), Header.ImageCount,
+				Header.ImageCount == 1 ? TEXT("") : TEXT("s"));
+		}
 		View.IndexById.Add(Header.Id, View.Messages.Add(MoveTemp(Msg)));
 	}
 	if (Header.ConversationId == CurrentConversationId) { RenderActiveConversation(); }
@@ -554,6 +580,7 @@ void UAIDAChatWidget::SwitchToConversation(const FGuid& ConvId)
 	EnsureConversation(ConvId);
 	RebuildTabBar();
 	RenderActiveConversation();
+	RebuildAttachmentChips(); // chips are per conversation and follow the active tab
 	FocusInput();
 }
 
@@ -574,12 +601,64 @@ void UAIDAChatWidget::HandleSendClicked()
 		return;
 	}
 	const FString Text = InputBox->GetText().ToString();
-	if (Text.IsEmpty())
+
+	// `/aida attach [path]` is the ONE chat command parsed client-side — the path lives on THIS
+	// machine's disk, so the server parser can never resolve it. No arg = open the file dialog.
+	if (Text.TrimStartAndEnd().StartsWith(TEXT("/aida attach"), ESearchCase::IgnoreCase))
+	{
+		FString PathArg = Text.TrimStartAndEnd().Mid(12).TrimStartAndEnd();
+		PathArg = PathArg.TrimQuotes();
+		RecordInputHistory(Text);
+		InputBox->SetText(FText::GetEmpty());
+		RefocusInput();
+		if (PathArg.IsEmpty())
+		{
+			HandleAttachClicked();
+		}
+		else
+		{
+			StartAttach(PathArg);
+		}
+		return;
+	}
+
+	// Attach the chips that finished uploading (they leave the row); still-uploading or failed
+	// chips stay pending for a later send so nothing silently detaches.
+	TArray<FGuid> ReadyIds;
+	if (TArray<FPendingAttachment>* List = PendingAttachments.Find(CurrentConversationId))
+	{
+		for (int32 i = List->Num() - 1; i >= 0; --i)
+		{
+			if ((*List)[i].ImageId.IsValid() && !(*List)[i].bFailed)
+			{
+				ReadyIds.Insert((*List)[i].ImageId, 0);
+				List->RemoveAt(i);
+			}
+		}
+	}
+
+	if (Text.IsEmpty() && ReadyIds.Num() == 0)
 	{
 		return;
 	}
-	SendChat(Text);
-	RecordInputHistory(Text);
+
+	if (ReadyIds.Num() > 0)
+	{
+		if (AAIDAChatRelay* R = Relay.Get())
+		{
+			R->SubmitChatWithImages(Text, CurrentConversationId, ReadyIds);
+		}
+		RebuildAttachmentChips();
+	}
+	else
+	{
+		SendChat(Text);
+	}
+
+	if (!Text.IsEmpty())
+	{
+		RecordInputHistory(Text);
+	}
 	InputBox->SetText(FText::GetEmpty());
 	RefocusInput();
 }
@@ -786,5 +865,293 @@ void UAIDAChatWidget::RebuildTabBar()
 	{
 		PSlot->SetPadding(FMargin(6.f, 0.f, 2.f, 0.f));
 		PSlot->SetVerticalAlignment(VAlign_Fill);
+	}
+}
+
+//~ ─────────────────────── Phase 5: reference-image attachments ───────────────────────
+
+void UAIDAChatWidget::BuildAttachmentRow(UFont* GameFont, float FontSize, float Margin,
+	float BottomInset, float InputHeight, float RowGap, float RightAnchor)
+{
+	UPanelWidget* RootPanel = Cast<UPanelWidget>(GetRootWidget());
+	if (!RootPanel || !WidgetTree)
+	{
+		return;
+	}
+
+	const auto MakeLabel = [this, GameFont, FontSize](const FString& Text, const FLinearColor& Color) -> UTextBlock*
+	{
+		UTextBlock* Block = WidgetTree->ConstructWidget<UTextBlock>();
+		Block->SetText(FText::FromString(Text));
+		FSlateFontInfo Font = GameFont ? FSlateFontInfo(GameFont, static_cast<int32>(FontSize)) : Block->GetFont();
+		Font.Size = FontSize;
+		Font.OutlineSettings.OutlineSize = 0;
+		Font.OutlineSettings.OutlineColor = FLinearColor::Transparent;
+		Block->SetFont(Font);
+		Block->SetColorAndOpacity(FSlateColor(Color));
+		return Block;
+	};
+
+	// Attach button: bottom-left, square, in the slot the input box was shifted right to clear.
+	AttachButton = WidgetTree->ConstructWidget<UButton>();
+	AttachButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleAttachClicked);
+	AttachButton->SetToolTipText(FText::FromString(TEXT("Attach a reference image (or type /aida attach <path>)")));
+	AttachButton->AddChild(MakeLabel(TEXT("+img"), FLinearColor(0.9f, 0.9f, 0.9f, 1.0f)));
+	if (UCanvasPanelSlot* BtnSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(AttachButton)))
+	{
+		BtnSlot->SetAnchors(FAnchors(0.f, 1.f, 0.f, 1.f));
+		BtnSlot->SetAlignment(FVector2D(0.f, 1.f));
+		BtnSlot->SetOffsets(FMargin(Margin, -BottomInset, 44.f, InputHeight));
+	}
+
+	// Chip row: hugs the top edge of the input row (overlaying the transcript's last pixels is fine
+	// — the row is empty and hit-test-invisible until something is attached).
+	AttachmentChips = WidgetTree->ConstructWidget<UHorizontalBox>();
+	if (UCanvasPanelSlot* ChipSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(AttachmentChips)))
+	{
+		ChipSlot->SetAnchors(FAnchors(0.f, 1.f, RightAnchor, 1.f));
+		ChipSlot->SetAlignment(FVector2D(0.f, 1.f));
+		ChipSlot->SetOffsets(FMargin(Margin, -(BottomInset + InputHeight + 4.f), Margin, 24.f));
+	}
+}
+
+void UAIDAChatWidget::HandleAttachClicked()
+{
+#if PLATFORM_WINDOWS
+	TCHAR FileName[MAX_PATH] = { 0 };
+	OPENFILENAMEW Ofn = { 0 };
+	Ofn.lStructSize = sizeof(Ofn);
+	Ofn.hwndOwner = GetActiveWindow();
+	Ofn.lpstrFilter = TEXT("Images (*.jpg;*.jpeg;*.png;*.bmp)\0*.jpg;*.jpeg;*.png;*.bmp\0All files (*.*)\0*.*\0");
+	Ofn.lpstrFile = FileName;
+	Ofn.nMaxFile = MAX_PATH;
+	Ofn.lpstrTitle = TEXT("Attach a reference image");
+	Ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+	if (GetOpenFileNameW(&Ofn))
+	{
+		StartAttach(FString(FileName));
+	}
+#else
+	UE_LOG(LogAIDA, Warning, TEXT("[widget] file dialog unavailable on this platform — use /aida attach <path>."));
+#endif
+}
+
+void UAIDAChatWidget::StartAttach(const FString& FilePath)
+{
+	TArray<FPendingAttachment>& List = PendingAttachments.FindOrAdd(CurrentConversationId);
+	if (List.Num() >= kMaxAttachmentsPerMessage)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[widget] attachment limit (%d) reached for this conversation."),
+			kMaxAttachmentsPerMessage);
+		return;
+	}
+
+	FPendingAttachment Att;
+	Att.FileName = FPaths::GetCleanFilename(FilePath);
+
+	TArray<uint8> FileBytes;
+	FString Error;
+	if (!FFileHelper::LoadFileToArray(FileBytes, *FilePath))
+	{
+		Att.bFailed = true;
+		Att.Error = TEXT("could not read file");
+	}
+	else if (!AIDANormalizeImageBytes(FileBytes, kClientMaxImageDim, Att.Jpeg, Error))
+	{
+		Att.bFailed = true;
+		Att.Error = Error;
+	}
+	else
+	{
+		Att.ChunkCount = FMath::DivideAndRoundUp(Att.Jpeg.Num(), FAIDAImageUploadAssembler::kChunkBytes);
+	}
+
+	List.Add(MoveTemp(Att));
+	RebuildAttachmentChips();
+	StartNextUpload();
+}
+
+UAIDAChatWidget::FPendingAttachment* UAIDAChatWidget::FindUploading(FGuid* OutConversation)
+{
+	for (auto& Pair : PendingAttachments)
+	{
+		for (FPendingAttachment& Att : Pair.Value)
+		{
+			if (Att.bUploading)
+			{
+				if (OutConversation) { *OutConversation = Pair.Key; }
+				return &Att;
+			}
+		}
+	}
+	return nullptr;
+}
+
+void UAIDAChatWidget::StartNextUpload()
+{
+	if (FindUploading())
+	{
+		return; // one in-flight upload per player (the server keeps one session per PlayerId)
+	}
+	AAIDAChatRelay* R = Relay.Get();
+	if (!R)
+	{
+		return; // relay not bound yet; StartNextUpload re-runs on the next attach/result
+	}
+	for (auto& Pair : PendingAttachments)
+	{
+		for (FPendingAttachment& Att : Pair.Value)
+		{
+			if (!Att.bUploading && !Att.bFailed && !Att.ImageId.IsValid())
+			{
+				Att.bUploading = true;
+				Att.NextChunk = 0;
+				R->BeginImageUpload(TEXT("image/jpeg"), Att.Jpeg.Num(), Att.ChunkCount);
+				RebuildAttachmentChips();
+				return;
+			}
+		}
+	}
+}
+
+void UAIDAChatWidget::HandleUploadAck(int32 UpToSeq)
+{
+	FPendingAttachment* Att = FindUploading();
+	AAIDAChatRelay* R = Relay.Get();
+	if (!Att || !R)
+	{
+		return;
+	}
+
+	// Ack-paced window (docs/PHASE5.md §3): never more than kUploadWindow chunks beyond the ack.
+	// Claim the chunk index BEFORE sending: on a listen host the RPC round-trip is synchronous, so
+	// the next ack re-enters this handler before the line after the send runs.
+	while (Att->NextChunk < Att->ChunkCount && Att->NextChunk <= UpToSeq + kUploadWindow)
+	{
+		const int32 Seq = Att->NextChunk++;
+		const int32 Offset = Seq * FAIDAImageUploadAssembler::kChunkBytes;
+		const int32 Len = FMath::Min(FAIDAImageUploadAssembler::kChunkBytes, Att->Jpeg.Num() - Offset);
+		TArray<uint8> Chunk(Att->Jpeg.GetData() + Offset, Len);
+		R->SendImageUploadChunk(Seq, Chunk);
+	}
+
+	if (UpToSeq == Att->ChunkCount - 1)
+	{
+		R->CommitImageUpload(FCrc::MemCrc32(Att->Jpeg.GetData(), Att->Jpeg.Num()));
+	}
+	RebuildAttachmentChips(); // progress % moved
+}
+
+void UAIDAChatWidget::HandleUploadResult(bool bOk, const FGuid& ImageId, const FString& Error)
+{
+	if (FPendingAttachment* Att = FindUploading())
+	{
+		Att->bUploading = false;
+		if (bOk)
+		{
+			Att->ImageId = ImageId;
+			Att->Jpeg.Empty(); // committed server-side; the id is all a send needs
+		}
+		else
+		{
+			Att->bFailed = true;
+			Att->Error = Error;
+			UE_LOG(LogAIDA, Warning, TEXT("[widget] attachment '%s' failed: %s"), *Att->FileName, *Error);
+		}
+	}
+	RebuildAttachmentChips();
+	StartNextUpload();
+}
+
+void UAIDAChatWidget::HandleChipRemoveClicked(int32 Index)
+{
+	TArray<FPendingAttachment>* List = PendingAttachments.Find(CurrentConversationId);
+	if (!List || !List->IsValidIndex(Index) || (*List)[Index].bUploading)
+	{
+		return; // an in-flight upload can't be cancelled client-side; let it finish, then remove
+	}
+	List->RemoveAt(Index);
+	RebuildAttachmentChips();
+}
+
+void UAIDAChatWidget::RebuildAttachmentChips()
+{
+	if (!AttachmentChips || !WidgetTree)
+	{
+		return;
+	}
+	AttachmentChips->ClearChildren();
+
+	const TArray<FPendingAttachment>* List = PendingAttachments.Find(CurrentConversationId);
+	if (!List || List->Num() == 0)
+	{
+		return;
+	}
+
+	UFont* GameFont = LoadObject<UFont>(nullptr, TEXT("/Game/FactoryGame/Interface/Font/DescriptionText.DescriptionText"));
+
+	for (int32 i = 0; i < List->Num(); ++i)
+	{
+		const FPendingAttachment& Att = (*List)[i];
+
+		FString Status;
+		FLinearColor Color(0.85f, 0.85f, 0.85f, 1.f);
+		if (Att.bFailed)
+		{
+			Status = FString::Printf(TEXT(" — %s"), *Att.Error);
+			Color = FLinearColor(1.f, 0.45f, 0.4f, 1.f);
+		}
+		else if (Att.ImageId.IsValid())
+		{
+			Status = TEXT(" [ok]");
+			Color = FLinearColor(0.6f, 1.f, 0.6f, 1.f);
+		}
+		else if (Att.bUploading)
+		{
+			Status = FString::Printf(TEXT(" %d%%"), Att.ChunkCount > 0 ? Att.NextChunk * 100 / Att.ChunkCount : 0);
+		}
+		else
+		{
+			Status = TEXT(" ...");
+		}
+
+		UBorder* Chip = WidgetTree->ConstructWidget<UBorder>();
+		Chip->SetBrushColor(FLinearColor(0.05f, 0.05f, 0.06f, 0.9f));
+		Chip->SetPadding(FMargin(6.f, 2.f));
+
+		UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>();
+		Chip->AddChild(Row);
+
+		UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>();
+		Label->SetText(FText::FromString(FString::Printf(TEXT("%s%s"), *Att.FileName, *Status)));
+		FSlateFontInfo Font = GameFont ? FSlateFontInfo(GameFont, 9) : Label->GetFont();
+		Font.Size = 9;
+		Font.OutlineSettings.OutlineSize = 0;
+		Label->SetFont(Font);
+		Label->SetColorAndOpacity(FSlateColor(Color));
+		Row->AddChildToHorizontalBox(Label);
+
+		if (!Att.bUploading)
+		{
+			UAIDAIndexButton* Remove = WidgetTree->ConstructWidget<UAIDAIndexButton>();
+			Remove->InitIndex(i);
+			Remove->OnIndexClickedNative.AddUObject(this, &UAIDAChatWidget::HandleChipRemoveClicked);
+			UTextBlock* X = WidgetTree->ConstructWidget<UTextBlock>();
+			X->SetText(FText::FromString(TEXT("x")));
+			FSlateFontInfo XFont = GameFont ? FSlateFontInfo(GameFont, 8) : X->GetFont();
+			XFont.Size = 8;
+			XFont.OutlineSettings.OutlineSize = 0;
+			X->SetFont(XFont);
+			Remove->AddChild(X);
+			if (UHorizontalBoxSlot* XSlot = Row->AddChildToHorizontalBox(Remove))
+			{
+				XSlot->SetPadding(FMargin(4.f, 0.f, 0.f, 0.f));
+			}
+		}
+
+		if (UHorizontalBoxSlot* ChipSlot = AttachmentChips->AddChildToHorizontalBox(Chip))
+		{
+			ChipSlot->SetPadding(FMargin(0.f, 0.f, 6.f, 0.f));
+		}
 	}
 }

@@ -8,9 +8,12 @@
 #include "Core/AIDASessionManager.h"
 #include "Core/AIDARateLimiter.h"
 #include "Core/AIDAPermissionService.h"
+#include "Core/AIDAImageStore.h"
 #include "Adapters/AnthropicAdapter.h"
 #include "Adapters/OpenAICompatAdapter.h"
+#include "Adapters/LLMClient.h"
 #include "Adapters/SSEStream.h"
+#include "Misc/Base64.h"
 #include "Tools/AIDAToolRegistry.h"
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Factory/AIDALogisticsGraph.h"
@@ -2514,6 +2517,255 @@ bool FAIDAPromptPackTest::RunTest(const FString&)
 	// Static guidance is always present.
 	TestTrue(TEXT("clock rules"), Pack.Contains(TEXT("## Clock speed rules")));
 	TestTrue(TEXT("authority header"), Pack.Contains(TEXT("GAME DATA PACK")));
+	return true;
+}
+
+// ───────────────────────────── Phase 5 "Imagination" (docs/PHASE5.md) ─────────────────────────────
+
+namespace
+{
+	FAIDACompletionRequest AIDAMakeImageRequest()
+	{
+		FAIDACompletionRequest Req;
+		Req.Model = TEXT("test-model");
+		Req.MaxTokens = 128;
+
+		FAIDAChatMessage Msg;
+		Msg.Role = TEXT("user");
+		Msg.Content = TEXT("build something like this");
+		Msg.Images.Add({ TEXT("image/jpeg"), TEXT("QUJD") }); // "ABC"
+		Req.Messages.Add(MoveTemp(Msg));
+		return Req;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAAnthropicImageWireTest, "AIDA.Adapters.AnthropicImageWireFormat",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAAnthropicImageWireTest::RunTest(const FString&)
+{
+	const TSharedPtr<FJsonObject> Json = ParseJsonObject(FAnthropicAdapter::BuildRequestBody(AIDAMakeImageRequest()));
+	if (!TestTrue(TEXT("valid JSON"), Json.IsValid())) { return false; }
+
+	const TArray<TSharedPtr<FJsonValue>>* Messages = nullptr;
+	Json->TryGetArrayField(TEXT("messages"), Messages);
+	if (!Messages || Messages->Num() != 1) { AddError(TEXT("expected 1 message")); return false; }
+
+	// Content becomes a block array: image (base64 source) first, then the text block.
+	const TSharedPtr<FJsonObject> M = (*Messages)[0]->AsObject();
+	const TArray<TSharedPtr<FJsonValue>>* Blocks = nullptr;
+	if (!TestTrue(TEXT("content is a 2-block array"),
+		M->TryGetArrayField(TEXT("content"), Blocks) && Blocks && Blocks->Num() == 2)) { return false; }
+
+	const TSharedPtr<FJsonObject> Img = (*Blocks)[0]->AsObject();
+	TestEqual(TEXT("block[0].type"), Img->GetStringField(TEXT("type")), TEXT("image"));
+	const TSharedPtr<FJsonObject>* Src = nullptr;
+	if (TestTrue(TEXT("image.source object"), Img->TryGetObjectField(TEXT("source"), Src) && Src))
+	{
+		TestEqual(TEXT("source.type"), (*Src)->GetStringField(TEXT("type")), TEXT("base64"));
+		TestEqual(TEXT("source.media_type"), (*Src)->GetStringField(TEXT("media_type")), TEXT("image/jpeg"));
+		TestEqual(TEXT("source.data"), (*Src)->GetStringField(TEXT("data")), TEXT("QUJD"));
+	}
+
+	const TSharedPtr<FJsonObject> Text = (*Blocks)[1]->AsObject();
+	TestEqual(TEXT("block[1].type"), Text->GetStringField(TEXT("type")), TEXT("text"));
+	TestEqual(TEXT("block[1].text"), Text->GetStringField(TEXT("text")), TEXT("build something like this"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAOpenAIImageWireTest, "AIDA.Adapters.OpenAIImageWireFormat",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAOpenAIImageWireTest::RunTest(const FString&)
+{
+	const TSharedPtr<FJsonObject> Json = ParseJsonObject(FOpenAICompatAdapter::BuildRequestBody(AIDAMakeImageRequest()));
+	if (!TestTrue(TEXT("valid JSON"), Json.IsValid())) { return false; }
+
+	const TArray<TSharedPtr<FJsonValue>>* Messages = nullptr;
+	Json->TryGetArrayField(TEXT("messages"), Messages);
+	if (!Messages || Messages->Num() != 1) { AddError(TEXT("expected 1 message")); return false; }
+
+	const TSharedPtr<FJsonObject> M = (*Messages)[0]->AsObject();
+	const TArray<TSharedPtr<FJsonValue>>* Parts = nullptr;
+	if (!TestTrue(TEXT("content is a 2-part array"),
+		M->TryGetArrayField(TEXT("content"), Parts) && Parts && Parts->Num() == 2)) { return false; }
+
+	const TSharedPtr<FJsonObject> Img = (*Parts)[0]->AsObject();
+	TestEqual(TEXT("part[0].type"), Img->GetStringField(TEXT("type")), TEXT("image_url"));
+	const TSharedPtr<FJsonObject>* Url = nullptr;
+	if (TestTrue(TEXT("image_url object"), Img->TryGetObjectField(TEXT("image_url"), Url) && Url))
+	{
+		TestEqual(TEXT("data URL"), (*Url)->GetStringField(TEXT("url")), TEXT("data:image/jpeg;base64,QUJD"));
+	}
+
+	const TSharedPtr<FJsonObject> Text = (*Parts)[1]->AsObject();
+	TestEqual(TEXT("part[1].type"), Text->GetStringField(TEXT("type")), TEXT("text"));
+	TestEqual(TEXT("part[1].text"), Text->GetStringField(TEXT("text")), TEXT("build something like this"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAVisionModelSwitchTest, "AIDA.Adapters.VisionModelSwitch",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAVisionModelSwitchTest::RunTest(const FString&)
+{
+	TArray<FAIDAChatMessage> Plain;
+	Plain.Add({ TEXT("user"), TEXT("hi") });
+
+	TArray<FAIDAChatMessage> WithImage = Plain;
+	WithImage[0].Images.Add({ TEXT("image/jpeg"), TEXT("QUJD") });
+
+	TestEqual(TEXT("text-only -> default"), FLLMClient::ChooseModel(TEXT("m"), TEXT("v"), Plain), TEXT("m"));
+	TestEqual(TEXT("images -> vision model"), FLLMClient::ChooseModel(TEXT("m"), TEXT("v"), WithImage), TEXT("v"));
+	TestEqual(TEXT("images, no vision model -> default"), FLLMClient::ChooseModel(TEXT("m"), TEXT(""), WithImage), TEXT("m"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAUploadsConfigTest, "AIDA.Config.ParsesUploads",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAUploadsConfigTest::RunTest(const FString&)
+{
+	const FString Base = TEXT(R"("provider": { "type": "anthropic", "baseUrl": "https://x", "model": "m" })");
+
+	FAIDAConfig Config;
+	FString Error;
+	TestTrue(TEXT("defaults without uploads block"),
+		FAIDAConfigLoader::LoadFromString(FString::Printf(TEXT("{ %s }"), *Base), Config, Error));
+	TestTrue(TEXT("default enabled"), Config.Uploads.bEnabled);
+	TestEqual(TEXT("default maxDimension"), Config.Uploads.MaxDimension, 1568);
+	TestEqual(TEXT("default maxImagesPerMessage"), Config.Uploads.MaxImagesPerMessage, 4);
+
+	TestTrue(TEXT("parses uploads block"), FAIDAConfigLoader::LoadFromString(FString::Printf(
+		TEXT("{ %s, \"uploads\": { \"enabled\": false, \"maxImageBytes\": 65536, \"maxImagesPerMessage\": 2, \"maxImagesPerRequest\": 3, \"maxDimension\": 800, \"maxStoredImages\": 5, \"ttlSeconds\": 60 } }"),
+		*Base), Config, Error));
+	TestFalse(TEXT("enabled=false"), Config.Uploads.bEnabled);
+	TestEqual(TEXT("maxImageBytes"), Config.Uploads.MaxImageBytes, 65536);
+	TestEqual(TEXT("maxImagesPerRequest"), Config.Uploads.MaxImagesPerRequest, 3);
+	TestEqual(TEXT("maxStoredImages"), Config.Uploads.MaxStoredImages, 5);
+	TestEqual(TEXT("ttlSeconds"), Config.Uploads.TtlSeconds, 60);
+
+	TestFalse(TEXT("rejects out-of-range limits"), FAIDAConfigLoader::LoadFromString(FString::Printf(
+		TEXT("{ %s, \"uploads\": { \"maxImageBytes\": 10 } }"), *Base), Config, Error));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAUploadChunkReassemblyTest, "AIDA.Uploads.ChunkReassembly",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAUploadChunkReassemblyTest::RunTest(const FString&)
+{
+	// 40000 bytes = 2 full 16 KiB chunks + a 7232-byte tail.
+	TArray<uint8> Payload;
+	Payload.SetNum(40000);
+	for (int32 i = 0; i < Payload.Num(); ++i) { Payload[i] = static_cast<uint8>(i * 31 + 7); }
+	const uint32 Crc = FCrc::MemCrc32(Payload.GetData(), Payload.Num());
+	const int32 ChunkBytes = FAIDAImageUploadAssembler::kChunkBytes;
+
+	FAIDAImageUploadAssembler Assembler;
+	FString Error;
+	TestTrue(TEXT("begin"), Assembler.Begin(TEXT("p1"), TEXT("image/jpeg"), Payload.Num(), 3, 1 << 20, 100, Error));
+
+	for (int32 Seq = 0; Seq < 3; ++Seq)
+	{
+		const int32 Offset = Seq * ChunkBytes;
+		TArray<uint8> Chunk(Payload.GetData() + Offset, FMath::Min(ChunkBytes, Payload.Num() - Offset));
+		TestTrue(*FString::Printf(TEXT("chunk %d"), Seq), Assembler.AddChunk(TEXT("p1"), Seq, Chunk, 100, Error));
+	}
+
+	TArray<uint8> Out;
+	FString MediaType;
+	TestTrue(TEXT("commit"), Assembler.Commit(TEXT("p1"), Crc, Out, MediaType, Error));
+	TestTrue(TEXT("bytes round-trip"), Out == Payload);
+	TestEqual(TEXT("media type carried"), MediaType, TEXT("image/jpeg"));
+	TestFalse(TEXT("session consumed"), Assembler.HasSession(TEXT("p1")));
+
+	// Out-of-order chunk kills the session.
+	TestTrue(TEXT("begin 2"), Assembler.Begin(TEXT("p1"), TEXT("image/jpeg"), Payload.Num(), 3, 1 << 20, 100, Error));
+	TArray<uint8> First(Payload.GetData(), ChunkBytes);
+	TestTrue(TEXT("chunk 0"), Assembler.AddChunk(TEXT("p1"), 0, First, 100, Error));
+	TArray<uint8> Wrong(Payload.GetData(), 8);
+	TestFalse(TEXT("out-of-order rejected"), Assembler.AddChunk(TEXT("p1"), 2, Wrong, 100, Error));
+	TestFalse(TEXT("session dead after violation"), Assembler.HasSession(TEXT("p1")));
+
+	// CRC mismatch fails the commit.
+	TestTrue(TEXT("begin 3"), Assembler.Begin(TEXT("p1"), TEXT("image/jpeg"), 8, 1, 1 << 20, 100, Error));
+	TArray<uint8> Small(Payload.GetData(), 8);
+	TestTrue(TEXT("small chunk"), Assembler.AddChunk(TEXT("p1"), 0, Small, 100, Error));
+	TestFalse(TEXT("bad crc rejected"), Assembler.Commit(TEXT("p1"), Crc + 1, Out, MediaType, Error));
+
+	// Stale sessions sweep away.
+	TestTrue(TEXT("begin 4"), Assembler.Begin(TEXT("p1"), TEXT("image/jpeg"), 8, 1, 1 << 20, 100, Error));
+	Assembler.Sweep(100 + FAIDAImageUploadAssembler::kSessionTimeoutSec + 1);
+	TestFalse(TEXT("timed-out session swept"), Assembler.HasSession(TEXT("p1")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAImageStoreLimitsTest, "AIDA.Uploads.StoreLimits",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAImageStoreLimitsTest::RunTest(const FString&)
+{
+	FAIDAUploadsConfig Config;
+	Config.MaxImageBytes = 1024;
+	Config.MaxStoredImages = 2;
+	Config.TtlSeconds = 60;
+
+	FAIDAImageStore Store;
+	Store.Configure(Config);
+
+	TArray<uint8> Bytes = { 1, 2, 3, 4 };
+	FString Error;
+
+	// Per-image cap.
+	TArray<uint8> Huge;
+	Huge.SetNumZeroed(2048);
+	TestFalse(TEXT("oversize rejected"), Store.Add(TEXT("image/jpeg"), Huge, TEXT("p1"), 100, Error).IsValid());
+
+	const FGuid A = Store.Add(TEXT("image/jpeg"), Bytes, TEXT("p1"), 100, Error);
+	const FGuid B = Store.Add(TEXT("image/jpeg"), Bytes, TEXT("p1"), 101, Error);
+	TestTrue(TEXT("A+B stored"), A.IsValid() && B.IsValid() && Store.Num() == 2);
+	TestEqual(TEXT("base64 encoded once"), Store.Find(A)->Base64Data, FBase64::Encode(Bytes.GetData(), Bytes.Num()));
+
+	// Count budget: adding a third evicts the oldest (A).
+	const FGuid C = Store.Add(TEXT("image/jpeg"), Bytes, TEXT("p1"), 102, Error);
+	TestTrue(TEXT("C stored"), C.IsValid());
+	TestEqual(TEXT("count budget held"), Store.Num(), 2);
+	TestTrue(TEXT("oldest evicted"), Store.Find(A) == nullptr && Store.Find(B) != nullptr);
+
+	// Ownership: only the uploader may reference.
+	TestFalse(TEXT("wrong owner refused"), Store.MarkReferenced(B, TEXT("p2")));
+	TestTrue(TEXT("owner references"), Store.MarkReferenced(B, TEXT("p1")));
+
+	// TTL: unreferenced C expires, referenced B survives.
+	Store.Sweep(102 + Config.TtlSeconds + 1);
+	TestTrue(TEXT("unreferenced swept"), Store.Find(C) == nullptr);
+	TestTrue(TEXT("referenced survives"), Store.Find(B) != nullptr);
+
+	// Eviction falls back to referenced images when everything evictable is referenced.
+	const FGuid D = Store.Add(TEXT("image/jpeg"), Bytes, TEXT("p1"), 200, Error);
+	TestTrue(TEXT("D stored"), D.IsValid() && Store.Num() == 2);
+	TestTrue(TEXT("D referenced"), Store.MarkReferenced(D, TEXT("p1")));
+	const FGuid E = Store.Add(TEXT("image/jpeg"), Bytes, TEXT("p1"), 201, Error);
+	TestTrue(TEXT("oldest referenced evicted when all are referenced"),
+		E.IsValid() && Store.Num() == 2 && Store.Find(B) == nullptr && Store.Find(D) != nullptr);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASessionImageRefsTest, "AIDA.Session.ImageRefs",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASessionImageRefsTest::RunTest(const FString&)
+{
+	FAIDASessionManager Session(8);
+	TArray<FGuid> Ids = { FGuid::NewGuid(), FGuid::NewGuid() };
+
+	const FGuid MsgId = Session.PostPlayerMessage(TEXT("Player"), TEXT("like this"), AIDADefaultConversationId(), Ids);
+
+	FAIDATranscriptEntry Entry;
+	if (!TestTrue(TEXT("entry stored"), Session.GetMessageBody(MsgId, Entry))) { return false; }
+	TestTrue(TEXT("image ids stored"), Entry.ImageIds == Ids);
+	TestEqual(TEXT("header carries the count only"), Entry.Header.ImageCount, 2);
+
+	const FGuid PlainId = Session.PostPlayerMessage(TEXT("Player"), TEXT("no images"), AIDADefaultConversationId());
+	if (TestTrue(TEXT("plain entry stored"), Session.GetMessageBody(PlainId, Entry)))
+	{
+		TestEqual(TEXT("no ids by default"), Entry.ImageIds.Num(), 0);
+		TestEqual(TEXT("count 0 by default"), Entry.Header.ImageCount, 0);
+	}
 	return true;
 }
 

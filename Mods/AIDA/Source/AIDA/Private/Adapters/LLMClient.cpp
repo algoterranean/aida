@@ -7,6 +7,7 @@
 FLLMClient::FLLMClient(const FAIDAConfig& Config)
 {
 	Model = Config.Provider.Model;
+	VisionModel = Config.Provider.VisionModel;
 	MaxTokens = Config.Provider.MaxOutputTokens;
 
 	if (Config.Provider.Type == TEXT("anthropic"))
@@ -60,6 +61,22 @@ void FLLMClient::Complete(const FString& UserText, FAIDAOnChunk OnChunk, FAIDAOn
 	Adapter->Complete(Req, MoveTemp(OnChunk), WrapTextComplete(MoveTemp(OnComplete)), MoveTemp(OnError));
 }
 
+FString FLLMClient::ChooseModel(const FString& DefaultModel, const FString& InVisionModel,
+	const TArray<FAIDAChatMessage>& Messages)
+{
+	if (!InVisionModel.IsEmpty())
+	{
+		for (const FAIDAChatMessage& Msg : Messages)
+		{
+			if (Msg.Images.Num() > 0)
+			{
+				return InVisionModel;
+			}
+		}
+	}
+	return DefaultModel;
+}
+
 void FLLMClient::CompleteChat(const TArray<FAIDAChatMessage>& Messages, FAIDAOnChunk OnChunk, FAIDAOnComplete OnComplete, FAIDAOnError OnError)
 {
 	if (!Adapter.IsValid())
@@ -69,7 +86,7 @@ void FLLMClient::CompleteChat(const TArray<FAIDAChatMessage>& Messages, FAIDAOnC
 	}
 
 	FAIDACompletionRequest Req;
-	Req.Model = Model;
+	Req.Model = ChooseModel(Model, VisionModel, Messages);
 	Req.MaxTokens = MaxTokens;
 	Req.System = SystemPrompt;
 	Req.Messages = Messages;
@@ -87,7 +104,7 @@ void FLLMClient::CompleteChat(const TArray<FAIDAChatMessage>& Messages, const TA
 	}
 
 	FAIDACompletionRequest Req;
-	Req.Model = Model;
+	Req.Model = ChooseModel(Model, VisionModel, Messages);
 	Req.MaxTokens = MaxTokens;
 	Req.System = SystemPrompt;
 	Req.Messages = Messages;

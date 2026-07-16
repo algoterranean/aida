@@ -40,9 +40,17 @@ public:
 	void CompleteChat(const TArray<FAIDAChatMessage>& Messages, const TArray<FAIDAToolDef>& Tools,
 		FAIDAOnChunk OnChunk, FAIDAOnCompleteResult OnComplete, FAIDAOnError OnError);
 
+	/**
+	 * Pure model-selection rule (Phase 5): a request that carries images uses VisionModel when one
+	 * is configured; everything else (and an empty VisionModel) uses the default model.
+	 */
+	static FString ChooseModel(const FString& DefaultModel, const FString& VisionModel,
+		const TArray<FAIDAChatMessage>& Messages);
+
 private:
 	TSharedPtr<ILLMAdapter> Adapter;
 	FString Model;
+	FString VisionModel;
 	int32 MaxTokens = 1024;
 	FString SystemPrompt;
 };

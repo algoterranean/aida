@@ -164,6 +164,19 @@ bool FAIDAConfigLoader::LoadFromString(const FString& Jsonc, FAIDAConfig& OutCon
 		}
 	}
 
+	const TSharedPtr<FJsonObject>* Uploads = nullptr;
+	if (Root->TryGetObjectField(TEXT("uploads"), Uploads) && Uploads)
+	{
+		int32 I;
+		(*Uploads)->TryGetBoolField(TEXT("enabled"), Parsed.Uploads.bEnabled);
+		if ((*Uploads)->TryGetNumberField(TEXT("maxImageBytes"), I)) { Parsed.Uploads.MaxImageBytes = I; }
+		if ((*Uploads)->TryGetNumberField(TEXT("maxImagesPerMessage"), I)) { Parsed.Uploads.MaxImagesPerMessage = I; }
+		if ((*Uploads)->TryGetNumberField(TEXT("maxImagesPerRequest"), I)) { Parsed.Uploads.MaxImagesPerRequest = I; }
+		if ((*Uploads)->TryGetNumberField(TEXT("maxDimension"), I)) { Parsed.Uploads.MaxDimension = I; }
+		if ((*Uploads)->TryGetNumberField(TEXT("maxStoredImages"), I)) { Parsed.Uploads.MaxStoredImages = I; }
+		if ((*Uploads)->TryGetNumberField(TEXT("ttlSeconds"), I)) { Parsed.Uploads.TtlSeconds = I; }
+	}
+
 	const TSharedPtr<FJsonObject>* Prompts = nullptr;
 	if (Root->TryGetObjectField(TEXT("prompts"), Prompts) && Prompts)
 	{
@@ -238,6 +251,14 @@ bool FAIDAConfigLoader::Validate(const FAIDAConfig& Config, FString& OutError)
 	if (Config.Actions.MaxProposalItems < 0 || Config.Actions.BatchPerTick < 1 || Config.Actions.MaxPendingProposals < 1)
 	{
 		OutError = TEXT("actions.maxProposalItems must be >= 0 (0 = unlimited); batchPerTick and maxPendingProposals must be >= 1");
+		return false;
+	}
+
+	const FAIDAUploadsConfig& Up = Config.Uploads;
+	if (Up.MaxImageBytes < 1024 || Up.MaxImagesPerMessage < 1 || Up.MaxImagesPerRequest < 1
+		|| Up.MaxDimension < 64 || Up.MaxStoredImages < 1 || Up.TtlSeconds < 1)
+	{
+		OutError = TEXT("uploads.* limits out of range (maxImageBytes >= 1024, maxDimension >= 64, counts/ttl >= 1)");
 		return false;
 	}
 

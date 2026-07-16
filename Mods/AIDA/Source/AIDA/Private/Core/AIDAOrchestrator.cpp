@@ -2,6 +2,7 @@
 
 #include "AIDA.h"
 #include "Core/AIDAConfigLoader.h"
+#include "Core/AIDAImageValidation.h"
 #include "Adapters/LLMClient.h"
 #include "Factory/AIDAFactoryAggregator.h"
 #include "Tools/AIDAFactoryTools.h"
@@ -400,6 +401,12 @@ AAIDAChatRelay* UAIDAOrchestrator::GetRelay()
 
 void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const FString& Text, const FGuid& ConversationId)
 {
+	HandleChatRequest(Requester, Text, ConversationId, TArray<FGuid>());
+}
+
+void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const FString& Text, const FGuid& ConversationId,
+	const TArray<FGuid>& ImageIds)
+{
 	// Authority-only: this path fans out network RPCs and calls the LLM (server egress).
 	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
 	{
@@ -412,7 +419,7 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 	}
 
 	const FString Trimmed = Text.TrimStartAndEnd();
-	if (Trimmed.IsEmpty())
+	if (Trimmed.IsEmpty() && ImageIds.Num() == 0)
 	{
 		return;
 	}
@@ -509,9 +516,102 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 		return;
 	}
 
-	Session->PostPlayerMessage(Requester.Author, Trimmed, ConversationId);
+	// Phase 5: bind surviving attachments to this message. Ids must be live and owned by the
+	// requester (MarkReferenced enforces both); referenced images outlast the upload TTL.
+	TArray<FGuid> ValidImageIds;
+	if (ImageIds.Num() > 0 && Config.Uploads.bEnabled)
+	{
+		for (const FGuid& Id : ImageIds)
+		{
+			if (ValidImageIds.Num() >= Config.Uploads.MaxImagesPerMessage)
+			{
+				break;
+			}
+			if (ImageStore.MarkReferenced(Id, Requester.PlayerId))
+			{
+				ValidImageIds.Add(Id);
+			}
+		}
+		if (ValidImageIds.Num() < ImageIds.Num())
+		{
+			Session->PostSystemMessage(FString::Printf(TEXT("%d attachment(s) were dropped (expired or over the per-message limit)."),
+				ImageIds.Num() - ValidImageIds.Num()), ConversationId);
+		}
+	}
+
+	Session->PostPlayerMessage(Requester.Author, Trimmed, ConversationId, ValidImageIds);
 
 	StartAIDAReply(Requester, ConversationId);
+}
+
+bool UAIDAOrchestrator::HandleImageUploadBegin(const FAIDARequester& Requester, const FString& MediaType,
+	int32 TotalBytes, int32 ChunkCount, FString& OutError)
+{
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_Client)
+	{
+		OutError = TEXT("not authority");
+		return false;
+	}
+	if (!AreUploadsEnabled())
+	{
+		OutError = TEXT("image uploads are disabled on this server (uploads.enabled)");
+		return false;
+	}
+
+	const int64 NowUtc = FDateTime::UtcNow().ToUnixTimestamp();
+	ImageUploads.Sweep(NowUtc); // lazy sweeps piggyback on upload traffic (proposal-store pattern)
+	ImageStore.Sweep(NowUtc);
+
+	return ImageUploads.Begin(Requester.PlayerId, MediaType, TotalBytes, ChunkCount,
+		Config.Uploads.MaxImageBytes, NowUtc, OutError);
+}
+
+bool UAIDAOrchestrator::HandleImageUploadChunk(const FAIDARequester& Requester, int32 Seq,
+	const TArray<uint8>& Data, FString& OutError)
+{
+	if (!AreUploadsEnabled())
+	{
+		OutError = TEXT("image uploads are disabled on this server (uploads.enabled)");
+		return false;
+	}
+	return ImageUploads.AddChunk(Requester.PlayerId, Seq, Data, FDateTime::UtcNow().ToUnixTimestamp(), OutError);
+}
+
+bool UAIDAOrchestrator::HandleImageUploadCommit(const FAIDARequester& Requester, uint32 Crc32,
+	FGuid& OutImageId, FString& OutError)
+{
+	if (!AreUploadsEnabled())
+	{
+		OutError = TEXT("image uploads are disabled on this server (uploads.enabled)");
+		return false;
+	}
+
+	TArray<uint8> Bytes;
+	FString ClaimedType;
+	if (!ImageUploads.Commit(Requester.PlayerId, Crc32, Bytes, ClaimedType, OutError))
+	{
+		return false;
+	}
+
+	// Never trust the client's media type — the bytes must decode as a real, normalized image.
+	FString MediaType;
+	if (!AIDAValidateImageBytes(Bytes, Config.Uploads.MaxDimension, MediaType, OutError))
+	{
+		return false;
+	}
+
+	const FGuid Id = ImageStore.Add(MediaType, Bytes, Requester.PlayerId,
+		FDateTime::UtcNow().ToUnixTimestamp(), OutError);
+	if (!Id.IsValid())
+	{
+		return false;
+	}
+
+	UE_LOG(LogAIDA, Log, TEXT("[uploads] %s [%s] stored %d bytes (%s) as %s — store now %d image(s), %lld bytes."),
+		*Requester.Author, *Requester.PlayerId, Bytes.Num(), *MediaType,
+		*Id.ToString(EGuidFormats::DigitsWithHyphens), ImageStore.Num(), ImageStore.TotalBytes());
+	OutImageId = Id;
+	return true;
 }
 
 void UAIDAOrchestrator::BuildChatContext(const FGuid& ConversationId, TArray<FAIDAChatMessage>& OutMessages) const
@@ -537,12 +637,15 @@ void UAIDAOrchestrator::BuildChatContext(const FGuid& ConversationId, TArray<FAI
 	const bool bNames = Config.Privacy.bSendPlayerNames;
 	const int32 Start = FMath::Max(0, Transcript.Num() - Depth);
 
+	// Player turns that carried attachments: (index into OutMessages, ids) for the second pass below.
+	TArray<TPair<int32, TArray<FGuid>>> TurnsWithImages;
+
 	for (int32 i = Start; i < Transcript.Num(); ++i)
 	{
 		const FAIDATranscriptEntry& Entry = Transcript[i];
-		if (Entry.Body.IsEmpty())
+		if (Entry.Body.IsEmpty() && Entry.ImageIds.Num() == 0)
 		{
-			continue; // skip an in-progress (empty) message
+			continue; // skip an in-progress (empty) message; image-only player turns stay in
 		}
 
 		FAIDAChatMessage Msg;
@@ -559,7 +662,40 @@ void UAIDAOrchestrator::BuildChatContext(const FGuid& ConversationId, TArray<FAI
 		default:
 			continue; // system notices are not part of the model context
 		}
-		OutMessages.Add(MoveTemp(Msg));
+		const int32 Index = OutMessages.Add(MoveTemp(Msg));
+		if (Entry.Header.Kind == EAIDAMsgKind::Player && Entry.ImageIds.Num() > 0)
+		{
+			TurnsWithImages.Emplace(Index, Entry.ImageIds);
+		}
+	}
+
+	// Phase 5: attach stored images newest-first under the per-request budget; anything older,
+	// expired, or evicted degrades to a text note so the model never hallucinates a lost image.
+	int32 ImageBudget = FMath::Max(1, Config.Uploads.MaxImagesPerRequest);
+	for (int32 t = TurnsWithImages.Num() - 1; t >= 0; --t)
+	{
+		FAIDAChatMessage& Msg = OutMessages[TurnsWithImages[t].Key];
+		int32 Unavailable = 0;
+		for (const FGuid& Id : TurnsWithImages[t].Value)
+		{
+			const FAIDAStoredImage* Img = ImageBudget > 0 ? ImageStore.Find(Id) : nullptr;
+			if (Img)
+			{
+				FAIDAImagePart Part;
+				Part.MediaType = Img->MediaType;
+				Part.Base64Data = Img->Base64Data;
+				Msg.Images.Add(MoveTemp(Part));
+				--ImageBudget;
+			}
+			else
+			{
+				++Unavailable;
+			}
+		}
+		if (Unavailable > 0)
+		{
+			Msg.Content += FString::Printf(TEXT(" [%d attached image(s) no longer available]"), Unavailable);
+		}
 	}
 }
 
@@ -578,6 +714,16 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 	if (Config.Prompts.bPackEnabled)
 	{
 		SystemPrompt += TEXT("\n\n") + GetPromptPack();
+	}
+
+	// Phase 5: reference-image guidance (stable text — keep it BEFORE the volatile state line).
+	if (Config.Uploads.bEnabled)
+	{
+		SystemPrompt += TEXT("\n\nPlayers may attach reference images (photos, sketches, screenshots of buildings) to their"
+			" messages. When a message includes an image, study its massing, proportions, and materials, then translate it"
+			" into an in-game structure using the propose tools with the closest available buildables — briefly state your"
+			" interpretation first. Never claim to see an image unless one is actually attached to a message in this"
+			" conversation.");
 	}
 
 	// Ground the model in the AUTHORITATIVE proposal state every request — it kept inventing queue
@@ -2845,6 +2991,7 @@ void UAIDAOrchestrator::LoadConfig()
 		LLMClient->SetSystemPrompt(GAIDASystemPrompt);
 		RateLimiter.Configure(Config.Limits);
 		Permissions.Configure(Config.Permissions);
+		ImageStore.Configure(Config.Uploads);
 		UE_LOG(LogAIDA, Log, TEXT("LLM client %s. Run console command 'AIDA.Ping' to test a round-trip."),
 			LLMClient->IsReady() ? TEXT("ready") : TEXT("NOT ready (provider unimplemented)"));
 	}

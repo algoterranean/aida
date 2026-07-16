@@ -35,6 +35,8 @@ struct FAIDAMessageHeader
 	/** Display author — player name or "AIDA". Never an account id / secret. */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString Author;
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") EAIDAMsgKind Kind = EAIDAMsgKind::Player;
+	/** Reference images attached to this (player) message — clients render a 📎 marker only (Phase 5). */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") int32 ImageCount = 0;
 };
 
 /** One batched body fragment for a message already opened by its header. */
@@ -58,6 +60,8 @@ struct FAIDATranscriptEntry
 
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FAIDAMessageHeader Header;
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString Body;
+	/** Server-side references into the Phase 5 image store (ids only — pixels never fan out). */
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FGuid> ImageIds;
 };
 
 /**
