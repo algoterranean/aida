@@ -396,9 +396,22 @@ bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsCon
 {
 	const int32 Batch = FMath::Max(1, Config.BatchPerTick);
 
-	// Phase 0 — the machines themselves, per-index captured for the wiring phase.
+	// Phase 0 — the machines themselves, per-index captured for the wiring phase. Power-only
+	// proposals (propose_power) wire EXISTING machines: the slots fill from the resolved actors
+	// and nothing is built here.
 	if (Proposal.Phase == 0)
 	{
+		if (Proposal.bPowerOnly)
+		{
+			AttachmentActors.Reset();
+			for (const FAIDAManifoldPort& Machine : Proposal.Ports)
+			{
+				AttachmentActors.Add(Machine.Machine);
+			}
+			Proposal.Phase = 1;
+			Proposal.Cursor = 0;
+			return true;
+		}
 		int32 Skipped = 0;
 		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.RecipeClassPath,
 			Proposal.Placements, Proposal.Cursor, Batch,
@@ -529,9 +542,12 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	{
 		const TCHAR* Kind = Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels") : TEXT("power"));
 		const TCHAR* Piece = Proposal.bManifold ? TEXT("run") : (Proposal.bLabel ? TEXT("sign") : TEXT("wire"));
+		const int32 PlacementTotal = Proposal.bPowerOnly
+			? Proposal.PolePlacements.Num() // Placements mirror the poles for ghosts — don't double count
+			: Proposal.Placements.Num() + Proposal.PolePlacements.Num();
 		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (%s): %d placement(s) (%d skipped), %d %s(s) built, %d %s(s) failed (journal %s)."),
 			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), Kind,
-			Proposal.Placements.Num() + Proposal.PolePlacements.Num() - SkippedCount, SkippedCount,
+			PlacementTotal - SkippedCount, SkippedCount,
 			RunBuiltCount, Piece, RunFailCount, Piece,
 			*JournalId.ToString(EGuidFormats::DigitsWithHyphens));
 		if (SkippedCount > 0 || RunFailCount > 0)

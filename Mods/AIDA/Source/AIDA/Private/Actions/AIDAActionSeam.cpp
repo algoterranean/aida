@@ -1828,14 +1828,23 @@ bool FAIDAActionSeam::ResolveAutoPower(UObject* WorldContext, const FString& Mac
 	Out = FAIDAPowerInfo();
 	OutError.Reset();
 
-	// Does the machine even need power? The CDO carries the native power connection.
-	const TSubclassOf<AFGBuildable> MachineClass = BuildableClassFromRecipe(MachineRecipePath);
-	const AFGBuildable* MachineCDO = MachineClass ? MachineClass->GetDefaultObject<AFGBuildable>() : nullptr;
-	if (!MachineCDO || !MachineCDO->FindComponentByClass<UFGPowerConnectionComponent>())
+	// Does the machine even need power? The CDO carries the native power connection. An EMPTY
+	// machine recipe = the power-only path (propose_power): the machines already exist and the
+	// caller vetted their power connections — only the pole/wire kit needs resolving here.
+	if (MachineRecipePath.IsEmpty())
 	{
-		return false; // no power connection = nothing to wire (bMachineNeedsPower stays false)
+		Out.bMachineNeedsPower = true;
 	}
-	Out.bMachineNeedsPower = true;
+	else
+	{
+		const TSubclassOf<AFGBuildable> MachineClass = BuildableClassFromRecipe(MachineRecipePath);
+		const AFGBuildable* MachineCDO = MachineClass ? MachineClass->GetDefaultObject<AFGBuildable>() : nullptr;
+		if (!MachineCDO || !MachineCDO->FindComponentByClass<UFGPowerConnectionComponent>())
+		{
+			return false; // no power connection = nothing to wire (bMachineNeedsPower stays false)
+		}
+		Out.bMachineNeedsPower = true;
+	}
 
 	// The pole: the override, or the lowest UNLOCKED mk.
 	TArray<FString> PoleNames;
@@ -2418,4 +2427,46 @@ bool FAIDAActionSeam::ResolveManifoldLane(UObject* WorldContext, const FAIDADism
 		return true;
 	}
 	return false;
+}
+
+int32 FAIDAActionSeam::ResolveUnpoweredMachines(UObject* WorldContext, const FString& Buildable,
+	const FVector& CenterCm, double RadiusCm, int32 MaxCount,
+	TArray<FAIDAManifoldPort>& OutMachines, int32& OutSkippedPowered)
+{
+	OutMachines.Reset();
+	OutSkippedPowered = 0;
+
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem) { return 0; }
+
+	const FString WantedName = NormalizeName(Buildable);
+	const double RadiusSq = FMath::Square(RadiusCm);
+	const int32 Cap = MaxCount > 0 ? MaxCount : MAX_int32;
+
+	for (AFGBuildable* Candidate : Subsystem->GetAllBuildablesRef())
+	{
+		if (OutMachines.Num() >= Cap) { break; }
+		if (!IsValid(Candidate)) { continue; }
+		if (Candidate->IsA<AFGBuildablePowerPole>()) { continue; } // poles are infrastructure, not loads
+		if (FVector::DistSquared(Candidate->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+
+		const FString Name = BuildableDisplayName(Candidate);
+		if (!WantedName.IsEmpty() && !NormalizeName(Name).Contains(WantedName)) { continue; }
+
+		UFGPowerConnectionComponent* Power = Candidate->FindComponentByClass<UFGPowerConnectionComponent>();
+		if (!Power) { continue; } // needs no power — not a match
+		if (Power->IsConnected())
+		{
+			++OutSkippedPowered;
+			continue;
+		}
+
+		FAIDAManifoldPort Machine;
+		Machine.Machine = Candidate;
+		Machine.MachineName = Name;
+		Machine.PosCm = Candidate->GetActorLocation();
+		OutMachines.Add(MoveTemp(Machine));
+	}
+	return OutMachines.Num();
 }

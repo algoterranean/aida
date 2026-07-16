@@ -133,6 +133,11 @@ namespace
 		"cost, cap), revise the spec or explain the reason. Never claim something was built until "
 		"get_proposal_status says executed.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
+		"- propose_power(spec): wire EXISTING machines to electricity — poles beside them, power lines, "
+		"and a tie to the nearest powered grid. Use when the player asks to power/wire up machines that "
+		"are already built ('connect to power', 'wire it up'). Omit spec.center to wire what they're "
+		"looking at; already-powered machines are skipped. NEVER tell the player machines can't be "
+		"located — the tool finds them server-side.\n"
 		"- propose_label_containers(spec): propose one sign per storage container, its text set to the "
 		"container's main item. Use when the player asks to label containers/boxes. Omit spec.center to "
 		"label the containers they're looking at; empty or already-labeled containers are skipped.\n"
@@ -1918,6 +1923,179 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Stage(TEXT("published — done"));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0));
+		}
+	});
+
+	// propose_power (live-verify gap): wire EXISTING unpowered machines — poles + power lines + a
+	// grid tie through the auto-power executor, phase 0 skipped (the machines are already there).
+	Tools.Register({
+		TEXT("propose_power"),
+		TEXT("PROPOSE wiring EXISTING machines to electricity: power poles beside them, power lines from each machine to its pole, a pole chain, and a tie-in to the nearest powered grid. Use when the player asks to power/wire up machines that are already built. Spec: {version:1, buildable?:'machine display name (empty = any unpowered machine)', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all, pole?:'pole display name override'}. OMIT center to wire the machines near where the requesting player is looking. Machines already on a circuit are skipped automatically. Costs poles upfront; wires charged as built."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned power spec (see tool description)."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+
+			FAIDAPowerSpec Spec;
+			FString Error;
+			if (!AIDAActionSpec::ParsePowerSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			// Pole + wire kit (empty machine path = "the machines exist; trust the resolver below").
+			FAIDAActionSeam::FAIDAPowerInfo Power;
+			if (!FAIDAActionSeam::ResolveAutoPower(this, FString(), Spec.Pole, Power, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			// No center = the machines the player is looking at, falling back to their position.
+			if (!Spec.bHasCenter)
+			{
+				FVector AimCm;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				{
+					Spec.CenterM = AimCm / 100.0;
+				}
+				else if (Ctx.bHasLocation)
+				{
+					Spec.CenterM = Ctx.Location / 100.0;
+				}
+				else
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'center' {x,y in metres}"), {}));
+				}
+				Spec.bHasCenter = true;
+				const TSharedRef<FJsonObject> Center = MakeShared<FJsonObject>();
+				Center->SetField(TEXT("x"), AIDANumber(Spec.CenterM.X));
+				Center->SetField(TEXT("y"), AIDANumber(Spec.CenterM.Y));
+				Center->SetField(TEXT("z"), AIDANumber(Spec.CenterM.Z));
+				(*SpecObj)->SetObjectField(TEXT("center"), Center);
+			}
+
+			TArray<FAIDAManifoldPort> Machines;
+			int32 SkippedPowered = 0;
+			FAIDAActionSeam::ResolveUnpoweredMachines(this, Spec.Buildable, Spec.CenterM * AIDAMetersToCm,
+				Spec.RadiusM * AIDAMetersToCm, Spec.MaxCount, Machines, SkippedPowered);
+			if (Machines.Num() == 0)
+			{
+				const FString Msg = SkippedPowered > 0
+					? FString::Printf(TEXT("all %d matching machine(s) are already on a power circuit"), SkippedPowered)
+					: FString::Printf(TEXT("no unpowered machine%s within %.0f m"),
+						Spec.Buildable.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" matching '%s'"), *Spec.Buildable), Spec.RadiusM);
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			TArray<FVector> Positions;
+			Positions.Reserve(Machines.Num());
+			for (const FAIDAManifoldPort& Machine : Machines) { Positions.Add(Machine.PosCm); }
+
+			// Pole lane candidates: either side of the row, stepping out — the dry-run picks, same
+			// pattern as build anchors and manifold lanes.
+			const double Offsets[] = { 300.0, -300.0, 600.0, -600.0 };
+			FAIDAPowerPlan Plan;
+			FAIDADryRunResult PoleDryRun;
+			FAIDAPowerPlan FallbackPlan;
+			FAIDADryRunResult FallbackDryRun;
+			bool bPlaced = false;
+			bool bHaveFallback = false;
+			for (const double Offset : Offsets)
+			{
+				FAIDAPowerPlan AttemptPlan = AIDAActionSpec::PlanPowerForPoints(Positions,
+					FMath::Max(1, Power.PoleConnectionCap - 2), Offset);
+				if (!AttemptPlan.Error.IsEmpty())
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(AttemptPlan.Error, {}));
+				}
+				for (FTransform& Pole : AttemptPlan.Poles)
+				{
+					double GroundZ;
+					if (FAIDAActionSeam::ProbeGroundZ(this, Pole.GetLocation(), GroundZ))
+					{
+						FVector Location = Pole.GetLocation();
+						Location.Z = GroundZ;
+						Pole.SetLocation(Location);
+					}
+				}
+				FAIDADryRunResult AttemptRun;
+				if (!FAIDAActionSeam::DryRunBuild(this, Power.PoleRecipePath, AttemptPlan.Poles, AttemptRun))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(AttemptRun.Error, {}));
+				}
+				if (AttemptRun.bOk && AttemptRun.ClippingCount == 0)
+				{
+					Plan = MoveTemp(AttemptPlan);
+					PoleDryRun = MoveTemp(AttemptRun);
+					bPlaced = true;
+					break;
+				}
+				if (AttemptRun.bOk && !bHaveFallback)
+				{
+					FallbackPlan = MoveTemp(AttemptPlan);
+					FallbackDryRun = AttemptRun;
+					bHaveFallback = true;
+				}
+			}
+			if (!bPlaced && bHaveFallback)
+			{
+				Plan = MoveTemp(FallbackPlan);
+				PoleDryRun = MoveTemp(FallbackDryRun);
+				bPlaced = true;
+			}
+			if (!bPlaced)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("no valid pole spot beside those machines (both sides blocked) — pass 'pole' or a different center"), {}));
+			}
+			if (Config.Actions.CostMode == TEXT("central") && !PoleDryRun.bAffordable)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					FString::Printf(TEXT("%d pole(s) not affordable from central storage (dimensional depot)"), Plan.Poles.Num()), {}));
+			}
+
+			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid();
+			Proposal.SpecJson = AIDAToCompactJson(SpecObj->ToSharedRef());
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = Plan.Poles;              // ghost preview = the poles
+			Proposal.RecipeClassPath = Power.PoleRecipePath;
+			Proposal.Cost = PoleDryRun.Cost;
+			Proposal.bAutoPower = true;
+			Proposal.bPowerOnly = true;
+			Proposal.Ports = MoveTemp(Machines);
+			Proposal.PolePlacements = MoveTemp(Plan.Poles);
+			Proposal.PoleRecipePath = Power.PoleRecipePath;
+			Proposal.PoleName = Power.PoleName;
+			Proposal.WireRecipePath = Power.WireRecipePath;
+			Proposal.MachineWires = MoveTemp(Plan.MachineWires);
+			Proposal.ChainWires = MoveTemp(Plan.ChainWires);
+			Proposal.Summary = FString::Printf(TEXT("power up %d x %s: %d x %s + %d wire(s) + grid tie"),
+				Proposal.Ports.Num(), *Proposal.Ports[0].MachineName, Proposal.PolePlacements.Num(),
+				*Power.PoleName, Proposal.MachineWires.Num() + Proposal.ChainWires.Num());
+			if (SkippedPowered > 0)
+			{
+				Proposal.Summary += FString::Printf(TEXT(" [%d machine(s) already powered, skipped]"), SkippedPowered);
+			}
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — poles cost %s; wires charged as built. Awaiting approval."),
+				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, PoleDryRun.bAffordable, 0.0));
 		}
 	});
 

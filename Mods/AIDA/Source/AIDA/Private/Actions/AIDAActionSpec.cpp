@@ -203,6 +203,87 @@ FString AIDAActionSpec::SummarizeLabel(const FAIDALabelSpec& Spec, const FString
 	return Summary;
 }
 
+bool AIDAActionSpec::ParsePowerSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAPowerSpec& Out, FString& OutError)
+{
+	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }
+	if (!CheckVersion(Spec, OutError)) { return false; }
+
+	FAIDAPowerSpec Parsed;
+	Spec->TryGetStringField(TEXT("buildable"), Parsed.Buildable);
+	Parsed.Buildable = Parsed.Buildable.TrimStartAndEnd();
+	Spec->TryGetStringField(TEXT("pole"), Parsed.Pole);
+	Parsed.Pole = Parsed.Pole.TrimStartAndEnd();
+
+	if (Spec->HasField(TEXT("center")))
+	{
+		if (!ReadVectorM(Spec, TEXT("center"), Parsed.CenterM))
+		{
+			OutError = TEXT("'center' must be an object with numeric x and y (metres) — or omit it to wire the machines near the player");
+			return false;
+		}
+		Parsed.bHasCenter = true;
+	}
+	if (Spec->HasField(TEXT("radiusM")))
+	{
+		if (!Spec->TryGetNumberField(TEXT("radiusM"), Parsed.RadiusM) || Parsed.RadiusM <= 0.0)
+		{
+			OutError = TEXT("'radiusM' must be a positive number");
+			return false;
+		}
+	}
+	int32 MaxCount = 0;
+	if (Spec->TryGetNumberField(TEXT("maxCount"), MaxCount))
+	{
+		if (MaxCount < 1) { OutError = TEXT("'maxCount' must be >= 1"); return false; }
+		Parsed.MaxCount = MaxCount;
+	}
+	if (MaxItems > 0) { Parsed.MaxCount = Parsed.MaxCount > 0 ? FMath::Min(Parsed.MaxCount, MaxItems) : MaxItems; }
+
+	Out = MoveTemp(Parsed);
+	return true;
+}
+
+FAIDAPowerPlan AIDAActionSpec::PlanPowerForPoints(const TArray<FVector>& MachinesCm, int32 MachinesPerPole, double OffsetCm)
+{
+	FAIDAPowerPlan Plan;
+	if (MachinesCm.Num() == 0)
+	{
+		Plan.Error = TEXT("no machines to power");
+		return Plan;
+	}
+	const int32 PerPole = FMath::Max(1, MachinesPerPole);
+
+	// Dominant world axis by extent: machine rows track the build grid closely enough to chunk by
+	// projection, and the perpendicular offset pushes the poles out of the row line itself.
+	FBox Bounds(ForceInit);
+	for (const FVector& Machine : MachinesCm) { Bounds += Machine; }
+	const FVector Size = Bounds.GetSize();
+	const bool bAlongX = Size.X >= Size.Y;
+
+	TArray<int32> Order;
+	Order.Reserve(MachinesCm.Num());
+	for (int32 i = 0; i < MachinesCm.Num(); ++i) { Order.Add(i); }
+	Order.Sort([&MachinesCm, bAlongX](int32 A, int32 B)
+	{
+		return bAlongX ? MachinesCm[A].X < MachinesCm[B].X : MachinesCm[A].Y < MachinesCm[B].Y;
+	});
+
+	const FVector Perp = bAlongX ? FVector(0.0, 1.0, 0.0) : FVector(1.0, 0.0, 0.0);
+	for (int32 Start = 0; Start < Order.Num(); Start += PerPole)
+	{
+		const int32 End = FMath::Min(Start + PerPole, Order.Num());
+		FVector Centroid = FVector::ZeroVector;
+		for (int32 i = Start; i < End; ++i) { Centroid += MachinesCm[Order[i]]; }
+		Centroid /= (End - Start);
+
+		const int32 PoleIndex = Plan.Poles.Num();
+		Plan.Poles.Add(FTransform(Centroid + Perp * OffsetCm));
+		for (int32 i = Start; i < End; ++i) { Plan.MachineWires.Add(FIntPoint(Order[i], PoleIndex)); }
+		if (PoleIndex > 0) { Plan.ChainWires.Add(FIntPoint(PoleIndex - 1, PoleIndex)); }
+	}
+	return Plan;
+}
+
 bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError)
 {
 	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }

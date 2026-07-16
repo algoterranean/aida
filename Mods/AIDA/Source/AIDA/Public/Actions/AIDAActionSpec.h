@@ -52,6 +52,22 @@ namespace AIDAActionSpec
 		double StandoffM, double FootprintM, double MaxRunM);
 
 	/**
+	 * Parse + validate a propose_power spec: version 1, everything optional — buildable filter,
+	 * pole override, center (omitted = requester's aim), radiusM (default 30), maxCount (0 = all,
+	 * clamped to MaxItems).
+	 */
+	bool ParsePowerSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAPowerSpec& Out, FString& OutError);
+
+	/**
+	 * Plan poles + wires for EXISTING machines at arbitrary points (propose_power, pure geometry):
+	 * machines sorted along the dominant world axis, chunked MachinesPerPole per pole, pole at each
+	 * chunk's centroid pushed OffsetCm perpendicular to the row, consecutive poles chained.
+	 * MachineWires.X indexes the input array. Callers ground-probe and validate the poles (and
+	 * retry with flipped/larger offsets).
+	 */
+	FAIDAPowerPlan PlanPowerForPoints(const TArray<FVector>& MachinesCm, int32 MachinesPerPole, double OffsetCm);
+
+	/**
 	 * Plan the power layout for a row-major machine grid (docs/PHASE4-POWER.md, pure geometry):
 	 * chunks of MachinesPerPole per row get one pole at the chunk's midpoint, half a step off the
 	 * row line (between rows; the last row of a multi-row grid folds back), plus machine→pole wire

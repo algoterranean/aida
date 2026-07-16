@@ -248,6 +248,16 @@ public:
 	static bool ResolveAutoPower(UObject* WorldContext, const FString& MachineRecipePath,
 		const FString& PoleOverrideName, FAIDAPowerInfo& Out, FString& OutError);
 
+	/**
+	 * EXISTING machines near a point whose power connection is unwired (propose_power). Name filter
+	 * optional; machines whose power connection is already on a circuit count in OutSkippedPowered;
+	 * buildables with no power connection at all are silently not matches. Reuses FAIDAManifoldPort
+	 * as the carrier (Machine + display name + location; NormalCm unused).
+	 */
+	static int32 ResolveUnpoweredMachines(UObject* WorldContext, const FString& Buildable,
+		const FVector& CenterCm, double RadiusCm, int32 MaxCount,
+		TArray<FAIDAManifoldPort>& OutMachines, int32& OutSkippedPowered);
+
 	/** Can central storage cover this WHOLE tally right now? (Merged machine+pole affordability.) */
 	static bool CheckAffordable(UObject* WorldContext, const TArray<FAIDACostItem>& Cost);
 

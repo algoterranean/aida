@@ -111,6 +111,18 @@ struct FAIDALabelTarget
 	FString Text;                          // the label (dominant item), resolved at propose time
 };
 
+/** propose_power spec v1 (live-verify gap): wire EXISTING unpowered machines to the grid. */
+struct FAIDAPowerSpec
+{
+	int32 Version = 1;
+	FString Buildable;                     // display-name match; "" = any unpowered machine
+	FString Pole;                          // optional pole override; "" = lowest unlocked mk
+	FVector CenterM = FVector::ZeroVector; // metres
+	bool bHasCenter = false;               // omitted center = the requester's aim (then position)
+	double RadiusM = 30.0;
+	int32 MaxCount = 0;                    // 0 = all in radius (clamped to MaxItems when capped)
+};
+
 /** One machine-port point for the pure planner (world units; the seam resolves these live). */
 struct FAIDAManifoldPortPoint
 {
@@ -260,7 +272,10 @@ struct FAIDAProposal
 
 	//~ Auto-power extensions (docs/PHASE4-POWER.md). Powered builds run phases 0 machines →
 	//  1 poles → 2 wires + grid tie. Empty/false = a plain (or manifold) proposal.
+	//  bPowerOnly (propose_power): the machines already EXIST — phase 0 fills the machine slots
+	//  from Ports instead of building; Placements mirror PolePlacements for the ghost preview.
 	bool bAutoPower = false;
+	bool bPowerOnly = false;
 	TArray<FTransform> PolePlacements;
 	FString PoleRecipePath;
 	FString PoleName;

@@ -1936,6 +1936,40 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 			AIDATestParseJson(TEXT(R"({ "version": 1, "center": { "x": 1, "y": 2 } })")), 200, Sel, Error));
 	}
 
+	// Power spec (propose_power): everything optional but the version; planner chunks rows.
+	{
+		FAIDAPowerSpec Power;
+		TestTrue(TEXT("minimal power spec parses"), AIDAActionSpec::ParsePowerSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1 })")), 200, Power, Error));
+		TestFalse(TEXT("omitted center flagged"), Power.bHasCenter);
+		TestEqual(TEXT("default radius 30"), Power.RadiusM, 30.0);
+		TestEqual(TEXT("maxCount 0 clamps to cap"), Power.MaxCount, 200);
+
+		TestTrue(TEXT("full power spec parses"), AIDAActionSpec::ParsePowerSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "Refinery", "pole": "Power Pole Mk.2",
+			                            "center": { "x": 1, "y": 2 }, "radiusM": 15, "maxCount": 4 })")), 200, Power, Error));
+		TestEqual(TEXT("buildable filter"), Power.Buildable, TEXT("Refinery"));
+		TestEqual(TEXT("pole override"), Power.Pole, TEXT("Power Pole Mk.2"));
+		TestEqual(TEXT("maxCount kept"), Power.MaxCount, 4);
+
+		// 5 machines in a row along X, 2 per pole -> 3 poles offset in Y, chained, every machine wired.
+		TArray<FVector> Row;
+		for (int32 i = 0; i < 5; ++i) { Row.Add(FVector(i * 1000.0, 0.0, 0.0)); }
+		const FAIDAPowerPlan Plan = AIDAActionSpec::PlanPowerForPoints(Row, 2, 300.0);
+		TestTrue(TEXT("plan ok"), Plan.Error.IsEmpty());
+		TestEqual(TEXT("three poles"), Plan.Poles.Num(), 3);
+		TestEqual(TEXT("five machine wires"), Plan.MachineWires.Num(), 5);
+		TestEqual(TEXT("two chain wires"), Plan.ChainWires.Num(), 2);
+		if (Plan.Poles.Num() == 3)
+		{
+			AIDA_TEST_NEAR("first pole at first chunk centroid X", Plan.Poles[0].GetLocation().X, 500.0);
+			AIDA_TEST_NEAR("pole offset perpendicular", Plan.Poles[0].GetLocation().Y, 300.0);
+			AIDA_TEST_NEAR("last pole alone at the tail", Plan.Poles[2].GetLocation().X, 4000.0);
+		}
+		const FAIDAPowerPlan Empty = AIDAActionSpec::PlanPowerForPoints({}, 2, 300.0);
+		TestTrue(TEXT("empty input errors"), !Empty.Error.IsEmpty());
+	}
+
 	// Label spec (P7 Slice 3): everything optional but the version; defaults hold; bad radius rejects.
 	{
 		FAIDALabelSpec Label;
