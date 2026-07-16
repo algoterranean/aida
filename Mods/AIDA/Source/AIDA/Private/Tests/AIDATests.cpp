@@ -2450,6 +2450,12 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		{
 			TestEqual(TEXT("pending countdown"), static_cast<int32>(List[0]->AsObject()->GetNumberField(TEXT("expiresInSec"))), 500);
 		}
+		TestEqual(TEXT("filtered pendingCount"), static_cast<int32>(One->GetNumberField(TEXT("pendingCount"))), 1);
+
+		// An empty/none-pending status leads with pendingCount 0 and a do-not-fabricate note.
+		const TSharedPtr<FJsonObject> None = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({}, FGuid(), 1100, 600));
+		TestEqual(TEXT("no pending"), static_cast<int32>(None->GetNumberField(TEXT("pendingCount"))), 0);
+		TestTrue(TEXT("none-pending note present"), None->HasField(TEXT("note")));
 	}
 
 	// RefundJson codec: items round-trip with their descriptor class paths.

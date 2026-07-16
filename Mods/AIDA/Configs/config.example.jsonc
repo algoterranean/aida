@@ -4,10 +4,10 @@
 // any replicated struct or client-reachable path. Never commit a real key (see .gitignore).
 {
   "provider": {
-    "type": "openai-compatible",                 // "openai-compatible" | "anthropic"
-    "baseUrl": "http://localhost:11434/v1",      // OpenAI, Anthropic, or Ollama/LAN. Ollama shown (free, local).
-    "apiKey": "",                                // SERVER-ONLY. Leave empty for keyless local endpoints.
-    "model": "llama3.1",
+    "type": "anthropic",                         // "openai-compatible" | "anthropic"
+    "baseUrl": "https://api.anthropic.com",      // Anthropic shown; for Ollama/LAN use "openai-compatible" + "http://localhost:11434/v1".
+    "apiKey": "",                                // SERVER-ONLY. Required for Anthropic; leave empty for keyless local endpoints.
+    "model": "claude-sonnet-5",
     "maxOutputTokens": 32768,                    // a CAP, not a spend — big composite build specs are several KB of tool-call JSON; truncation mid-call loses the whole call
     "visionModel": ""                            // optional: model used for requests carrying reference images (empty = "model")
   },

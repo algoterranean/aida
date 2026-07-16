@@ -827,6 +827,7 @@ FString AIDAActionSpec::BuildErrorJson(const FString& Error, const TArray<FAIDAP
 FString AIDAActionSpec::BuildStatusJson(const TArray<FAIDAProposal>& Proposals, const FGuid& Filter, int64 NowUtc, int32 TtlSeconds)
 {
 	TArray<TSharedPtr<FJsonValue>> List;
+	int32 PendingCount = 0;
 	for (const FAIDAProposal& P : Proposals)
 	{
 		if (Filter.IsValid() && P.Id != Filter) { continue; }
@@ -838,13 +839,23 @@ FString AIDAActionSpec::BuildStatusJson(const TArray<FAIDAProposal>& Proposals, 
 		O->SetStringField(TEXT("requester"), P.RequesterName);
 		if (P.State == EAIDAProposalState::Pending)
 		{
+			++PendingCount;
 			const int64 Left = (P.ProposedUtc + TtlSeconds) - NowUtc;
 			O->SetNumberField(TEXT("expiresInSec"), FMath::Max<int64>(0, Left));
 		}
 		List.Add(MakeShared<FJsonValueObject>(O));
 	}
 
+	// pendingCount leads the payload: the list includes recently RESOLVED proposals for context, and
+	// the model must never mistake an executed entry for a live queue (live-verify: it announced
+	// "approve with /aida approve" off a status listing where everything had already built).
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("pendingCount"), PendingCount);
+	if (PendingCount == 0)
+	{
+		Root->SetStringField(TEXT("note"),
+			TEXT("NOTHING is awaiting approval — entries below are resolved history. To build more, call propose_build; never tell the player to approve without a new proposalId from a tool result."));
+	}
 	Root->SetNumberField(TEXT("count"), List.Num());
 	Root->SetArrayField(TEXT("proposals"), List);
 	return AIDAToCompactJson(Root);

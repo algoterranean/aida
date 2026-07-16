@@ -33,6 +33,15 @@
 
 namespace
 {
+	/** Does this reply text invite the player to approve a proposal? (Fabrication tripwire input.) */
+	bool AIDATextInvitesApproval(const FString& Text)
+	{
+		return Text.Contains(TEXT("/aida approve"), ESearchCase::IgnoreCase)
+			|| Text.Contains(TEXT("awaiting approval"), ESearchCase::IgnoreCase)
+			|| Text.Contains(TEXT("approve with"), ESearchCase::IgnoreCase)
+			|| Text.Contains(TEXT("awaiting your approval"), ESearchCase::IgnoreCase);
+	}
+
 	/** Map a tool's declared tier onto the permission tier the orchestrator gates it with. */
 	EAIDATier ToPermissionTier(EAIDAToolTier Tier)
 	{
@@ -774,6 +783,7 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 	BuildChatContext(ConversationId, Context);
 
 	const FGuid MsgId = Session->BeginAIDAMessage(TEXT("AIDA"), ConversationId);
+	const int64 ReplyStartUtc = FDateTime::UtcNow().ToUnixTimestamp();
 
 	// Route the visible chat through the tool loop so the model can inspect the factory before answering.
 	// Shared so the message history survives the async tool rounds.
@@ -789,11 +799,36 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 				O->Session->AppendDelta(MsgId, Delta);
 			}
 		},
-		[Weak, MsgId](const FString& /*FullText*/)
+		[Weak, MsgId, ConversationId, ReplyStartUtc](const FString& FullText)
 		{
 			if (UAIDAOrchestrator* O = Weak.Get(); O && O->Session.IsValid())
 			{
 				O->Session->CompleteMessage(MsgId);
+
+				// Fabrication tripwire (live-verify: the model announced "approve with /aida approve"
+				// after reading get_proposal_status, without ever calling propose_build). If the reply
+				// invites approval but NOTHING is pending and nothing was proposed during this reply,
+				// correct the record IMMEDIATELY — not when the player's approve bounces.
+				if (O->Config.Actions.bEnabled && AIDATextInvitesApproval(FullText))
+				{
+					O->SweepProposals();
+					bool bRealProposal = false;
+					for (const FAIDAProposal& Proposal : O->Actions.Store().All())
+					{
+						if (Proposal.State == EAIDAProposalState::Pending || Proposal.ProposedUtc >= ReplyStartUtc)
+						{
+							bRealProposal = true;
+							break;
+						}
+					}
+					if (!bRealProposal)
+					{
+						UE_LOG(LogAIDA, Warning, TEXT("[actions] reply invited approval but created no proposal — posting correction."));
+						O->Session->PostSystemMessage(
+							TEXT("(Heads up: that reply mentions approving a proposal, but none was actually created — real proposals always get an 'AIDA proposes …' line. Tell AIDA to 'propose it' to get a real one.)"),
+							ConversationId);
+					}
+				}
 			}
 		},
 		[Weak, MsgId](int32 Status, const FString& Message)
