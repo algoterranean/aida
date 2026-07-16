@@ -1325,17 +1325,41 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
-			const FString AttachmentName = !Spec.Attachment.IsEmpty() ? Spec.Attachment
-				: (Spec.bPipe ? TEXT("Pipeline Junction Cross")
-					: (Spec.bOutput ? TEXT("Conveyor Merger") : TEXT("Conveyor Splitter")));
-			FAIDARecipeResolution Attachment;
-			if (!FAIDAActionSeam::ResolveBuildRecipe(this, AttachmentName, Attachment))
+			// Default attachment names are TRIED IN ORDER — the game's display names drift ("Pipeline
+			// Junction Cross" vs "Pipeline Junction"; live-verify: a miss with no suggestions read as
+			// "you haven't unlocked junctions"). An explicit spec override is a single candidate.
+			TArray<FString> AttachmentNames;
+			if (!Spec.Attachment.IsEmpty())
 			{
-				FString Msg = FString::Printf(TEXT("no unlocked buildable matches attachment '%s'"), *AttachmentName);
+				AttachmentNames.Add(Spec.Attachment);
+			}
+			else if (Spec.bPipe)
+			{
+				AttachmentNames = { TEXT("Pipeline Junction Cross"), TEXT("Pipeline Junction"), TEXT("Junction") };
+			}
+			else
+			{
+				AttachmentNames.Add(Spec.bOutput ? TEXT("Conveyor Merger") : TEXT("Conveyor Splitter"));
+			}
+			FAIDARecipeResolution Attachment;
+			FString AttachmentName;
+			for (const FString& Candidate : AttachmentNames)
+			{
+				if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Attachment))
+				{
+					AttachmentName = Candidate;
+					break;
+				}
+			}
+			if (AttachmentName.IsEmpty())
+			{
+				FString Msg = FString::Printf(TEXT("no unlocked buildable matches attachment '%s' — the name may differ from the build menu, or it may be locked"),
+					*FString::Join(AttachmentNames, TEXT("' / '")));
 				if (Attachment.Suggestions.Num() > 0)
 				{
-					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Attachment.Suggestions, TEXT(", ")));
+					Msg += FString::Printf(TEXT("; closest: %s"), *FString::Join(Attachment.Suggestions, TEXT(", ")));
 				}
+				Msg += TEXT("; you can pass 'attachment' with the exact build-menu name");
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
 

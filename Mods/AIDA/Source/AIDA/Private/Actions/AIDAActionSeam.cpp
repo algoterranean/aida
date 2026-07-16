@@ -401,19 +401,30 @@ bool FAIDAActionSeam::ResolveBuildRecipe(UObject* WorldContext, const FString& D
 	const FString Wanted = NormalizeName(DisplayName);
 	if (Wanted.IsEmpty()) { return false; }
 
-	// Exact (normalized) match wins; otherwise a UNIQUE substring match; otherwise suggestions.
+	// Exact (normalized) match wins; otherwise a UNIQUE substring match — in EITHER direction: the
+	// model often over-specifies ("Pipeline Junction Cross" for a building named "Pipeline
+	// Junction"; live-verify: zero matches AND zero suggestions read as "not unlocked"). Reverse
+	// candidates need some length so "Junction Deluxe" can't claim a query for "junk".
 	const FBuildRecipeEntry* Exact = nullptr;
 	TArray<const FBuildRecipeEntry*> Partial;
+	TArray<const FBuildRecipeEntry*> Reverse;
 	for (const FBuildRecipeEntry& Entry : Entries)
 	{
 		const FString Candidate = NormalizeName(Entry.Name);
 		if (Candidate == Wanted) { Exact = &Entry; break; }
 		if (Candidate.Contains(Wanted)) { Partial.Add(&Entry); }
+		else if (Candidate.Len() >= 8 && Wanted.Contains(Candidate)) { Reverse.Add(&Entry); }
 	}
-	const FBuildRecipeEntry* Chosen = Exact ? Exact : (Partial.Num() == 1 ? Partial[0] : nullptr);
+	const FBuildRecipeEntry* Chosen = Exact ? Exact
+		: (Partial.Num() == 1 ? Partial[0] : (Partial.Num() == 0 && Reverse.Num() == 1 ? Reverse[0] : nullptr));
 	if (!Chosen)
 	{
 		for (const FBuildRecipeEntry* Candidate : Partial)
+		{
+			if (Out.Suggestions.Num() >= MaxSuggestions) { break; }
+			Out.Suggestions.AddUnique(Candidate->Name);
+		}
+		for (const FBuildRecipeEntry* Candidate : Reverse)
 		{
 			if (Out.Suggestions.Num() >= MaxSuggestions) { break; }
 			Out.Suggestions.AddUnique(Candidate->Name);
