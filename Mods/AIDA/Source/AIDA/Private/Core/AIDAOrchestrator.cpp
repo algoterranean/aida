@@ -118,7 +118,10 @@ namespace
 		"inputs, 'out' collects outputs; 'both ends' or 'inputs and outputs' means TWO calls, one 'in' and "
 		"one 'out'. Omit machines.center to use the machines the player is looking at ('these assemblers', "
 		"'this row') — that is almost always right; only ask when you truly cannot tell which machine TYPE "
-		"they mean. Machines already connected on that port are skipped automatically.\n"
+		"they mean. Machines already connected on that port are skipped automatically. When machines need "
+		"BOTH belt and pipe manifolds on the same side (refineries etc.), propose the PIPE manifolds FIRST: "
+		"pipes hug the machines, and a later manifold's row automatically steps further out when its lane "
+		"is occupied.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
 		"/aida undo (or /aida undo N) in this chat. Players decide proposals with the on-screen card or "
@@ -1420,12 +1423,62 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Points.Add({ Port.PosCm, Port.NormalCm });
 			}
+			// Plan at the requested standoff, and when the near lane is blocked (a pipe-junction row
+			// already hugging the machines, any obstruction) STEP THE ROW OUTWARD and retry instead
+			// of failing — a machine that needs both belt and pipe manifolds gets pipes close in and
+			// splitters/mergers further back, without anyone doing lane math.
 			const double FootprintM = FMath::Max(Attachment.FootprintXM, Attachment.FootprintYM);
-			FAIDAManifoldPlan Plan = AIDAActionSpec::PlanManifold(Points, Spec.bOutput, Spec.bPipe,
-				Spec.StandoffM, FootprintM, /*MaxRunM*/ 56.0);
-			if (!Plan.Error.IsEmpty())
+			FAIDAManifoldPlan Plan;
+			FAIDADryRunResult DryRun;
+			double UsedStandoffM = Spec.StandoffM;
+			bool bPlaced = false;
+			for (int32 Attempt = 0; Attempt < 4; ++Attempt)
 			{
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+				UsedStandoffM = Spec.StandoffM + Attempt * 3.0;
+				Plan = AIDAActionSpec::PlanManifold(Points, Spec.bOutput, Spec.bPipe,
+					UsedStandoffM, FootprintM, /*MaxRunM*/ 56.0);
+				if (!Plan.Error.IsEmpty())
+				{
+					// Geometry errors (mixed facing, machines too close) don't improve with distance.
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+				}
+
+				// Attachments stand on the floor under each trunk point; belts auto-route the height.
+				for (FTransform& Placement : Plan.Attachments)
+				{
+					double GroundZ;
+					if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
+					{
+						FVector Location = Placement.GetLocation();
+						Location.Z = GroundZ;
+						Placement.SetLocation(Location);
+					}
+				}
+				Stage(FString::Printf(TEXT("planned %d attachment(s) at %.0f m (yaw=%d axis=%s) — dry-running"),
+					Plan.Attachments.Num(), UsedStandoffM, Plan.YawDeg, *Plan.RowAxis.ToCompactString()));
+
+				if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+				}
+				if (DryRun.bOk)
+				{
+					bPlaced = true;
+					break;
+				}
+				Stage(FString::Printf(TEXT("%d placement(s) blocked at %.0f m — stepping the row out"),
+					DryRun.Failures.Num(), UsedStandoffM));
+			}
+			if (!bPlaced)
+			{
+				const FString Msg = FString::Printf(TEXT("%d of %d attachment placement(s) invalid even %.0f m out from the ports"),
+					DryRun.Failures.Num(), Plan.Attachments.Num(), UsedStandoffM);
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
+			}
+			if (UsedStandoffM != Spec.StandoffM)
+			{
+				// The stored/journaled spec must carry the standoff that actually validated.
+				(*SpecObj)->SetNumberField(TEXT("standoffM"), UsedStandoffM);
 			}
 
 			// Reorder the ports to the plan's sort so everything downstream is index-aligned.
@@ -1434,34 +1487,6 @@ void UAIDAOrchestrator::RegisterActionTools()
 			for (const int32 PortIdx : Plan.PortOrder)
 			{
 				SortedPorts.Add(Ports[PortIdx]);
-			}
-
-			Stage(FString::Printf(TEXT("planned %d attachment(s) yaw=%d axis=%s — probing ground"),
-				Plan.Attachments.Num(), Plan.YawDeg, *Plan.RowAxis.ToCompactString()));
-
-			// Attachments stand on the floor under each trunk point; belts auto-route the height.
-			for (FTransform& Placement : Plan.Attachments)
-			{
-				double GroundZ;
-				if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
-				{
-					FVector Location = Placement.GetLocation();
-					Location.Z = GroundZ;
-					Placement.SetLocation(Location);
-				}
-			}
-			Stage(TEXT("ground probed — dry-running attachments"));
-
-			FAIDADryRunResult DryRun;
-			if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun))
-			{
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
-			}
-			if (!DryRun.bOk)
-			{
-				const FString Msg = FString::Printf(TEXT("%d of %d attachment placement(s) invalid"),
-					DryRun.Failures.Num(), Plan.Attachments.Num());
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, DryRun.Failures));
 			}
 			if (Config.Actions.CostMode == TEXT("central") && !DryRun.bAffordable)
 			{
@@ -1496,6 +1521,10 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (SkippedConnected > 0)
 			{
 				Proposal.Summary += FString::Printf(TEXT(" [%d machine(s) already connected, skipped]"), SkippedConnected);
+			}
+			if (UsedStandoffM != Spec.StandoffM)
+			{
+				Proposal.Summary += FString::Printf(TEXT(" [row stepped out to %.0f m]"), UsedStandoffM);
 			}
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
