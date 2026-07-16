@@ -25,4 +25,15 @@ namespace AIDAMapTools
 	 */
 	const FAIDAResourceNode* FindNearestUntapped(const TArray<FAIDAResourceNode>& Nodes, const FString& ResourceFilter,
 		const FString& PurityFilter, const FVector& From, bool bHasFrom);
+
+	/** Sentinel in BuildTerrainProbeJson height grids: the ground probe hit nothing (emitted as null). */
+	inline constexpr double AIDATerrainNoHit = -1.0e9;
+
+	/**
+	 * probe_terrain (P5 reconstruction aid): a Rows x Cols grid of ground heights in metres, row-major —
+	 * row 0 is the grid's north edge (game north = -Y), columns run west->east (+X). Emits the height
+	 * rows plus min/max/spread over the cells that hit. Pure, so it unit-tests on synthetic heights.
+	 */
+	FString BuildTerrainProbeJson(const TArray<double>& HeightsM, int32 Cols, int32 Rows,
+		double CenterXM, double CenterYM, double StepM);
 }

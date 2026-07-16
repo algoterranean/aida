@@ -53,6 +53,97 @@ namespace
 		return true;
 	}
 
+	/** A {x,y,z} object in metres from a world-unit location. */
+	TSharedRef<FJsonObject> VecMToJson(const FVector& Cm)
+	{
+		const TSharedRef<FJsonObject> V = MakeShared<FJsonObject>();
+		V->SetField(TEXT("x"), AIDANumber(Cm.X / AIDAMetersToCm));
+		V->SetField(TEXT("y"), AIDANumber(Cm.Y / AIDAMetersToCm));
+		V->SetField(TEXT("z"), AIDANumber(Cm.Z / AIDAMetersToCm));
+		return V;
+	}
+
+	/** Part buildable names as the model wrote them, recovered from the stored spec ({} on v1/garbage). */
+	TArray<FString> PartNamesFromSpecJson(const FString& SpecJson)
+	{
+		TArray<FString> Names;
+		TSharedPtr<FJsonObject> Spec;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(SpecJson);
+		if (!FJsonSerializer::Deserialize(Reader, Spec) || !Spec.IsValid()) { return Names; }
+		const TArray<TSharedPtr<FJsonValue>>* Parts = nullptr;
+		if (!Spec->TryGetArrayField(TEXT("parts"), Parts)) { return Names; }
+		for (const TSharedPtr<FJsonValue>& Value : *Parts)
+		{
+			const TSharedPtr<FJsonObject> Part = Value.IsValid() ? Value->AsObject() : nullptr;
+			FString Name;
+			if (Part.IsValid()) { Part->TryGetStringField(TEXT("buildable"), Name); }
+			Names.Add(MoveTemp(Name));
+		}
+		return Names;
+	}
+
+	/**
+	 * As-built geometry for a build proposal's first Placed placements (docs/PHASE5-RECONSTRUCTION.md):
+	 * resolved origin + world AABB in metres, and — for spec-v2 composites — one entry per part run so
+	 * the model can verify a reconstruction against its plan and propose corrections.
+	 */
+	TSharedRef<FJsonObject> AsBuiltToJson(const FAIDAProposal& P, int32 Placed)
+	{
+		constexpr int32 MaxPartsListed = 16;
+
+		const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetNumberField(TEXT("placed"), Placed);
+		if (Placed < P.Placements.Num()) { Root->SetNumberField(TEXT("planned"), P.Placements.Num()); }
+		Root->SetObjectField(TEXT("origin"), VecMToJson(P.Placements[0].GetLocation()));
+
+		FBox Bounds(ForceInit);
+		for (int32 i = 0; i < Placed; ++i) { Bounds += P.Placements[i].GetLocation(); }
+		Root->SetObjectField(TEXT("min"), VecMToJson(Bounds.Min));
+		Root->SetObjectField(TEXT("max"), VecMToJson(Bounds.Max));
+		Root->SetStringField(TEXT("note"), TEXT("positions are placement pivots in metres, not clearance extents"));
+
+		// v2 composites: placements are stored grouped by part (contiguous runs), so one pass suffices.
+		if (P.PlacementPartIndex.Num() == P.Placements.Num() && P.PartRecipePaths.Num() > 0)
+		{
+			const TArray<FString> PartNames = PartNamesFromSpecJson(P.SpecJson);
+			TArray<TSharedPtr<FJsonValue>> PartsArr;
+			int32 Start = 0;
+			while (Start < Placed)
+			{
+				const int32 PartIdx = P.PlacementPartIndex[Start];
+				FBox PartBounds(ForceInit);
+				int32 End = Start;
+				while (End < Placed && P.PlacementPartIndex[End] == PartIdx)
+				{
+					PartBounds += P.Placements[End].GetLocation();
+					++End;
+				}
+				if (PartsArr.Num() >= MaxPartsListed)
+				{
+					Root->SetBoolField(TEXT("partsTruncated"), true);
+					break;
+				}
+				const TSharedRef<FJsonObject> PartO = MakeShared<FJsonObject>();
+				PartO->SetNumberField(TEXT("part"), PartIdx);
+				if (PartNames.IsValidIndex(PartIdx) && !PartNames[PartIdx].IsEmpty())
+				{
+					PartO->SetStringField(TEXT("buildable"), PartNames[PartIdx]);
+				}
+				PartO->SetNumberField(TEXT("count"), End - Start);
+				PartO->SetObjectField(TEXT("first"), VecMToJson(P.Placements[Start].GetLocation()));
+				if (End - Start > 1)
+				{
+					PartO->SetObjectField(TEXT("min"), VecMToJson(PartBounds.Min));
+					PartO->SetObjectField(TEXT("max"), VecMToJson(PartBounds.Max));
+				}
+				PartsArr.Add(MakeShared<FJsonValueObject>(PartO));
+				Start = End;
+			}
+			Root->SetArrayField(TEXT("parts"), PartsArr);
+		}
+		return Root;
+	}
+
 	TSharedRef<FJsonObject> CostToJson(const FAIDACostItem& Item)
 	{
 		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
@@ -842,6 +933,17 @@ FString AIDAActionSpec::BuildStatusJson(const TArray<FAIDAProposal>& Proposals, 
 			++PendingCount;
 			const int64 Left = (P.ProposedUtc + TtlSeconds) - NowUtc;
 			O->SetNumberField(TEXT("expiresInSec"), FMath::Max<int64>(0, Left));
+		}
+
+		// As-built geometry for plain builds that actually placed something (executed, or failed
+		// partway = the first Cursor placements). The model checks a reconstruction against its
+		// dimensioned plan with this instead of building blind (docs/PHASE5-RECONSTRUCTION.md).
+		const bool bPlainBuild = !P.bDismantle && !P.bManifold && !P.bLabel && !P.bPowerOnly;
+		const int32 Placed = P.State == EAIDAProposalState::Executed ? P.Placements.Num()
+			: (P.State == EAIDAProposalState::Failed ? FMath::Min(P.Cursor, P.Placements.Num()) : 0);
+		if (bPlainBuild && Placed > 0)
+		{
+			O->SetObjectField(TEXT("asBuilt"), AsBuiltToJson(P, Placed));
 		}
 		List.Add(MakeShared<FJsonValueObject>(O));
 	}

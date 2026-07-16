@@ -726,15 +726,31 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 	}
 
 	// Phase 5: reference-image guidance (stable text — keep it BEFORE the volatile state line).
+	// Reconstruction protocol (docs/PHASE5-RECONSTRUCTION.md): committing to numbers in text BEFORE
+	// the tool call is what turns "vibes about massing" into buildable geometry.
 	if (Config.Uploads.bEnabled)
 	{
 		SystemPrompt += TEXT("\n\nPlayers may attach reference images (photos, sketches, screenshots of buildings) to their"
-			" messages. When a message includes an image, study its massing, proportions, and materials, then reconstruct it"
-			" as ONE propose_build version-2 COMPOSITE: decompose the reference into parts (floor slabs, walls, pillars,"
-			" beams, terraces) with explicit at:{x,y,z} offsets in metres — z is height, so stacked storeys and cantilevered"
-			" decks are different parts at different z. Use several proposals only when one composite can't express it,"
-			" placing later ones relative to the resolved origin the tool result returns. Briefly state your interpretation"
-			" first. Never claim to see an image unless one is actually attached to a message in this conversation.");
+			" messages. When a message includes an image, reconstruct it with this PROTOCOL, in order:"
+			"\n1) SCALE: photos carry no scale bar — estimate the real building's size from human-scale cues"
+			" (a door ~2 m, a person ~1.8 m, a deck chair ~1.5 m, one photographed storey ~3-4 m, a mature tree ~15 m)"
+			" and state the overall bounding box as width x depth x height in metres."
+			"\n2) PLAN IN TEXT FIRST: before any propose call, write a short dimensioned plan — storey count, then one"
+			" line per part: buildable, size, at:{x,y,z} offset, and what it represents in the image (e.g. 'upper"
+			" cantilevered terrace'). Only then translate that plan into the tool call."
+			"\n3) SNAP to the game's modules: foundations are 8x8 m tiles (1/2/4 m thick), walls 8 m wide x 4 m tall"
+			" (one storey = 4 m of z), so round every estimate to multiples of 1/2/4/8 m."
+			"\n4) BUILD as ONE propose_build v2 composite. Placement conventions: a part's 'at' offset runs from the"
+			" composite origin to the part's FIRST placement (grid row 0, col 0 — the actor pivot); grids expand +X"
+			" then +Y and rotate with the composite yawDeg, so offsets and rows turn together; at.z is height above"
+			" the origin — stacked storeys and cantilevered decks are separate parts at different z. On uneven ground,"
+			" call probe_terrain first and set part z from the sampled heights. Use several proposals only when one"
+			" composite can't express it, placing later ones relative to the resolved origin the tool result returns."
+			"\n5) VERIFY: after execution, call get_proposal_status and compare each part's as-built position against"
+			" your plan; if something is off, say so and propose a correcting composite."
+			"\nIf the massing is ambiguous from one photo, ask the player for another angle (messages can carry several"
+			" images) instead of guessing. Never claim to see an image unless one is actually attached to a message in"
+			" this conversation.");
 	}
 
 	// Ground the model in the AUTHORITATIVE proposal state every request — it kept inventing queue
@@ -994,6 +1010,73 @@ void UAIDAOrchestrator::RegisterTools()
 			UWorld* World = GetWorld();
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			return FAIDAToolResult::Ok(AIDAMapTools::BuildResourceNodesJson(MapService.GetNodes(World, Now), Resource, bUntappedOnly));
+		}
+	});
+
+	// P5 reconstruction aid (docs/PHASE5-RECONSTRUCTION.md): ground-height sampling so composite part
+	// z offsets can follow the real terrain instead of assuming a flat plane.
+	Tools.Register({
+		TEXT("probe_terrain"),
+		TEXT("Sample ground heights on a square grid around a point. Use BEFORE proposing multi-part builds on uneven ground (slopes, cliffs, river banks) so part z offsets can follow the terrain. Omit x/y to probe around the requesting player's aim (falling back to their position). Returns ground z in metres — row 0 is the grid's north edge (-Y), columns run west->east (+X) — plus min/max/spread."),
+		TEXT(R"({"type":"object","properties":{"x":{"type":"number","description":"Optional center X in metres; omit to use the player's aim."},"y":{"type":"number","description":"Optional center Y in metres."},"radius_m":{"type":"number","description":"Half-width of the sampled square in metres (default 32, max 128)."},"step_m":{"type":"number","description":"Sample spacing in metres (default 8; coarsened automatically if the grid would exceed 33x33)."}}})"),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			double XM = 0.0, YM = 0.0;
+			const bool bHasX = Args->TryGetNumberField(TEXT("x"), XM);
+			const bool bHasY = Args->TryGetNumberField(TEXT("y"), YM);
+
+			FVector CenterCm = FVector::ZeroVector;
+			FVector AimCm = FVector::ZeroVector;
+			if (bHasX && bHasY)
+			{
+				// Probe start height: the requester's z when known — ProbeGroundZ retries from +50 m anyway.
+				CenterCm = FVector(XM * AIDAMetersToCm, YM * AIDAMetersToCm, Ctx.bHasLocation ? Ctx.Location.Z : 0.0);
+			}
+			else if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+			{
+				CenterCm = AimCm;
+			}
+			else if (Ctx.bHasLocation)
+			{
+				CenterCm = Ctx.Location;
+			}
+			else
+			{
+				return FAIDAToolResult::Error(TEXT("probe_terrain needs 'x' and 'y' — the requesting player's aim/position could not be resolved."));
+			}
+
+			double RadiusM = 32.0;
+			Args->TryGetNumberField(TEXT("radius_m"), RadiusM);
+			RadiusM = FMath::Clamp(RadiusM, 4.0, 128.0);
+			double StepM = 8.0;
+			Args->TryGetNumberField(TEXT("step_m"), StepM);
+			StepM = FMath::Clamp(StepM, 1.0, RadiusM);
+
+			// Cap the trace count: a finer step silently coarsens instead of firing thousands of traces.
+			constexpr int32 MaxPerAxis = 33;
+			int32 PerAxis = FMath::FloorToInt32(2.0 * RadiusM / StepM) + 1;
+			if (PerAxis > MaxPerAxis)
+			{
+				PerAxis = MaxPerAxis;
+				StepM = 2.0 * RadiusM / (MaxPerAxis - 1);
+			}
+
+			TArray<double> HeightsM;
+			HeightsM.Reserve(PerAxis * PerAxis);
+			for (int32 Row = 0; Row < PerAxis; ++Row)          // row 0 = north edge (-Y)
+			{
+				for (int32 Col = 0; Col < PerAxis; ++Col)      // west -> east (+X)
+				{
+					const FVector AtCm(CenterCm.X + (Col * StepM - RadiusM) * AIDAMetersToCm,
+						CenterCm.Y + (Row * StepM - RadiusM) * AIDAMetersToCm, CenterCm.Z);
+					double GroundZCm = 0.0;
+					HeightsM.Add(FAIDAActionSeam::ProbeGroundZ(this, AtCm, GroundZCm)
+						? GroundZCm / AIDAMetersToCm : AIDAMapTools::AIDATerrainNoHit);
+				}
+			}
+			return FAIDAToolResult::Ok(AIDAMapTools::BuildTerrainProbeJson(HeightsM, PerAxis, PerAxis,
+				CenterCm.X / AIDAMetersToCm, CenterCm.Y / AIDAMetersToCm, StepM));
 		}
 	});
 
@@ -1320,8 +1403,17 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 		|| Proposal->State == EAIDAProposalState::Rejected || Proposal->State == EAIDAProposalState::Expired
 		|| Proposal->State == EAIDAProposalState::Undone)
 	{
-		RecentProposalOutcomes.Add({ FDateTime::UtcNow().ToUnixTimestamp(),
-			FString::Printf(TEXT("%s: %s"), *AIDAActionSpec::StateToString(Proposal->State), *Proposal->Summary) });
+		FString Outcome = FString::Printf(TEXT("%s: %s"), *AIDAActionSpec::StateToString(Proposal->State), *Proposal->Summary);
+		// Executed builds carry their resolved origin so the model can verify/extend the structure
+		// without guessing where it landed (per-part positions live in get_proposal_status's asBuilt).
+		if (Proposal->State == EAIDAProposalState::Executed && !Proposal->bDismantle && !Proposal->bManifold
+			&& !Proposal->bLabel && !Proposal->bPowerOnly && Proposal->Placements.Num() > 0)
+		{
+			const FVector OriginM = Proposal->Placements[0].GetLocation() / AIDAMetersToCm;
+			Outcome += FString::Printf(TEXT(" [as-built origin (%.0f, %.0f, %.0f) m — get_proposal_status has per-part positions]"),
+				OriginM.X, OriginM.Y, OriginM.Z);
+		}
+		RecentProposalOutcomes.Add({ FDateTime::UtcNow().ToUnixTimestamp(), MoveTemp(Outcome) });
 		while (RecentProposalOutcomes.Num() > 8) { RecentProposalOutcomes.RemoveAt(0); }
 	}
 

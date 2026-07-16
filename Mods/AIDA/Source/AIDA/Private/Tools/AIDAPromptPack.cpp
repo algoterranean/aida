@@ -126,6 +126,22 @@ FString AIDAPromptPack::Build(const TArray<FAIDARecipeInfo>& Recipes, const TArr
 	AppendSection(Out, TEXT("Miners & extractors (multiply by 0.5 on impure nodes, 2 on pure)"), Extractors);
 	AppendSection(Out, TEXT("Structures (footprints for layout math)"), Structures);
 
+	// Static architecture guidance (P5 reconstruction, docs/PHASE5-RECONSTRUCTION.md): the material→
+	// buildable mapping and one worked composite so the model doesn't reinvent the decomposition style
+	// per request. Names are advisory — the caveat line redirects to the Structures list above.
+	Out += TEXT("\n## Architecture palette (buildings, reference-image reconstruction)\n");
+	Out += TEXT("Photo material -> buildable (when a named piece is missing from the Structures list it is not unlocked — substitute the closest one that is):\n");
+	Out += TEXT("- horizontal slab / floor / flat roof / terrace deck -> foundation tiles (8x8 m; 1 m thickness reads as a slab, 4 m as a plinth)\n");
+	Out += TEXT("- solid wall (stucco, concrete, brick, stone) -> wall pieces (8 m wide x 4 m tall = one storey)\n");
+	Out += TEXT("- ribbon or floor-to-ceiling glazing -> windowed / glass walls\n");
+	Out += TEXT("- chimney core, masonry tower, column -> a stacked 1-tile shaft of walls or pillars\n");
+	Out += TEXT("- structural posts under a cantilever -> pillars or beams\n");
+	Out += TEXT("- terrace-edge parapet or balustrade -> railings/fences\n");
+	Out += TEXT("Plan storeys at 4 m each; everything snaps best in multiples of 1/2/4/8 m.\n");
+	Out += TEXT("Worked example — \"two offset storeys with an 8 m cantilevered deck over posts\", ONE composite (origin at ground level, z up):\n");
+	Out += TEXT(R"json({"version":2,"yawDeg":0,"parts":[{"buildable":"Foundation (1 m)","at":{"x":0,"y":0,"z":0},"grid":{"countX":3,"countY":2}},{"buildable":"Wall","at":{"x":0,"y":0,"z":1},"grid":{"countX":3,"countY":1}},{"buildable":"Foundation (1 m)","at":{"x":8,"y":0,"z":5},"grid":{"countX":3,"countY":2}},{"buildable":"Pillar","at":{"x":24,"y":0,"z":0},"grid":{"countX":1,"countY":2}}]})json");
+	Out += TEXT("\nParts in order: 24x16 m ground slab; north wall of storey 1 on top of it (z 1 = slab thickness); the storey-2 slab at z 5 (1 m slab + 4 m wall), shifted +8 m in x so its far edge overhangs; pillars from the ground under the overhanging corner. Offsets point at each part's FIRST tile (row 0, col 0), not its centre-of-mass.\n");
+
 	Out += TEXT("\n## Clock speed rules\n");
 	Out += TEXT("Production building power = base MW x (clock/100)^exp (exp listed above; underclocking saves power superlinearly, e.g. exp 1.32 at 50% clock -> 40% power). Generator fuel burn scales linearly with clock. Clocking above 100% requires power shards; below 100% is always free.\n");
 

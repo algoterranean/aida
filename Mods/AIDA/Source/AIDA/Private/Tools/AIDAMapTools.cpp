@@ -113,3 +113,51 @@ const FAIDAResourceNode* AIDAMapTools::FindNearestUntapped(const TArray<FAIDARes
 	}
 	return Best;
 }
+
+FString AIDAMapTools::BuildTerrainProbeJson(const TArray<double>& HeightsM, int32 Cols, int32 Rows,
+	double CenterXM, double CenterYM, double StepM)
+{
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetField(TEXT("centerX"), AIDANumber(CenterXM));
+	Root->SetField(TEXT("centerY"), AIDANumber(CenterYM));
+	Root->SetField(TEXT("stepM"), AIDANumber(StepM));
+	Root->SetNumberField(TEXT("cols"), Cols);
+	Root->SetNumberField(TEXT("rows"), Rows);
+
+	double MinZ = TNumericLimits<double>::Max();
+	double MaxZ = TNumericLimits<double>::Lowest();
+	int32 Misses = 0;
+
+	TArray<TSharedPtr<FJsonValue>> RowValues;
+	for (int32 Row = 0; Row < Rows; ++Row)
+	{
+		TArray<TSharedPtr<FJsonValue>> Cells;
+		for (int32 Col = 0; Col < Cols; ++Col)
+		{
+			const int32 Index = Row * Cols + Col;
+			const double Height = HeightsM.IsValidIndex(Index) ? HeightsM[Index] : AIDATerrainNoHit;
+			if (Height <= AIDATerrainNoHit * 0.5)
+			{
+				++Misses;
+				Cells.Add(MakeShared<FJsonValueNull>());
+				continue;
+			}
+			MinZ = FMath::Min(MinZ, Height);
+			MaxZ = FMath::Max(MaxZ, Height);
+			Cells.Add(AIDANumber(Height));
+		}
+		RowValues.Add(MakeShared<FJsonValueArray>(Cells));
+	}
+	Root->SetArrayField(TEXT("heights"), RowValues);
+
+	if (MinZ <= MaxZ)
+	{
+		Root->SetField(TEXT("minZ"), AIDANumber(MinZ));
+		Root->SetField(TEXT("maxZ"), AIDANumber(MaxZ));
+		Root->SetField(TEXT("spreadZ"), AIDANumber(MaxZ - MinZ));
+	}
+	if (Misses > 0) { Root->SetNumberField(TEXT("noHit"), Misses); }
+	Root->SetStringField(TEXT("legend"),
+		TEXT("ground z in metres; row 0 = north edge (-Y), rows advance south, columns run west->east (+X); null = nothing under that point"));
+	return AIDAToCompactJson(Root);
+}

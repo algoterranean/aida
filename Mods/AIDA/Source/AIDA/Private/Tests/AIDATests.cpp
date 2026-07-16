@@ -2867,6 +2867,138 @@ bool FAIDASessionImageRefsTest::RunTest(const FString&)
 	return true;
 }
 
+// ──────────────────── P5 reconstruction aids (docs/PHASE5-RECONSTRUCTION.md) ────────────────────
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAPromptPackPaletteTest, "AIDA.PromptPack.ArchitecturePalette",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAPromptPackPaletteTest::RunTest(const FString&)
+{
+	// The palette is static guidance — present even with no unlocked buildings at all.
+	const FString Pack = AIDAPromptPack::Build({}, {});
+	TestTrue(TEXT("palette section"), Pack.Contains(TEXT("## Architecture palette")));
+	TestTrue(TEXT("material mapping"), Pack.Contains(TEXT("Photo material -> buildable")));
+	TestTrue(TEXT("substitution caveat"), Pack.Contains(TEXT("not unlocked")));
+	TestTrue(TEXT("worked example is v2"), Pack.Contains(TEXT("\"version\":2")));
+	TestTrue(TEXT("module rule"), Pack.Contains(TEXT("storeys at 4 m")));
+
+	// The worked example must be VALID JSON — the model copies its shape into tool args.
+	const int32 SpecStart = Pack.Find(TEXT("{\"version\":2"));
+	const int32 SpecEnd = Pack.Find(TEXT("]}"), ESearchCase::CaseSensitive, ESearchDir::FromStart, SpecStart);
+	if (TestTrue(TEXT("example found"), SpecStart != INDEX_NONE && SpecEnd != INDEX_NONE))
+	{
+		const TSharedPtr<FJsonObject> Spec = AIDATestParseJson(Pack.Mid(SpecStart, SpecEnd - SpecStart + 2));
+		if (TestTrue(TEXT("example parses"), Spec.IsValid()))
+		{
+			FAIDABuildSpec Parsed;
+			FString Error;
+			TestTrue(TEXT("example passes ParseBuildSpec"), AIDAActionSpec::ParseBuildSpec(Spec, 100, Parsed, Error));
+			TestEqual(TEXT("example part count"), Parsed.Parts.Num(), 4);
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAMapToolsTerrainProbeTest, "AIDA.MapTools.TerrainProbeJson",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAMapToolsTerrainProbeTest::RunTest(const FString&)
+{
+	// 3x3 row-major grid: flat north row, a rise, one probe miss at the southwest corner.
+	const TArray<double> HeightsM = {
+		10.0, 10.0, 10.0,
+		10.0, 12.0, 12.0,
+		AIDAMapTools::AIDATerrainNoHit, 14.0, 14.5 };
+	const TSharedPtr<FJsonObject> O = AIDATestParseJson(
+		AIDAMapTools::BuildTerrainProbeJson(HeightsM, 3, 3, 100.0, 200.0, 8.0));
+	if (!TestTrue(TEXT("terrain probe is JSON"), O.IsValid())) { return false; }
+
+	TestEqual(TEXT("cols"), static_cast<int32>(O->GetNumberField(TEXT("cols"))), 3);
+	TestEqual(TEXT("rows"), static_cast<int32>(O->GetNumberField(TEXT("rows"))), 3);
+	TestEqual(TEXT("centerX"), O->GetNumberField(TEXT("centerX")), 100.0);
+	TestEqual(TEXT("stepM"), O->GetNumberField(TEXT("stepM")), 8.0);
+	TestEqual(TEXT("minZ"), O->GetNumberField(TEXT("minZ")), 10.0);
+	TestEqual(TEXT("maxZ"), O->GetNumberField(TEXT("maxZ")), 14.5);
+	TestEqual(TEXT("spreadZ"), O->GetNumberField(TEXT("spreadZ")), 4.5);
+	TestEqual(TEXT("noHit counted"), static_cast<int32>(O->GetNumberField(TEXT("noHit"))), 1);
+
+	const TArray<TSharedPtr<FJsonValue>>& Rows = O->GetArrayField(TEXT("heights"));
+	if (TestEqual(TEXT("three rows"), Rows.Num(), 3))
+	{
+		const TArray<TSharedPtr<FJsonValue>>& South = Rows[2]->AsArray();
+		if (TestEqual(TEXT("three cells"), South.Num(), 3))
+		{
+			TestTrue(TEXT("miss is null"), South[0]->IsNull());
+			TestEqual(TEXT("row-major order"), South[1]->AsNumber(), 14.0);
+		}
+	}
+	TestTrue(TEXT("legend orients the grid"), O->GetStringField(TEXT("legend")).Contains(TEXT("north")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsStatusAsBuiltTest, "AIDA.Actions.StatusAsBuilt",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsStatusAsBuiltTest::RunTest(const FString&)
+{
+	// An executed 2-part composite: two foundations along +X, one wall a metre up.
+	FAIDAProposal P;
+	P.Id = FGuid::NewGuid();
+	P.Summary = TEXT("place a 2-part composite");
+	P.State = EAIDAProposalState::Executed;
+	P.SpecJson = TEXT(R"json({"version":2,"parts":[{"buildable":"Foundation (1 m)","grid":{"countX":2,"countY":1}},{"buildable":"Wall"}]})json");
+	P.Placements.Emplace(FRotator::ZeroRotator, FVector(0.0, 0.0, 0.0));
+	P.Placements.Emplace(FRotator::ZeroRotator, FVector(800.0, 0.0, 0.0));
+	P.Placements.Emplace(FRotator::ZeroRotator, FVector(0.0, 0.0, 100.0));
+	P.PlacementPartIndex = { 0, 0, 1 };
+	P.PartRecipePaths = { TEXT("recipe-a"), TEXT("recipe-b") };
+
+	const TSharedPtr<FJsonObject> Status = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P }, FGuid(), 0, 600));
+	if (!TestTrue(TEXT("status is JSON"), Status.IsValid())) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>& List = Status->GetArrayField(TEXT("proposals"));
+	if (!TestEqual(TEXT("one entry"), List.Num(), 1)) { return false; }
+
+	const TSharedPtr<FJsonObject>* AsBuilt = nullptr;
+	if (!TestTrue(TEXT("asBuilt present"), List[0]->AsObject()->TryGetObjectField(TEXT("asBuilt"), AsBuilt))) { return false; }
+	TestEqual(TEXT("placed"), static_cast<int32>((*AsBuilt)->GetNumberField(TEXT("placed"))), 3);
+	TestFalse(TEXT("no planned when complete"), (*AsBuilt)->HasField(TEXT("planned")));
+	TestEqual(TEXT("bbox max x in metres"), (*AsBuilt)->GetObjectField(TEXT("max"))->GetNumberField(TEXT("x")), 8.0);
+
+	const TArray<TSharedPtr<FJsonValue>>& Parts = (*AsBuilt)->GetArrayField(TEXT("parts"));
+	if (TestEqual(TEXT("two part runs"), Parts.Num(), 2))
+	{
+		const TSharedPtr<FJsonObject> Slab = Parts[0]->AsObject();
+		TestEqual(TEXT("part 0 name from spec"), Slab->GetStringField(TEXT("buildable")), TEXT("Foundation (1 m)"));
+		TestEqual(TEXT("part 0 count"), static_cast<int32>(Slab->GetNumberField(TEXT("count"))), 2);
+		TestEqual(TEXT("part 0 run max"), Slab->GetObjectField(TEXT("max"))->GetNumberField(TEXT("x")), 8.0);
+		const TSharedPtr<FJsonObject> Wall = Parts[1]->AsObject();
+		TestEqual(TEXT("part 1 name"), Wall->GetStringField(TEXT("buildable")), TEXT("Wall"));
+		TestEqual(TEXT("part 1 z in metres"), Wall->GetObjectField(TEXT("first"))->GetNumberField(TEXT("z")), 1.0);
+		TestFalse(TEXT("single placement skips bbox"), Wall->HasField(TEXT("max")));
+	}
+
+	// Failed partway: only the first Cursor placements are as-built; planned shows the shortfall.
+	P.State = EAIDAProposalState::Failed;
+	P.Cursor = 1;
+	const TSharedPtr<FJsonObject> Failed = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P }, FGuid(), 0, 600));
+	const TSharedPtr<FJsonObject>* PartialBuilt = nullptr;
+	if (TestTrue(TEXT("failed carries asBuilt"),
+		Failed->GetArrayField(TEXT("proposals"))[0]->AsObject()->TryGetObjectField(TEXT("asBuilt"), PartialBuilt)))
+	{
+		TestEqual(TEXT("partial placed"), static_cast<int32>((*PartialBuilt)->GetNumberField(TEXT("placed"))), 1);
+		TestEqual(TEXT("planned total"), static_cast<int32>((*PartialBuilt)->GetNumberField(TEXT("planned"))), 3);
+	}
+
+	// Pending proposals never claim as-built geometry; neither do manifold/label/power-only shapes.
+	P.State = EAIDAProposalState::Pending;
+	const TSharedPtr<FJsonObject> Pending = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P }, FGuid(), 0, 600));
+	TestFalse(TEXT("pending has no asBuilt"),
+		Pending->GetArrayField(TEXT("proposals"))[0]->AsObject()->HasField(TEXT("asBuilt")));
+	P.State = EAIDAProposalState::Executed;
+	P.bManifold = true;
+	const TSharedPtr<FJsonObject> Manifold = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P }, FGuid(), 0, 600));
+	TestFalse(TEXT("manifold has no asBuilt"),
+		Manifold->GetArrayField(TEXT("proposals"))[0]->AsObject()->HasField(TEXT("asBuilt")));
+	return true;
+}
+
 #undef AIDA_TEST_NEAR
 
 #endif // WITH_AUTOMATION_TESTS
