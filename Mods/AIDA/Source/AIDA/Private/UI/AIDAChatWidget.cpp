@@ -42,6 +42,12 @@ void UAIDAChatWidget::NativeConstruct()
 {
 	Super::NativeConstruct();
 
+	// NativeTick drives the transcript scrollbar sync, but UUserWidget's tick heuristic only
+	// detects a BLUEPRINT Tick event — and this BP is a pure layout with none, so without this
+	// flag the widget never ticks and the slider stays collapsed (live-verify: no scrollbar).
+	bHasScriptImplementedTick = true;
+	UpdateCanTick();
+
 	// Self-wire the optional sub-widgets so the Blueprint can stay a pure layout (no event graph).
 	if (SendButton && !SendButton->OnClicked.IsAlreadyBound(this, &UAIDAChatWidget::HandleSendClicked))
 	{
@@ -470,6 +476,11 @@ void UAIDAChatWidget::ScrollTranscriptBy(float DeltaPx)
 		const float End = FMath::Max(0.f, TranscriptScroll->GetScrollOffsetOfEnd());
 		TranscriptScroll->SetScrollOffset(FMath::Clamp(TranscriptScroll->GetScrollOffset() + DeltaPx, 0.f, End));
 	}
+}
+
+bool UAIDAChatWidget::IsScreenPositionOverTranscript(const FVector2D& ScreenPos) const
+{
+	return TranscriptScroll && TranscriptScroll->GetCachedGeometry().IsUnderLocation(ScreenPos);
 }
 
 void UAIDAChatWidget::HandleSliderValueChanged(float Value)

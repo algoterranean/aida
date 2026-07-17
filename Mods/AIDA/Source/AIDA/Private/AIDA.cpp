@@ -196,6 +196,29 @@ namespace
 			}
 			return false;
 		}
+
+		/** Plain wheel over the transcript scrolls it. The transcript is deliberately click-through
+		 *  (it must never eat clicks meant for menus/world underneath), so the widget itself can't
+		 *  see these wheel events — they're claimed here, ahead of Slate routing. Ctrl+Wheel (ghost
+		 *  rotate) and captured-mouse play (mouse-look, drags) fall through untouched. */
+		virtual bool HandleMouseWheelOrGestureEvent(FSlateApplication& SlateApp, const FPointerEvent& WheelEvent, const FPointerEvent* /*GestureEvent*/) override
+		{
+			if (WheelEvent.GetWheelDelta() == 0.f || WheelEvent.IsControlDown() || SlateApp.HasAnyMouseCaptor())
+			{
+				return false;
+			}
+			for (const auto& Pair : ShownChatWidgets())
+			{
+				UAIDAChatWidget* Widget = Pair.Value.Get();
+				if (Widget && Widget->IsInViewport() &&
+					Widget->IsScreenPositionOverTranscript(WheelEvent.GetScreenSpacePosition()))
+				{
+					Widget->ScrollTranscriptBy(WheelEvent.GetWheelDelta() * -60.f);
+					return true; // consume — the hotbar must not also spin
+				}
+			}
+			return false;
+		}
 		virtual const TCHAR* GetDebugName() const override { return TEXT("AIDAChatInput"); }
 	};
 

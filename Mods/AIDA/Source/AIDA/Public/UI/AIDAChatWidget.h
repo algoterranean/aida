@@ -115,6 +115,14 @@ public:
 	/** Put keyboard focus into the input box (used when the window is opened via the Ctrl+Enter keybind). */
 	void FocusInput();
 
+	/** Scroll the transcript by a signed pixel delta, clamped to the content. Public: the module's
+	 *  global input preprocessor drives this for wheel-over-transcript (the transcript is
+	 *  click-through, so the widget itself never sees those wheel events). */
+	void ScrollTranscriptBy(float DeltaPx);
+
+	/** Is this absolute screen position inside the transcript area? (Preprocessor wheel routing.) */
+	bool IsScreenPositionOverTranscript(const FVector2D& ScreenPos) const;
+
 	/** The whole transcript rendered to a single display string ("Author: body" blocks). */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA")
 	FString RenderedTranscript;
@@ -172,9 +180,6 @@ private:
 
 	/** True while the mouse holds the slider — tick must not fight the thumb mid-drag. */
 	bool bSliderDragging = false;
-
-	/** Scroll the transcript by a signed pixel delta, clamped to the content. */
-	void ScrollTranscriptBy(float DeltaPx);
 
 	UFUNCTION()
 	void HandleSliderValueChanged(float Value);
