@@ -18,6 +18,7 @@
 #include "Components/PanelWidget.h"
 #include "Components/RichTextBlock.h"
 #include "Components/ScrollBox.h"
+#include "Components/Slider.h"
 #include "Components/TextBlock.h"
 #include "Blueprint/WidgetTree.h"
 #include "Engine/DataTable.h"
@@ -63,6 +64,9 @@ void UAIDAChatWidget::NativeConstruct()
 	if (TranscriptScroll)
 	{
 		TranscriptScroll->SetVisibility(ESlateVisibility::HitTestInvisible);
+		// The built-in scrollbar is dead under HitTestInvisible (it drew but could never be
+		// grabbed) — hide it; the gutter slider below is the interactive scroll control.
+		TranscriptScroll->SetScrollBarVisibility(ESlateVisibility::Collapsed);
 	}
 	if (TranscriptText)
 	{
@@ -166,6 +170,26 @@ void UAIDAChatWidget::NativeConstruct()
 		{
 			TabSlot->SetAnchors(FAnchors(0.f, 0.f, RightAnchor, 0.f));
 			TabSlot->SetOffsets(FMargin(Margin, Margin, Margin, TabBarHeight));
+		}
+
+		// Transcript scrollbar: the transcript is click-through by design (see above), which also
+		// kills the ScrollBox's own scrollbar — a slim vertical slider in the outer-margin gutter
+		// right of the transcript is the ONE hit-testable scroll control (user: "can't scroll the
+		// scrollbar"). NativeTick mirrors the scroll state onto it; it hides while the text fits.
+		TranscriptSlider = WidgetTree->ConstructWidget<USlider>();
+		TranscriptSlider->SetOrientation(EOrientation::Orient_Vertical);
+		TranscriptSlider->SetSliderBarColor(FLinearColor(1.f, 1.f, 1.f, 0.15f));
+		TranscriptSlider->SetSliderHandleColor(FLinearColor(0.85f, 0.85f, 0.85f, 0.9f));
+		TranscriptSlider->SetVisibility(ESlateVisibility::Collapsed);
+		TranscriptSlider->OnValueChanged.AddDynamic(this, &UAIDAChatWidget::HandleSliderValueChanged);
+		TranscriptSlider->OnMouseCaptureBegin.AddDynamic(this, &UAIDAChatWidget::HandleSliderCaptureBegin);
+		TranscriptSlider->OnMouseCaptureEnd.AddDynamic(this, &UAIDAChatWidget::HandleSliderCaptureEnd);
+		if (UCanvasPanelSlot* SliderSlot = Cast<UCanvasPanelSlot>(RootPanel->AddChild(TranscriptSlider)))
+		{
+			SliderSlot->SetAnchors(FAnchors(RightAnchor, 0.f, RightAnchor, 1.f));
+			SliderSlot->SetAlignment(FVector2D(1.f, 0.f));
+			// Right edge 4px inside the half-line; spans the transcript's vertical extent.
+			SliderSlot->SetOffsets(FMargin(-4.f, TranscriptTop, 14.f, BottomInset + InputHeight + RowGap));
 		}
 	}
 
@@ -417,6 +441,55 @@ void UAIDAChatWidget::FocusInput()
 	}
 }
 
+void UAIDAChatWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+{
+	Super::NativeTick(MyGeometry, InDeltaTime);
+
+	// Mirror the (click-through) scroll box onto the gutter slider: thumb at the TOP = offset 0
+	// (vertical sliders run bottom→top, so the value is inverted). Hidden while the text fits.
+	if (TranscriptScroll && TranscriptSlider)
+	{
+		const float End = TranscriptScroll->GetScrollOffsetOfEnd();
+		const ESlateVisibility Wanted = End > 1.f ? ESlateVisibility::Visible : ESlateVisibility::Collapsed;
+		if (TranscriptSlider->GetVisibility() != Wanted)
+		{
+			TranscriptSlider->SetVisibility(Wanted);
+		}
+		if (!bSliderDragging && End > 1.f)
+		{
+			// SetValue is silent (no OnValueChanged) — no feedback loop with the drag handler.
+			TranscriptSlider->SetValue(1.f - FMath::Clamp(TranscriptScroll->GetScrollOffset() / End, 0.f, 1.f));
+		}
+	}
+}
+
+void UAIDAChatWidget::ScrollTranscriptBy(float DeltaPx)
+{
+	if (TranscriptScroll)
+	{
+		const float End = FMath::Max(0.f, TranscriptScroll->GetScrollOffsetOfEnd());
+		TranscriptScroll->SetScrollOffset(FMath::Clamp(TranscriptScroll->GetScrollOffset() + DeltaPx, 0.f, End));
+	}
+}
+
+void UAIDAChatWidget::HandleSliderValueChanged(float Value)
+{
+	if (TranscriptScroll)
+	{
+		TranscriptScroll->SetScrollOffset((1.f - Value) * FMath::Max(0.f, TranscriptScroll->GetScrollOffsetOfEnd()));
+	}
+}
+
+void UAIDAChatWidget::HandleSliderCaptureBegin()
+{
+	bSliderDragging = true;
+}
+
+void UAIDAChatWidget::HandleSliderCaptureEnd()
+{
+	bSliderDragging = false;
+}
+
 void UAIDAChatWidget::BuildTranscriptRich(UFont* GameFont, float FontSize)
 {
 	if (!TranscriptScroll || !WidgetTree)
@@ -592,6 +665,10 @@ void UAIDAChatWidget::SwitchToConversation(const FGuid& ConvId)
 	EnsureConversation(ConvId);
 	RebuildTabBar();
 	RenderActiveConversation();
+	if (TranscriptScroll)
+	{
+		TranscriptScroll->ScrollToEnd(); // a fresh tab always opens at its newest message
+	}
 	RebuildAttachmentChips(); // chips are per conversation and follow the active tab
 	FocusInput();
 }
@@ -748,6 +825,16 @@ FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, cons
 		return FReply::Handled();
 	}
 
+	// Plain PageUp/PageDown page the transcript (the Ctrl variants are the ghost's raise/lower).
+	if (!InKeyEvent.IsControlDown() &&
+		(InKeyEvent.GetKey() == EKeys::PageUp || InKeyEvent.GetKey() == EKeys::PageDown))
+	{
+		const float Viewport = TranscriptScroll ? TranscriptScroll->GetCachedGeometry().GetLocalSize().Y : 0.f;
+		const float Page = Viewport > 1.f ? Viewport * 0.8f : 300.f;
+		ScrollTranscriptBy(InKeyEvent.GetKey() == EKeys::PageUp ? -Page : Page);
+		return FReply::Handled();
+	}
+
 	// Up/Down = shell-style recall of this conversation's sent lines, only while typing in the box.
 	if (InputBox && InputBox->HasKeyboardFocus())
 	{
@@ -774,7 +861,7 @@ FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, cons
 
 FReply UAIDAChatWidget::NativeOnMouseWheel(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
 {
-	// Ctrl+Wheel rotates the pending proposal ghost 90° per notch (plain wheel stays the hotbar's).
+	// Ctrl+Wheel rotates the pending proposal ghost 90° per notch.
 	if (InMouseEvent.IsControlDown())
 	{
 		if (AAIDAProposalRelay* R = ProposalRelay.Get(); R && R->HasPendingProposal())
@@ -783,7 +870,11 @@ FReply UAIDAChatWidget::NativeOnMouseWheel(const FGeometry& InGeometry, const FP
 			return FReply::Handled();
 		}
 	}
-	return Super::NativeOnMouseWheel(InGeometry, InMouseEvent);
+	// Plain wheel scrolls the transcript. This only fires when the cursor is over one of the
+	// window's HIT-TESTABLE parts (input row, tabs, slider) — the transcript itself is
+	// click-through, so wheel over it (and over the game world) still drives the hotbar.
+	ScrollTranscriptBy(InMouseEvent.GetWheelDelta() * -60.f);
+	return FReply::Handled();
 }
 
 void UAIDAChatWidget::RenderActiveConversation()
@@ -826,7 +917,14 @@ void UAIDAChatWidget::RenderActiveConversation()
 	}
 	if (TranscriptScroll)
 	{
-		TranscriptScroll->ScrollToEnd();
+		// Stick to the end only when the reader is already there — a player scrolled up to read
+		// must not be yanked back down by every streamed delta. (Offsets are PRE-append here;
+		// content only grows, so "within a line of the end" is the right stickiness test.)
+		const float End = TranscriptScroll->GetScrollOffsetOfEnd();
+		if (End <= 1.f || TranscriptScroll->GetScrollOffset() >= End - 20.f)
+		{
+			TranscriptScroll->ScrollToEnd();
+		}
 	}
 	OnTranscriptChanged.Broadcast(RenderedTranscript);
 }

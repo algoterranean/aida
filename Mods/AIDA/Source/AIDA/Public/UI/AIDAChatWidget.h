@@ -14,6 +14,7 @@ class UEditableTextBox;
 class UHorizontalBox;
 class URichTextBlock;
 class UScrollBox;
+class USlider;
 class UTextBlock;
 
 /** Broadcast whenever the rendered transcript string changes (for optional BP text bindings). */
@@ -94,6 +95,8 @@ class UAIDAChatWidget : public UUserWidget
 public:
 	virtual void NativeConstruct() override;
 	virtual void NativeDestruct() override;
+	/** Mirrors the transcript scroll state onto the gutter slider (the one interactive scroll control). */
+	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
 	/** Up/Down recall the current conversation's input history while the input box has focus.
 	 *  Ctrl+Arrows / Ctrl+PgUp/PgDn nudge a pending proposal ghost (Shift = 1 m fine steps). */
 	virtual FReply NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
@@ -158,6 +161,27 @@ private:
 
 	/** Build a transient rich-text style set (Default/Bold/Italic/Code/Header) from the given font. */
 	void BuildTranscriptRich(class UFont* GameFont, float FontSize);
+
+	//~ Transcript scrollbar. The transcript is deliberately click-through (it must not eat clicks
+	//~ meant for menus/world underneath), which also disables the ScrollBox's built-in scrollbar —
+	//~ so a slim vertical slider in the gutter right of the transcript is the ONE hit-testable
+	//~ scroll control. NativeTick mirrors the scroll state onto it; dragging it scrolls; it hides
+	//~ while the transcript fits. PageUp/PageDown and the wheel (over interactive parts) scroll too.
+	UPROPERTY(Transient)
+	TObjectPtr<USlider> TranscriptSlider;
+
+	/** True while the mouse holds the slider — tick must not fight the thumb mid-drag. */
+	bool bSliderDragging = false;
+
+	/** Scroll the transcript by a signed pixel delta, clamped to the content. */
+	void ScrollTranscriptBy(float DeltaPx);
+
+	UFUNCTION()
+	void HandleSliderValueChanged(float Value);
+	UFUNCTION()
+	void HandleSliderCaptureBegin();
+	UFUNCTION()
+	void HandleSliderCaptureEnd();
 
 	UPROPERTY(Transient)
 	TWeakObjectPtr<AAIDAChatRelay> Relay;
