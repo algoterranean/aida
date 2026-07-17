@@ -197,14 +197,29 @@ namespace
 			return false;
 		}
 
-		/** Plain wheel over the transcript scrolls it. The transcript is deliberately click-through
-		 *  (it must never eat clicks meant for menus/world underneath), so the widget itself can't
-		 *  see these wheel events — they're claimed here, ahead of Slate routing. Ctrl+Wheel (ghost
-		 *  rotate) and captured-mouse play (mouse-look, drags) fall through untouched. */
+		/** Plain wheel over the transcript scrolls it; Ctrl+Wheel rotates a pending proposal ghost
+		 *  from ANYWHERE. Both are claimed here, ahead of Slate routing: the transcript AND the game
+		 *  view are click-through, so the widget's own wheel handler only ever fires over the
+		 *  window's few hit-testable parts (live-verify: Ctrl+Wheel rotate "did nothing").
+		 *  Captured-mouse play (mouse-look, drags) falls through untouched. */
 		virtual bool HandleMouseWheelOrGestureEvent(FSlateApplication& SlateApp, const FPointerEvent& WheelEvent, const FPointerEvent* /*GestureEvent*/) override
 		{
-			if (WheelEvent.GetWheelDelta() == 0.f || WheelEvent.IsControlDown() || SlateApp.HasAnyMouseCaptor())
+			if (WheelEvent.GetWheelDelta() == 0.f || SlateApp.HasAnyMouseCaptor())
 			{
+				return false;
+			}
+			if (WheelEvent.IsControlDown())
+			{
+				// Only consumed while a pending proposal exists — otherwise the game keeps the chord.
+				for (const auto& Pair : ShownChatWidgets())
+				{
+					UAIDAChatWidget* Widget = Pair.Value.Get();
+					if (Widget && Widget->IsInViewport() &&
+						Widget->TryRotatePendingProposal(WheelEvent.GetWheelDelta() > 0.f ? 90 : -90))
+					{
+						return true; // consume — the hotbar must not also spin
+					}
+				}
 				return false;
 			}
 			for (const auto& Pair : ShownChatWidgets())

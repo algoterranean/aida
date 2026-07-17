@@ -870,14 +870,24 @@ FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, cons
 	return Super::NativeOnPreviewKeyDown(InGeometry, InKeyEvent);
 }
 
+bool UAIDAChatWidget::TryRotatePendingProposal(int32 YawDeltaDeg)
+{
+	AAIDAProposalRelay* R = ProposalRelay.Get();
+	if (!R || !R->HasPendingProposal())
+	{
+		return false;
+	}
+	R->Adjust(FVector::ZeroVector, YawDeltaDeg);
+	return true;
+}
+
 FReply UAIDAChatWidget::NativeOnMouseWheel(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
 {
 	// Ctrl+Wheel rotates the pending proposal ghost 90° per notch.
 	if (InMouseEvent.IsControlDown())
 	{
-		if (AAIDAProposalRelay* R = ProposalRelay.Get(); R && R->HasPendingProposal())
+		if (TryRotatePendingProposal(InMouseEvent.GetWheelDelta() > 0.f ? 90 : -90))
 		{
-			R->Adjust(FVector::ZeroVector, InMouseEvent.GetWheelDelta() > 0.f ? 90 : -90);
 			return FReply::Handled();
 		}
 	}

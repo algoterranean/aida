@@ -123,6 +123,12 @@ public:
 	/** Is this absolute screen position inside the transcript area? (Preprocessor wheel routing.) */
 	bool IsScreenPositionOverTranscript(const FVector2D& ScreenPos) const;
 
+	/** Rotate the pending proposal ghost (false = no pending proposal to rotate). Public: the
+	 *  module's global input preprocessor drives this for Ctrl+Wheel from ANYWHERE — the transcript
+	 *  and game view are click-through, so the widget's own wheel handler only fires over the
+	 *  window's few hit-testable parts (live-verify: rotate "did nothing"). */
+	bool TryRotatePendingProposal(int32 YawDeltaDeg);
+
 	/** The whole transcript rendered to a single display string ("Author: body" blocks). */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA")
 	FString RenderedTranscript;
