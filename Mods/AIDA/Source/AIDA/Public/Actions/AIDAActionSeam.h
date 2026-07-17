@@ -66,6 +66,27 @@ public:
 		TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError);
 
 	/**
+	 * The nearest FREE belt-input port on BUILT structures near a point (standalone belt taps —
+	 * the machines/manifold already exist). Conveyor attachments (a built manifold row's open
+	 * trunk end) win over machine inputs; belts themselves are excluded. OutPort carries the
+	 * owning actor, connector position and outward normal.
+	 */
+	static bool FindFreeBeltInputPort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+		FAIDAManifoldPort& OutPort, FString& OutError);
+
+	/**
+	 * One CHAIN segment of a long belt feed: a belt run from a live actor's free output port to a
+	 * raw waypoint POSITION (no destination actor — the hologram's auto support pole at the
+	 * unsnapped end is kept as the waypoint stand). Wired at the START only; the belt's free far
+	 * end is the next hop's source. Costs charge as built; belt + supports are journaled.
+	 */
+	static bool BuildChainSegment(UObject* WorldContext, const FString& TransportRecipePath,
+		AActor* FromActor, const FVector& FromWantDir, const FVector& ToPosCm,
+		bool bChargeCost, TArray<FAIDACostItem>& OutCost, TArray<FString>& OutEntityIds,
+		TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutBeltActor,
+		FString& OutError, const FString& PayerPlayerId);
+
+	/**
 	 * The aim point, SNAPPED the way the build gun would place this recipe there: a probe hologram
 	 * is placed at the player's aim hit (running the game's TrySnapToActor / world-grid snapping —
 	 * lightweight-instance hits are first resolved to a temporary buildable so foundations actually

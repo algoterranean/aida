@@ -385,6 +385,11 @@ struct FAIDAProposal
 	FString TapSplitterRecipePath;         // cut variant: the tap splitter
 	FString TapSplitterName;
 	int32 TapSetIndex = INDEX_NONE;        // connected builds: which ManifoldSet the tap feeds (bManifold: INDEX_NONE)
+	//~ Long feeds chain several belt runs: intermediate waypoints (world cm, Z ground-probed at
+	//  propose), one hop per executor tick; the LAST hop lands on the destination port. Empty =
+	//  a single direct run. STANDALONE taps (no pending manifold — the machines/manifold already
+	//  exist) put their destination port in Ports[0] and their belt in TransportRecipePath.
+	TArray<FVector> TapChainPointsCm;
 
 	//~ Container-label extensions (P7 Slice 3). Placements carry the sign spots (ghost preview +
 	//  count + upfront cost reuse the build paths); Targets carry the containers and their texts.

@@ -175,14 +175,16 @@ namespace
 		"further out, a second belt input gets the next row) — when machines need several manifolds "
 		"(refineries: belt + pipe, both sides), just propose each one; any order works, rows won't "
 		"collide.\n"
-		"- propose_belt_tap(spec, forProposalId): feed a PENDING belt-input manifold from an EXISTING "
-		"belt — the server finds the nearest belt carrying spec.item ('Coal'; omit = any belt), taps "
-		"it (splices a splitter into it mid-belt, or uses a free belt end), and routes a feed belt to "
-		"the manifold's open end — all merged into the SAME proposal, ONE approval. The flow for "
-		"'feed these generators from the nearest coal belt': call propose_manifold (direction 'in') "
-		"first, then propose_belt_tap with forProposalId = that proposal's id and item 'Coal'. "
-		"spec.maxDistanceM defaults to 100; the feed is one belt run (up to ~56 m). The item match "
-		"reads what is riding each belt RIGHT NOW.\n"
+		"- propose_belt_tap(spec, forProposalId?): feed machines from an EXISTING belt — the server "
+		"finds the nearest belt carrying spec.item ('Coal'; omit = any belt), taps it (splices a "
+		"splitter into it mid-belt, or uses a free belt end), and routes a feed belt to the "
+		"destination, chaining runs automatically for long distances (up to ~2 km). WITH "
+		"forProposalId = a PENDING belt-in manifold proposal: everything merges into ONE proposal/"
+		"approval. WITHOUT forProposalId: the destination is the nearest FREE belt input near the "
+		"player's aim on machines or a BUILT manifold row — use this whenever the manifold already "
+		"executed ('connect it' after the fact). NEVER hand-build feeds with propose_build; never "
+		"tell the player to run belts manually — call this tool (raise spec.maxDistanceM, default "
+		"250, when the source is far). The item match reads what is riding each belt RIGHT NOW.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired. "
 		"Pending proposals include their full stored 'spec' — the input for revisions.\n"
 		"REVISING A PENDING PROPOSAL (very common): when the player asks to change or extend a proposed "
@@ -1574,23 +1576,51 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 					FMath::Atan2(Proposal->TapDirCm.Y, Proposal->TapDirCm.X)));
 				Part.TileCenters.Add(Proposal->TapPointCm);
 			}
+			// Destination + belt: a pending row's open end, or (standalone) the stored built port.
 			const bool bSet = Proposal->ManifoldSets.IsValidIndex(Proposal->TapSetIndex);
-			const FTransform* OpenEnd = bSet
-				? (Proposal->ManifoldSets[Proposal->TapSetIndex].Attachments.Num() > 0
-					? &Proposal->ManifoldSets[Proposal->TapSetIndex].Attachments[0] : nullptr)
-				: (Proposal->Placements.Num() > 0 ? &Proposal->Placements[0] : nullptr);
-			const FVector FeedRowAxis = bSet ? Proposal->ManifoldSets[Proposal->TapSetIndex].RowAxis : Proposal->RowAxis;
-			const FString FeedTransport = bSet
-				? Proposal->ManifoldSets[Proposal->TapSetIndex].TransportRecipePath : Proposal->TransportRecipePath;
-			if (OpenEnd && !FeedTransport.IsEmpty())
+			const bool bStandalone = !Proposal->bManifold && Proposal->ManifoldSets.Num() == 0;
+			FVector DestCm = FVector::ZeroVector;
+			FVector DestNormal = -Proposal->RowAxis;
+			FString FeedTransport = Proposal->TransportRecipePath;
+			bool bHaveDest = false;
+			if (bSet)
 			{
-				FAIDAGhostRun& Run = View.GhostRuns.AddDefaulted_GetRef();
-				Run.RecipeClassPath = FeedTransport;
-				Run.FromCm = Proposal->TapPointCm;
-				Run.FromNormal = (OpenEnd->GetLocation() - Proposal->TapPointCm)
-					.GetSafeNormal(UE_SMALL_NUMBER, Proposal->TapDirCm);
-				Run.ToCm = OpenEnd->GetLocation();
-				Run.ToNormal = -FeedRowAxis;
+				const FAIDAManifoldSet& Set = Proposal->ManifoldSets[Proposal->TapSetIndex];
+				if (Set.Attachments.Num() > 0)
+				{
+					DestCm = Set.Attachments[0].GetLocation();
+					DestNormal = -Set.RowAxis;
+					FeedTransport = Set.TransportRecipePath;
+					bHaveDest = true;
+				}
+			}
+			else if (bStandalone && Proposal->Ports.Num() > 0)
+			{
+				DestCm = Proposal->Ports[0].PosCm;
+				DestNormal = Proposal->Ports[0].NormalCm;
+				bHaveDest = true;
+			}
+			else if (Proposal->Placements.Num() > 0)
+			{
+				DestCm = Proposal->Placements[0].GetLocation();
+				bHaveDest = true;
+			}
+			if (bHaveDest && !FeedTransport.IsEmpty())
+			{
+				// One ghost run per feed hop: tap → waypoints → the destination port.
+				TArray<FVector> Points;
+				Points.Add(Proposal->TapPointCm);
+				Points.Append(Proposal->TapChainPointsCm);
+				Points.Add(DestCm);
+				for (int32 i = 0; i + 1 < Points.Num(); ++i)
+				{
+					FAIDAGhostRun& Run = View.GhostRuns.AddDefaulted_GetRef();
+					Run.RecipeClassPath = FeedTransport;
+					Run.FromCm = Points[i];
+					Run.FromNormal = (Points[i + 1] - Points[i]).GetSafeNormal(UE_SMALL_NUMBER, Proposal->TapDirCm);
+					Run.ToCm = Points[i + 1];
+					Run.ToNormal = (i + 2 == Points.Num()) ? DestNormal : -Run.FromNormal;
+				}
 			}
 		}
 	}
@@ -3340,8 +3370,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// after the manifold (TickManifold/TickConnected tap phases).
 	Tools.Register({
 		TEXT("propose_belt_tap"),
-		TEXT("Feed a PENDING belt-input manifold from an EXISTING belt: the server finds the nearest belt whose riding items match spec.item (omit = the nearest belt of any kind), taps it — by SPLICING a Conveyor Splitter into it mid-belt (the source keeps flowing; the tap takes a share) or by using a FREE (unconnected) belt end — and routes one feed belt run from the tap to the pending manifold's open trunk end. Everything merges into ONE combined proposal with ONE approval. Spec: {version:1, item?: item display name ('Coal'), maxDistanceM?: search radius from the manifold's feed end (default 100)}. forProposalId is REQUIRED and must reference a PENDING proposal that contains a belt-INPUT manifold (a propose_manifold direction-'in' proposal, or a connected build with a belt-in set). Typical flow for 'feed these generators from the nearest coal belt': propose_manifold {kind belt, direction in} for the generators, then propose_belt_tap {item:'Coal'} with forProposalId = the returned id. The feed is a single belt run (up to ~56 m) — a longer distance errors with the actual gap. NOTE: /aida undo removes the tap splitter and feed but the source belt stays cut."),
-		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, item?: item display name riding the source belt, maxDistanceM?: default 100}"},"forProposalId":{"type":"string","description":"REQUIRED: the pending belt-in manifold (or connected build) proposal to feed. It is replaced by ONE combined proposal (manifold + tap, one approval)."}},"required":["spec","forProposalId"]})"),
+		TEXT("Feed machines from an EXISTING belt: the server finds the nearest belt whose riding items match spec.item (omit = the nearest belt of any kind), taps it — by SPLICING a Conveyor Splitter into it mid-belt (the source keeps flowing; the tap takes a share) or by using a FREE (unconnected) belt end — and routes a feed belt from the tap to the destination, CHAINING several runs automatically for long distances (up to ~2 km; failures are reported per hop and refunded). TWO TARGET MODES. (1) forProposalId = a PENDING proposal with a belt-INPUT manifold (propose_manifold direction 'in', or a connected build with a belt-in set): the tap merges into that proposal, ONE approval builds everything. (2) OMIT forProposalId when the machines/manifold are ALREADY BUILT: the server finds the nearest FREE belt input near where the player is aiming (a built splitter row's open trunk end, or a machine input) and feeds that — this is the mode for 'connect it' after a manifold has executed. Spec: {version:1, item?: item display name ('Coal'), maxDistanceM?: source-belt search radius from the destination (default 250, up to 2000), transport?: belt display name for the feed (default: best unlocked)}. Typical flow: propose_manifold {kind belt, direction in} then propose_belt_tap {item:'Coal'} with forProposalId; or, for built manifolds, aim at them and call propose_belt_tap alone. NOTE: /aida undo removes the tap splitter and feed belts but the source belt stays cut."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, item?: item riding the source belt, maxDistanceM?: default 250, transport?: feed belt display name}"},"forProposalId":{"type":"string","description":"Optional: a PENDING belt-in manifold (or connected build) proposal to feed — replaced by ONE combined proposal. OMIT when the machines/manifold are already built; the destination is then the nearest free belt input near the player's aim."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
 		{
@@ -3350,56 +3380,86 @@ void UAIDAOrchestrator::RegisterActionTools()
 			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
 			Args->TryGetObjectField(TEXT("spec"), SpecObj);
 			FString Item;
-			double MaxDistanceM = 100.0;
+			FString TransportName;
+			double MaxDistanceM = 250.0;
 			if (SpecObj && SpecObj->IsValid())
 			{
 				(*SpecObj)->TryGetStringField(TEXT("item"), Item);
+				(*SpecObj)->TryGetStringField(TEXT("transport"), TransportName);
 				(*SpecObj)->TryGetNumberField(TEXT("maxDistanceM"), MaxDistanceM);
 			}
-			MaxDistanceM = FMath::Clamp(MaxDistanceM, 5.0, 500.0);
+			MaxDistanceM = FMath::Clamp(MaxDistanceM, 5.0, 2000.0);
 
 			FString ForIdStr;
 			Args->TryGetStringField(TEXT("forProposalId"), ForIdStr);
+			ForIdStr = ForIdStr.TrimStartAndEnd();
 			FGuid ForId;
-			const FAIDAProposal* Target = FGuid::Parse(ForIdStr.TrimStartAndEnd(), ForId)
-				? Actions.Store().Find(ForId) : nullptr;
-			if (!Target || Target->State != EAIDAProposalState::Pending)
+			const FAIDAProposal* Target = nullptr;
+			if (!ForIdStr.IsEmpty())
 			{
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-					TEXT("forProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
-			}
-			if (Target->bTap)
-			{
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-					TEXT("that proposal already has a belt tap — approve it, or revise the manifold first"), {}));
+				Target = FGuid::Parse(ForIdStr, ForId) ? Actions.Store().Find(ForId) : nullptr;
+				if (!Target || Target->State != EAIDAProposalState::Pending)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("forProposalId doesn't match a pending proposal (it may have been decided or expired) — for machines/manifolds that are ALREADY BUILT, call again WITHOUT forProposalId while aiming at them"), {}));
+				}
+				if (Target->bTap)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("that proposal already has a belt tap — approve it, or revise the manifold first"), {}));
+				}
 			}
 
-			// The open feed end: a live belt-in manifold proposal, or a connected build's first
-			// belt-in set. Index 0 of the row carries the free trunk-end port.
+			// The destination: a pending proposal's open feed end (index 0 of the belt-in row), or —
+			// standalone — the nearest FREE belt input on BUILT structures near the player's aim.
 			FVector FeedPointCm = FVector::ZeroVector;
 			int32 TapSetIndex = INDEX_NONE;
-			if (Target->bManifold && !Target->bManifoldPipe && !Target->bManifoldOutput
-				&& Target->Placements.Num() > 0)
+			FAIDAManifoldPort DestPort;
+			if (Target)
 			{
-				FeedPointCm = Target->Placements[0].GetLocation();
+				if (Target->bManifold && !Target->bManifoldPipe && !Target->bManifoldOutput
+					&& Target->Placements.Num() > 0)
+				{
+					FeedPointCm = Target->Placements[0].GetLocation();
+				}
+				else
+				{
+					for (int32 i = 0; i < Target->ManifoldSets.Num(); ++i)
+					{
+						const FAIDAManifoldSet& Set = Target->ManifoldSets[i];
+						if (!Set.bPipe && !Set.bOutput && Set.Attachments.Num() > 0)
+						{
+							TapSetIndex = i;
+							FeedPointCm = Set.Attachments[0].GetLocation();
+							break;
+						}
+					}
+					if (TapSetIndex == INDEX_NONE)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("forProposalId must reference a pending proposal with a belt-INPUT manifold — call propose_manifold {kind belt, direction in} first, then tap that proposal"), {}));
+					}
+				}
 			}
 			else
 			{
-				for (int32 i = 0; i < Target->ManifoldSets.Num(); ++i)
+				FVector Center = Ctx.Location;
+				FVector Aim;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, Aim))
 				{
-					const FAIDAManifoldSet& Set = Target->ManifoldSets[i];
-					if (!Set.bPipe && !Set.bOutput && Set.Attachments.Num() > 0)
-					{
-						TapSetIndex = i;
-						FeedPointCm = Set.Attachments[0].GetLocation();
-						break;
-					}
+					Center = Aim;
 				}
-				if (TapSetIndex == INDEX_NONE)
+				else if (!Ctx.bHasLocation)
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-						TEXT("forProposalId must reference a pending proposal with a belt-INPUT manifold — call propose_manifold {kind belt, direction in} first, then tap that proposal"), {}));
+						TEXT("could not resolve where the player is aiming — have them aim at the machines or their manifold"), {}));
 				}
+				FString PortError;
+				if (!FAIDAActionSeam::FindFreeBeltInputPort(this, Center, 3000.0, DestPort, PortError))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(PortError, {}));
+				}
+				FeedPointCm = DestPort.PosCm;
 			}
 
 			FAIDATapSource Source;
@@ -3407,12 +3467,31 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Source.Error, {}));
 			}
-			const double FeedGapM = FVector::Dist(Source.PointCm, FeedPointCm) / AIDAMetersToCm;
-			if (FeedGapM > 56.0)
+
+			// Long feeds chain hops through waypoints (Z ground-probed here at propose). ~50 m per
+			// hop; the LAST hop lands on the destination port itself.
+			TArray<FVector> ChainPoints;
+			const double FeedGapCm = FVector::Dist(Source.PointCm, FeedPointCm);
+			const double FeedGapM = FeedGapCm / AIDAMetersToCm;
+			if (FeedGapM > 2000.0)
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
-					TEXT("the nearest matching belt (%s carrying %s) is %.0f m from the manifold's feed end — beyond the 56 m single-run limit; move the manifold closer or pick another belt"),
+					TEXT("the nearest matching belt (%s carrying %s) is %.0f m from the destination — beyond the 2 km feed limit"),
 					*Source.BeltName, *Source.ItemNote, FeedGapM), {}));
+			}
+			{
+				constexpr double HopCm = 5000.0;
+				const int32 Hops = FMath::CeilToInt32(FeedGapCm / HopCm);
+				for (int32 i = 1; i < Hops; ++i)
+				{
+					FVector Point = FMath::Lerp(Source.PointCm, FeedPointCm, static_cast<double>(i) / Hops);
+					double GroundZ;
+					if (FAIDAActionSeam::ProbeGroundZ(this, Point, GroundZ))
+					{
+						Point.Z = GroundZ + 150.0;
+					}
+					ChainPoints.Add(Point);
+				}
 			}
 
 			// The tap splitter (cut variant): resolved + costed upfront like any placement.
@@ -3428,8 +3507,41 @@ void UAIDAOrchestrator::RegisterActionTools()
 				FAIDAActionSeam::TallyRecipeCost(this, Splitter.RecipeClassPath, 1, SplitterCost);
 			}
 
-			// The combined proposal: the target (machines/manifolds) + the tap, ONE approval.
-			FAIDAProposal Combined = *Target;
+			// Standalone taps carry their own feed belt; combined taps reuse the manifold's.
+			FAIDARecipeResolution Transport;
+			if (!Target)
+			{
+				TArray<FString> Candidates;
+				if (!TransportName.IsEmpty())
+				{
+					Candidates.Add(TransportName);
+				}
+				else
+				{
+					Candidates = { TEXT("Conveyor Belt Mk.6"), TEXT("Conveyor Belt Mk.5"),
+						TEXT("Conveyor Belt Mk.4"), TEXT("Conveyor Belt Mk.3"),
+						TEXT("Conveyor Belt Mk.2"), TEXT("Conveyor Belt Mk.1") };
+				}
+				bool bResolved = false;
+				for (const FString& Candidate : Candidates)
+				{
+					if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Transport))
+					{
+						bResolved = true;
+						break;
+					}
+				}
+				if (!bResolved)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("no unlocked belt matches '%s' for the feed"),
+						TransportName.IsEmpty() ? TEXT("any conveyor belt") : *TransportName), {}));
+				}
+			}
+
+			// The proposal: the pending target + tap merged (one approval), or a standalone tap
+			// against the already-built destination port.
+			FAIDAProposal Combined = Target ? *Target : FAIDAProposal();
 			Combined.Id = FGuid::NewGuid();
 			Combined.RequesterId = Ctx.PlayerId;
 			Combined.RequesterName = Ctx.Author;
@@ -3443,6 +3555,13 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Combined.TapSplitterRecipePath = Source.bDangling ? FString() : Splitter.RecipeClassPath;
 			Combined.TapSplitterName = Source.bDangling ? FString() : Splitter.DisplayName;
 			Combined.TapSetIndex = TapSetIndex;
+			Combined.TapChainPointsCm = MoveTemp(ChainPoints);
+			if (!Target)
+			{
+				Combined.Ports.Add(DestPort);
+				Combined.TransportRecipePath = Transport.RecipeClassPath;
+				Combined.TransportName = Transport.DisplayName;
+			}
 			for (const FAIDACostItem& CostItem : SplitterCost)
 			{
 				bool bMerged = false;
@@ -3457,7 +3576,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 				if (!bMerged) { Combined.Cost.Add(CostItem); }
 			}
-			if (Config.Actions.CostMode == TEXT("central")
+			if (Config.Actions.CostMode == TEXT("central") && Combined.Cost.Num() > 0
 				&& !FAIDAActionSeam::CheckAffordable(this, Combined.Cost, Ctx.PlayerId))
 			{
 				FString Msg = TEXT("not affordable from central storage + your inventory with the tap included: needs ");
@@ -3467,31 +3586,44 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
-			Combined.Summary += Source.bDangling
-				? FString::Printf(TEXT(" + tap: free end of %s carrying %s, %.0f m away (+ feed run)"),
-					*Source.BeltName, *Source.ItemNote, Source.DistanceM)
-				: FString::Printf(TEXT(" + tap: splice %s into %s carrying %s, %.0f m away (+ feed run)"),
-					*Splitter.DisplayName, *Source.BeltName, *Source.ItemNote, Source.DistanceM);
+			const int32 FeedRuns = Combined.TapChainPointsCm.Num() + 1;
+			const FString TapPhrase = Source.bDangling
+				? FString::Printf(TEXT("tap the free end of %s carrying %s, %.0f m away (%d feed run(s), charged as built)"),
+					*Source.BeltName, *Source.ItemNote, Source.DistanceM, FeedRuns)
+				: FString::Printf(TEXT("tap %s carrying %s, %.0f m away (splice a %s in + %d feed run(s), charged as built)"),
+					*Source.BeltName, *Source.ItemNote, Source.DistanceM, *Splitter.DisplayName, FeedRuns);
+			Combined.Summary = Target
+				? Combined.Summary + TEXT(" + ") + TapPhrase
+				: FString::Printf(TEXT("%s to feed %s"), *TapPhrase, *DestPort.MachineName);
 
-			// Compound stored spec: append the tap to whatever the target stored.
+			// Stored spec: append the tap to the target's spec, or stand alone.
 			{
 				TSharedPtr<FJsonObject> StoredSpec;
-				const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Target->SpecJson);
-				if (!FJsonSerializer::Deserialize(Reader, StoredSpec) || !StoredSpec.IsValid())
+				if (Target)
+				{
+					const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Target->SpecJson);
+					FJsonSerializer::Deserialize(Reader, StoredSpec);
+				}
+				if (!StoredSpec.IsValid())
 				{
 					StoredSpec = MakeShared<FJsonObject>();
+					StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_belt_tap"));
 				}
 				TSharedRef<FJsonObject> Tap = MakeShared<FJsonObject>();
 				if (!Item.IsEmpty()) { Tap->SetStringField(TEXT("item"), Item); }
 				Tap->SetStringField(TEXT("belt"), Source.BeltName);
 				Tap->SetStringField(TEXT("mode"), Source.bDangling ? TEXT("freeEnd") : TEXT("splice"));
 				Tap->SetNumberField(TEXT("distanceM"), Source.DistanceM);
+				Tap->SetNumberField(TEXT("feedRuns"), FeedRuns);
 				StoredSpec->SetObjectField(TEXT("tap"), Tap);
 				Combined.SpecJson = AIDAToCompactJson(StoredSpec.ToSharedRef());
 			}
 
-			SupersedeProposal(ForId);
-			Target = nullptr;
+			if (Target)
+			{
+				SupersedeProposal(ForId);
+				Target = nullptr;
+			}
 
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 			FString Error;
@@ -3502,8 +3634,9 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (tap): %s (by %s)"),
 				*Combined.Id.ToString(EGuidFormats::DigitsWithHyphens), *Combined.Summary, *Ctx.Author);
 			PublishProposal(Combined.Id);
-			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s, revised): %s — cost %s. Awaiting approval."),
-				*Ctx.Author, *Combined.Summary, *AIDACostSummaryString(Combined.Cost));
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, ForIdStr.IsEmpty() ? TEXT("") : TEXT(", revised"),
+				*Combined.Summary, *AIDACostSummaryString(Combined.Cost));
 			if (!Combined.bTapDangling)
 			{
 				Announce += TEXT(" NOTE: approving cuts the source belt to splice the tap in (undo removes the tap but the cut stays).");

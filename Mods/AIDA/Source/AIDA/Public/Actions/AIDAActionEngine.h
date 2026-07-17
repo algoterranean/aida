@@ -116,6 +116,26 @@ private:
 	 */
 	bool TickConnected(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 
+	/**
+	 * Advance a STANDALONE belt tap (the machines/manifold already exist): phase 0 splice/claim the
+	 * source, then one feed hop per tick toward the destination port stored in Ports[0]. True while
+	 * more work remains.
+	 */
+	bool TickTapOnly(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
+
+	/** Splice the tap splitter into the source belt (or claim its free end) into TapSourceActor.
+	 *  False = tap failed (recorded in RunFailures; splitter cost refunded). */
+	bool PrepareTapSource(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAProposal& Proposal);
+
+	/**
+	 * One feed hop per call, Cursor-driven: TapSourceActor → chain waypoints → DestActor's port.
+	 * Intermediate hops are BuildChainSegment (belt to a waypoint, next hop continues from its free
+	 * end); the LAST hop is a full BuildConnectingRun onto the destination port. True while more
+	 * hops remain; failures abort the rest and are counted like manifold runs.
+	 */
+	bool TickFeedHop(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAProposal& Proposal,
+		const FString& TransportPath, AActor* DestActor, const FVector& DestWantDir);
+
 	/** One journal entry queued for reversal. */
 	struct FUndoJob
 	{
@@ -152,8 +172,10 @@ private:
 	TArray<TWeakObjectPtr<AActor>> PoleActors;
 	//~ Connected-build scratch: one actor list per manifold set, per attachment index.
 	TArray<TArray<TWeakObjectPtr<AActor>>> SetAttachmentActors;
-	//~ Belt-tap scratch: the actor the feed run starts from (spliced splitter, or the source belt).
+	//~ Belt-tap scratch: the actor the feed run starts from (spliced splitter, or the source belt),
+	//  and the newest chain segment (each hop continues from the previous belt's free end).
 	TWeakObjectPtr<AActor> TapSourceActor;
+	TWeakObjectPtr<AActor> ChainPrevActor;
 	int32 RunBuiltCount = 0;
 	int32 RunFailCount = 0;
 	TArray<FString> RunFailures; // first few human-readable reasons for the outcome announcement

@@ -1060,6 +1060,251 @@ bool FAIDAActionSeam::ExecuteTapSplice(UObject* WorldContext, AActor* BeltActor,
 	return true;
 }
 
+bool FAIDAActionSeam::FindFreeBeltInputPort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+	FAIDAManifoldPort& OutPort, FString& OutError)
+{
+	OutPort = FAIDAManifoldPort();
+	OutError.Reset();
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem)
+	{
+		OutError = TEXT("no buildables to search");
+		return false;
+	}
+
+	const double RadiusSq = RadiusCm * RadiusCm;
+	AActor* BestActor = nullptr;
+	UFGFactoryConnectionComponent* BestConn = nullptr;
+	int32 BestTier = MAX_int32; // attachments (built manifold rows) beat machine inputs
+	double BestDistSq = TNumericLimits<double>::Max();
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (!IsValid(Buildable)) { continue; }
+		if (Buildable->IsA<AFGBuildableConveyorBase>()) { continue; } // belt ends are sources, not destinations
+		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+		const int32 Tier = Buildable->IsA<AFGBuildableConveyorAttachment>() ? 0 : 1;
+
+		TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
+		Buildable->GetComponents(Connections);
+		for (UFGFactoryConnectionComponent* Conn : Connections)
+		{
+			if (!Conn || Conn->IsConnected()) { continue; }
+			const EFactoryConnectionDirection Dir = Conn->GetDirection();
+			if (Dir != EFactoryConnectionDirection::FCD_INPUT && Dir != EFactoryConnectionDirection::FCD_ANY)
+			{
+				continue;
+			}
+			const double DistSq = FVector::DistSquared(Conn->GetConnectorLocation(), CenterCm);
+			if (Tier < BestTier || (Tier == BestTier && DistSq < BestDistSq))
+			{
+				BestTier = Tier;
+				BestDistSq = DistSq;
+				BestActor = Buildable;
+				BestConn = Conn;
+			}
+		}
+	}
+	if (!BestConn)
+	{
+		OutError = FString::Printf(
+			TEXT("no free belt input within %.0f m of there — aim at the machines or their manifold row (a splitter row's open trunk end counts)"),
+			RadiusCm / AIDAMetersToCm);
+		return false;
+	}
+
+	OutPort.Machine = BestActor;
+	OutPort.MachineName = GetNameSafe(BestActor->GetClass());
+	if (AFGBuildable* Buildable = Cast<AFGBuildable>(BestActor))
+	{
+		if (const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe())
+		{
+			const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
+			if (Products.Num() > 0) { OutPort.MachineName = DescriptorName(Products[0].ItemClass); }
+		}
+	}
+	OutPort.PosCm = BestConn->GetConnectorLocation();
+	OutPort.NormalCm = BestConn->GetConnectorNormal();
+	UE_LOG(LogAIDA, Log, TEXT("[actions][tap] destination port: %s at %s"),
+		*OutPort.MachineName, *OutPort.PosCm.ToCompactString());
+	return true;
+}
+
+namespace
+{
+	// Defined further down (the manifold-run helper block); declared here for BuildChainSegment.
+	UFGFactoryConnectionComponent* FindFactoryPort(AActor* Actor, bool bWantOutput, const FVector& WantDir);
+	FHitResult MakePortHit(AActor* Actor, const FVector& ConnectorLoc, const FVector& ConnectorNormal);
+}
+
+bool FAIDAActionSeam::BuildChainSegment(UObject* WorldContext, const FString& TransportRecipePath,
+	AActor* FromActor, const FVector& FromWantDir, const FVector& ToPosCm,
+	bool bChargeCost, TArray<FAIDACostItem>& OutCost, TArray<FString>& OutEntityIds,
+	TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutBeltActor,
+	FString& OutError, const FString& PayerPlayerId)
+{
+	OutCost.Reset();
+	OutError.Reset();
+	OutBeltActor = nullptr;
+
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(TransportRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass) { OutError = TEXT("transport recipe no longer resolvable"); return false; }
+	if (!IsValid(FromActor)) { OutError = TEXT("chain source no longer exists"); return false; }
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory) { OutError = TEXT("no player inventory available to validate against"); return false; }
+
+	UFGFactoryConnectionComponent* FromConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
+	if (!FromConn)
+	{
+		OutError = FString::Printf(TEXT("no free output port on %s facing the run"), *GetNameSafe(FromActor));
+		return false;
+	}
+	const FVector FromLoc = FromConn->GetConnectorLocation();
+	const FVector FromNormal = FromConn->GetConnectorNormal();
+
+	UE_LOG(LogAIDA, Log, TEXT("[actions][tap] chain hop %s(%s) -> %s"),
+		*GetNameSafe(FromActor), *FromLoc.ToCompactString(), *ToPosCm.ToCompactString());
+	GLog->Flush();
+
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, FromLoc);
+	AFGSplineHologram* Spline = Cast<AFGSplineHologram>(Hologram);
+	if (!Spline)
+	{
+		OutError = TEXT("the transport recipe is not a belt");
+		if (Hologram) { Hologram->Destroy(); }
+		return false;
+	}
+
+	// Start at the source port (snap attempted, not required — belts wire directly below); end at
+	// the raw waypoint, hit backed by the real ground beneath so the hologram takes it (a bare hit
+	// reads as aiming at the sky). The auto support pole at the unsnapped end is KEPT — it is the
+	// waypoint's stand, and the next hop starts from this belt's free far end.
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(MakePortHit(FromActor, FromLoc, FromNormal));
+	Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false);
+
+	FHitResult EndHit(ForceInit);
+	{
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAChainTrace), /*bTraceComplex*/ false);
+		Params.AddIgnoredActor(Hologram);
+		TraceGroundIgnoringConveyors(World, ToPosCm + FVector(0.0, 0.0, 300.0),
+			ToPosCm - FVector(0.0, 0.0, 50000.0), Params, EndHit);
+		EndHit.bBlockingHit = true;
+		EndHit.Location = ToPosCm;
+		EndHit.ImpactPoint = ToPosCm;
+		EndHit.Normal = FVector::UpVector;
+		EndHit.ImpactNormal = FVector::UpVector;
+		EndHit.TraceStart = ToPosCm + FVector(0.0, 0.0, 300.0);
+		EndHit.TraceEnd = ToPosCm - FVector(0.0, 0.0, 100.0);
+		EndHit.Distance = 300.0;
+	}
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(EndHit);
+
+	Hologram->ValidatePlacementAndCost(Inventory);
+	TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
+	Hologram->GetConstructDisqualifiers(Disqualifiers);
+	for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+	{
+		if (IsBlockingDisqualifier(Disqualifier))
+		{
+			OutError = UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString();
+			Hologram->Destroy();
+			return false;
+		}
+	}
+
+	for (const FItemAmount& Entry : Hologram->GetCost(/*includeChildren*/ true))
+	{
+		AddCost(OutCost, Entry.ItemClass, Entry.Amount);
+	}
+	if (bChargeCost && !DeductCost(WorldContext, OutCost, PayerPlayerId))
+	{
+		OutError = TEXT("central storage + the requester's inventory cannot afford this hop");
+		Hologram->Destroy();
+		return false;
+	}
+
+	Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false);
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	if (!Built)
+	{
+		OutError = TEXT("chain hop Construct() returned nothing");
+		return false;
+	}
+
+	// Wire the START only (input end at the source port); the far end stays free for the next hop.
+	AFGBuildableConveyorBase* Belt = Cast<AFGBuildableConveyorBase>(Built);
+	UFGFactoryConnectionComponent* C0 = Belt ? Belt->GetConnection0() : nullptr;
+	UFGFactoryConnectionComponent* C1 = Belt ? Belt->GetConnection1() : nullptr;
+	FString WireError;
+	if (!C0 || !C1)
+	{
+		WireError = TEXT("constructed belt has no connection components");
+	}
+	else if (FVector::DistSquared(C1->GetConnectorLocation(), FromLoc)
+		< FVector::DistSquared(C0->GetConnectorLocation(), FromLoc))
+	{
+		WireError = TEXT("belt constructed reversed (output end at the source port)");
+	}
+	else if (!C0->IsConnected() && !FromConn->IsConnected())
+	{
+		if (C0->CanConnectTo(FromConn))
+		{
+			C0->SetConnection(FromConn);
+		}
+		else
+		{
+			WireError = TEXT("belt input end refuses the source port (direction mismatch)");
+		}
+	}
+	if (WireError.IsEmpty() && !FromConn->IsConnected())
+	{
+		WireError = TEXT("the source port was already taken");
+	}
+	if (!WireError.IsEmpty())
+	{
+		OutError = FString::Printf(TEXT("chain hop could not be wired (%s)"), *WireError);
+		for (AActor* Child : Children)
+		{
+			if (Child) { Child->Destroy(); }
+		}
+		if (Built)
+		{
+			if (IFGDismantleInterface::Execute_CanDismantle(Built)) { IFGDismantleInterface::Execute_Dismantle(Built); }
+			else { Built->Destroy(); }
+		}
+		if (bChargeCost)
+		{
+			UE_LOG(LogAIDA, Error, TEXT("[actions] chain hop torn down AFTER cost deduction — items lost."));
+		}
+		return false;
+	}
+
+	// Journal the belt and its auto supports so /aida undo removes the whole chain.
+	const auto Journal = [&OutEntityIds, &OutActors](AActor* Actor, const FString& RecipePath)
+	{
+		FAIDAEntityId Entity;
+		Entity.Type = TEXT("actor");
+		Entity.ClassPath = Actor->GetClass()->GetPathName();
+		Entity.RecipePath = RecipePath;
+		Entity.Pos = Actor->GetActorLocation();
+		Entity.YawDeg = FMath::RoundToInt32(Actor->GetActorRotation().Yaw);
+		OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
+		OutActors.Add(Actor);
+	};
+	Journal(Built, TransportRecipePath);
+	for (AActor* Child : Children)
+	{
+		if (Child) { Journal(Child, FString()); }
+	}
+	OutBeltActor = Built;
+	return true;
+}
+
 bool FAIDAActionSeam::ResolveAimSnappedOrigin(UObject* WorldContext, const FString& PlayerId,
 	const FString& RecipeClassPath, int32& InOutYawDeg,
 	int32 CountX, int32 CountY, double StepXCm, double StepYCm, FVector& OutOriginCm,
