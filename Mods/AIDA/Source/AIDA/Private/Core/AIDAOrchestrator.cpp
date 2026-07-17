@@ -2130,10 +2130,14 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 				(*SpecObj)->TryGetStringField(TEXT("direction"), Direction);
 			}
-			if (Count < 1 || Count > Config.Actions.MaxProposalItems)
+			// MaxProposalItems 0 = unlimited (repo-wide convention; live-verify: a 0 cap read as
+			// "between 1 and 0" and rejected every extension).
+			if (Count < 1 || (Config.Actions.MaxProposalItems > 0 && Count > Config.Actions.MaxProposalItems))
 			{
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
-					TEXT("count must be between 1 and %d"), Config.Actions.MaxProposalItems), {}));
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					Config.Actions.MaxProposalItems > 0
+						? FString::Printf(TEXT("count must be between 1 and %d"), Config.Actions.MaxProposalItems)
+						: FString(TEXT("count must be at least 1")), {}));
 			}
 
 			// Revision id validated up front (mirrors propose_build).

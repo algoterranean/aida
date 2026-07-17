@@ -771,7 +771,7 @@ FAIDASlabExtensionPlan AIDAActionSpec::PlanSlabExtension(const TArray<FAIDASlabC
 		for (int32 Step = 1; Step <= Count; ++Step)
 		{
 			const FIntPoint Coord(Edge->Coord.X + Dir.X * Step, Edge->Coord.Y + Dir.Y * Step);
-			if (Out.NewCells.Num() >= MaxItems)
+			if (MaxItems > 0 && Out.NewCells.Num() >= MaxItems) // 0 = unlimited
 			{
 				Out.Error = FString::Printf(
 					TEXT("extending the whole %d-lane slab by %d needs more than %d tiles — reduce the count"),
