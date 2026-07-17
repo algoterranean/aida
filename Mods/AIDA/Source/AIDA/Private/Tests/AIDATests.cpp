@@ -1793,6 +1793,16 @@ bool FAIDAMarkdownTest::RunTest(const FString&)
 		TestTrue(TEXT("bare table rows mono"), T.Contains(TEXT("<Mono>")));
 		TestFalse(TEXT("bare table has no header style"), T.Contains(TEXT("<MonoHeader>")));
 	}
+	// A lone dash rule is NOT a table: IsSeparatorRow matches it (outer pipes optional) but no '|'
+	// row follows, and the old code consumed nothing and re-looped the SAME line forever — Out grew
+	// until the 2 GB FString limit crashed the game (live crash 2026-07-17). This test completing
+	// at all is the regression check; the rule must also survive as literal text.
+	{
+		const FString T = AIDAMarkdownToRichText(TEXT("above\n---\nbelow"));
+		TestTrue(TEXT("dash rule kept literal"), T.Contains(TEXT("---")));
+		TestTrue(TEXT("text around rule kept"), T.Contains(TEXT("above")) && T.Contains(TEXT("below")));
+		TestEqual(TEXT("rule-only input terminates"), AIDAMarkdownToRichText(TEXT("---")), FString(TEXT("---")));
+	}
 	return true;
 }
 

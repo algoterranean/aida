@@ -166,8 +166,12 @@ FString AIDAMarkdownToRichText(const FString& Markdown)
 
 		// Table detection. Two forms: a proper header row followed by a |---| separator, OR (some models
 		// emit these) a separator row with no header above it. Either way, consume the run of '|' lines.
+		// A bare separator must ITSELF be a '|' row: IsSeparatorRow accepts a lone "---" (outer pipes
+		// are optional), but the collector below only consumes '|' lines — treating a dash-rule as a
+		// table consumed NOTHING and re-visited the same line forever, growing Out until the 2 GB
+		// FString limit crashed the game (live crash 2026-07-17: every streamed reply with a "---").
 		const bool bHeaderThenSeparator = IsTableRow(Trimmed) && i + 1 < Lines.Num() && IsSeparatorRow(Lines[i + 1]);
-		const bool bBareSeparator = IsSeparatorRow(Trimmed);
+		const bool bBareSeparator = IsTableRow(Trimmed) && IsSeparatorRow(Trimmed);
 		if (bHeaderThenSeparator || bBareSeparator)
 		{
 			TArray<FString> TableRows;
@@ -179,10 +183,13 @@ FString AIDAMarkdownToRichText(const FString& Markdown)
 				if (!IsTableRow(RowTrim)) { break; }
 				TableRows.Add(Lines[j]);
 			}
-			Out += RenderTable(TableRows, /*bHasHeader=*/bHeaderThenSeparator);
-			if (j < Lines.Num()) { Out += TEXT("\n"); }
-			i = j - 1; // for-loop ++ lands on the first non-table line
-			continue;
+			if (j > i) // defensive: NEVER loop without consuming at least the current line
+			{
+				Out += RenderTable(TableRows, /*bHasHeader=*/bHeaderThenSeparator);
+				if (j < Lines.Num()) { Out += TEXT("\n"); }
+				i = j - 1; // for-loop ++ lands on the first non-table line
+				continue;
+			}
 		}
 
 		if (Trimmed.StartsWith(TEXT("#")))
