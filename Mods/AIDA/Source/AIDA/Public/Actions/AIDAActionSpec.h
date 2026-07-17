@@ -55,6 +55,17 @@ namespace AIDAActionSpec
 		double StandoffM, double FootprintM, double MaxRunM);
 
 	/**
+	 * Extend a foundation slab (pure lattice): for EVERY lane perpendicular to Dir, find the lane's
+	 * frontier (greatest along-Dir cell) and append Count new cells beyond it, copying that frontier
+	 * cell's part (foundation class) and Z — so ragged edges, mixed classes and terrain-following
+	 * steps all extend correctly. Cells the slab already covers are skipped (L-shapes) and counted.
+	 * Dir must be a unit lattice step; fails (Out.Error) when the plan exceeds MaxItems or nothing
+	 * new would be placed.
+	 */
+	FAIDASlabExtensionPlan PlanSlabExtension(const TArray<FAIDASlabCell>& Slab, const FIntPoint& Dir,
+		int32 Count, int32 MaxItems);
+
+	/**
 	 * Parse + validate a propose_power spec: version 1, everything optional — buildable filter,
 	 * pole override, center (omitted = requester's aim), radiusM (default 30), maxCount (0 = all,
 	 * clamped to MaxItems).

@@ -426,22 +426,76 @@ bool FAIDAActionEngine::TickManifold(UObject* WorldContext, const FAIDAActionsCo
 		return true;
 	}
 
-	if (Proposal.Cursor < N)
+	if (Proposal.Phase == 2)
 	{
-		const int32 Index = Proposal.Cursor++;
-		AActor* Attachment = AttachmentAt(Index);
-		AActor* Machine = Proposal.Ports.IsValidIndex(Index) ? Proposal.Ports[Index].Machine.Get() : nullptr;
-		const FVector MachineDir = Proposal.Ports.IsValidIndex(Index)
-			? Proposal.Ports[Index].NormalCm : -Proposal.DropDir;
-		if (Proposal.bManifoldOutput) // machine output → attachment (merger/junction) input
+		if (Proposal.Cursor < N)
 		{
-			RunOne(Machine, MachineDir, Attachment, Proposal.DropDir, TEXT("drop"), Index);
+			const int32 Index = Proposal.Cursor++;
+			AActor* Attachment = AttachmentAt(Index);
+			AActor* Machine = Proposal.Ports.IsValidIndex(Index) ? Proposal.Ports[Index].Machine.Get() : nullptr;
+			const FVector MachineDir = Proposal.Ports.IsValidIndex(Index)
+				? Proposal.Ports[Index].NormalCm : -Proposal.DropDir;
+			if (Proposal.bManifoldOutput) // machine output → attachment (merger/junction) input
+			{
+				RunOne(Machine, MachineDir, Attachment, Proposal.DropDir, TEXT("drop"), Index);
+			}
+			else                          // attachment (splitter/junction) output → machine input
+			{
+				RunOne(Attachment, Proposal.DropDir, Machine, MachineDir, TEXT("drop"), Index);
+			}
+			if (Proposal.Cursor < N) { return true; }
 		}
-		else                          // attachment (splitter/junction) output → machine input
+		if (!Proposal.bTap)
 		{
-			RunOne(Attachment, Proposal.DropDir, Machine, MachineDir, TEXT("drop"), Index);
+			FinishExecution(WorldContext, Config, Memory, Proposal);
+			return false;
 		}
-		if (Proposal.Cursor < N) { return true; }
+		Proposal.Phase = 3;
+		Proposal.Cursor = 0;
+		return true;
+	}
+
+	// Phase 3 — tap the source belt: splice the splitter in (cut variant) or claim the free end.
+	if (Proposal.Phase == 3)
+	{
+		AActor* SourceBelt = Proposal.TapBelt.Get();
+		FString Error;
+		if (!SourceBelt)
+		{
+			Error = TEXT("the source belt no longer exists");
+		}
+		else if (Proposal.bTapDangling)
+		{
+			TapSourceActor = SourceBelt;
+		}
+		else if (!FAIDAActionSeam::ExecuteTapSplice(WorldContext, SourceBelt, Proposal.TapOffsetCm,
+			Proposal.TapSplitterRecipePath, Proposal.AffectedEntityIds, BuiltActors, TapSourceActor, Error))
+		{
+			AccrueSkippedCost(WorldContext, Config, Proposal.TapSplitterRecipePath, 1); // refund the unbuilt splitter
+		}
+		if (!TapSourceActor.IsValid())
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("tap: %s"), *Error));
+			}
+			UE_LOG(LogAIDA, Warning, TEXT("[actions] belt tap failed: %s"), *Error);
+			FinishExecution(WorldContext, Config, Memory, Proposal);
+			return false;
+		}
+		Proposal.Phase = 4;
+		return true;
+	}
+
+	// Phase 4 — the feed run: tap → the trunk's open end (index 0 carries the free feed port).
+	{
+		AActor* Tap = TapSourceActor.Get();
+		AActor* OpenEnd = AttachmentAt(0);
+		const FVector FromDir = (Tap && OpenEnd)
+			? (OpenEnd->GetActorLocation() - Tap->GetActorLocation()).GetSafeNormal(UE_SMALL_NUMBER, Proposal.TapDirCm)
+			: Proposal.TapDirCm;
+		RunOne(Tap, FromDir, OpenEnd, -Proposal.RowAxis, TEXT("feed"), 0);
 	}
 
 	FinishExecution(WorldContext, Config, Memory, Proposal);
@@ -611,12 +665,33 @@ bool FAIDAActionEngine::TickConnected(UObject* WorldContext, const FAIDAActionsC
 	// Phase 0 — the machines, index-captured so the sets' planned ports can rebind to real actors.
 	if (Proposal.Phase == 0)
 	{
+		// Spec-v2 composites: placements are grouped by part, so clamp each tick's batch to the
+		// current part's contiguous run and construct with THAT part's recipe (same shape as the
+		// plain build path).
+		FString Recipe = Proposal.RecipeClassPath;
+		int32 MachineBatch = Batch;
+		if (Proposal.PlacementPartIndex.Num() == Proposal.Placements.Num()
+			&& Proposal.PlacementPartIndex.IsValidIndex(Proposal.Cursor))
+		{
+			const int32 Part = Proposal.PlacementPartIndex[Proposal.Cursor];
+			if (Proposal.PartRecipePaths.IsValidIndex(Part))
+			{
+				Recipe = Proposal.PartRecipePaths[Part];
+			}
+			int32 RunEnd = Proposal.Cursor;
+			while (RunEnd < Proposal.PlacementPartIndex.Num() && Proposal.PlacementPartIndex[RunEnd] == Part)
+			{
+				++RunEnd;
+			}
+			MachineBatch = FMath::Min(MachineBatch, RunEnd - Proposal.Cursor);
+		}
+
 		int32 Skipped = 0;
-		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.RecipeClassPath,
-			Proposal.Placements, Proposal.Cursor, Batch,
+		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Recipe,
+			Proposal.Placements, Proposal.Cursor, MachineBatch,
 			Proposal.AffectedEntityIds, BuiltActors, Skipped, &AttachmentActors);
 		SkippedCount += Skipped;
-		AccrueSkippedCost(WorldContext, Config, Proposal.RecipeClassPath, Skipped);
+		AccrueSkippedCost(WorldContext, Config, Recipe, Skipped);
 		if (Proposal.Cursor < Proposal.Placements.Num()) { return true; }
 
 		// Rebind: planned ports (Machine was null since propose) now point at the BUILT actors.
@@ -821,6 +896,63 @@ bool FAIDAActionEngine::TickConnected(UObject* WorldContext, const FAIDAActionsC
 		else if (Proposal.PolePlacements.Num() > 0)
 		{
 			RunReport.Add(TEXT("no existing power grid within 100 m — connect the feed line manually"));
+		}
+	}
+
+	// Tap phases (belt-tap combined proposals) — last, so the feed run's open-end attachment
+	// exists. Plain proposals arrive here at PolePhase; powered ones fall through the wire block.
+	const int32 TapPhase = WirePhase + 1;
+	if (Proposal.bTap)
+	{
+		if (Proposal.Phase < TapPhase)
+		{
+			Proposal.Phase = TapPhase;
+			Proposal.Cursor = 0;
+			return true;
+		}
+		const int32 SetIdx = Proposal.TapSetIndex;
+		if (Proposal.Phase == TapPhase)
+		{
+			AActor* SourceBelt = Proposal.TapBelt.Get();
+			FString Error;
+			if (!SourceBelt)
+			{
+				Error = TEXT("the source belt no longer exists");
+			}
+			else if (Proposal.bTapDangling)
+			{
+				TapSourceActor = SourceBelt;
+			}
+			else if (!FAIDAActionSeam::ExecuteTapSplice(WorldContext, SourceBelt, Proposal.TapOffsetCm,
+				Proposal.TapSplitterRecipePath, Proposal.AffectedEntityIds, BuiltActors, TapSourceActor, Error))
+			{
+				AccrueSkippedCost(WorldContext, Config, Proposal.TapSplitterRecipePath, 1);
+			}
+			if (!TapSourceActor.IsValid())
+			{
+				++RunFailCount;
+				if (RunFailures.Num() < 5)
+				{
+					RunFailures.Add(FString::Printf(TEXT("tap: %s"), *Error));
+				}
+				UE_LOG(LogAIDA, Warning, TEXT("[actions] belt tap failed: %s"), *Error);
+				FinishExecution(WorldContext, Config, Memory, Proposal);
+				return false;
+			}
+			Proposal.Phase = TapPhase + 1;
+			return true;
+		}
+		// Feed run: tap → the belt-in set's trunk open end (index 0).
+		if (Proposal.ManifoldSets.IsValidIndex(SetIdx))
+		{
+			const FAIDAManifoldSet& FeedSet = Proposal.ManifoldSets[SetIdx];
+			AActor* Tap = TapSourceActor.Get();
+			AActor* OpenEnd = (SetAttachmentActors.IsValidIndex(SetIdx) && SetAttachmentActors[SetIdx].Num() > 0)
+				? SetAttachmentActors[SetIdx][0].Get() : nullptr;
+			const FVector FromDir = (Tap && OpenEnd)
+				? (OpenEnd->GetActorLocation() - Tap->GetActorLocation()).GetSafeNormal(UE_SMALL_NUMBER, Proposal.TapDirCm)
+				: Proposal.TapDirCm;
+			RunOne(FeedSet, Tap, FromDir, OpenEnd, -FeedSet.RowAxis, TEXT("feed"), 0);
 		}
 	}
 

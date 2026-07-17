@@ -728,6 +728,70 @@ FAIDAPowerPlan AIDAActionSpec::PlanPower(int32 CountX, int32 CountY, double Step
 	return Plan;
 }
 
+FAIDASlabExtensionPlan AIDAActionSpec::PlanSlabExtension(const TArray<FAIDASlabCell>& Slab,
+	const FIntPoint& Dir, int32 Count, int32 MaxItems)
+{
+	FAIDASlabExtensionPlan Out;
+	if (Slab.Num() == 0)
+	{
+		Out.Error = TEXT("the slab census is empty — nothing to extend");
+		return Out;
+	}
+	if (FMath::Abs(Dir.X) + FMath::Abs(Dir.Y) != 1)
+	{
+		Out.Error = TEXT("the extend direction must be a single lattice step");
+		return Out;
+	}
+	if (Count < 1)
+	{
+		Out.Error = TEXT("count must be at least 1");
+		return Out;
+	}
+
+	// One frontier cell per lane: the greatest along-direction coordinate. The frontier cell also
+	// donates its part (foundation class) and Z to everything placed beyond it in that lane.
+	TMap<int32, const FAIDASlabCell*> Frontier;
+	for (const FAIDASlabCell& Cell : Slab)
+	{
+		const int32 Lane = (Dir.X != 0) ? Cell.Coord.Y : Cell.Coord.X;
+		const int32 Along = Cell.Coord.X * Dir.X + Cell.Coord.Y * Dir.Y;
+		const FAIDASlabCell* const* Existing = Frontier.Find(Lane);
+		if (!Existing || Along > ((*Existing)->Coord.X * Dir.X + (*Existing)->Coord.Y * Dir.Y))
+		{
+			Frontier.Add(Lane, &Cell);
+		}
+	}
+
+	TArray<int32> Lanes;
+	Frontier.GenerateKeyArray(Lanes);
+	Lanes.Sort();
+	for (const int32 Lane : Lanes)
+	{
+		const FAIDASlabCell* Edge = Frontier[Lane];
+		for (int32 Step = 1; Step <= Count; ++Step)
+		{
+			const FIntPoint Coord(Edge->Coord.X + Dir.X * Step, Edge->Coord.Y + Dir.Y * Step);
+			if (Out.NewCells.Num() >= MaxItems)
+			{
+				Out.Error = FString::Printf(
+					TEXT("extending the whole %d-lane slab by %d needs more than %d tiles — reduce the count"),
+					Lanes.Num(), Count, MaxItems);
+				return Out;
+			}
+			FAIDASlabCell New;
+			New.Coord = Coord;
+			New.ZCm = Edge->ZCm;
+			New.Part = Edge->Part;
+			Out.NewCells.Add(New);
+		}
+	}
+	if (Out.NewCells.Num() == 0)
+	{
+		Out.Error = TEXT("the slab already covers everything in that direction");
+	}
+	return Out;
+}
+
 FString AIDAActionSpec::CompassName(const FVector& Dir)
 {
 	// Game convention (AIDAChatCommands): north = -Y, east = +X. 8-way, 45° sectors.

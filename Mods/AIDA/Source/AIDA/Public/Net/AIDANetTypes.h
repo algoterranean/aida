@@ -76,6 +76,23 @@ struct FAIDAGhostPart
 };
 
 /**
+ * One belt/pipe run of a pending proposal's ghost preview: a display-only spline hologram driven
+ * from A to B (trunk hops between attachments + drops to machine ports). Normals are the port /
+ * flow directions the executor will use, so the ghost belt curves the way the real one will.
+ */
+USTRUCT(BlueprintType)
+struct FAIDAGhostRun
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FString RecipeClassPath; // the transport (belt/pipe)
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FVector FromCm = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FVector FromNormal = FVector::XAxisVector;
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FVector ToCm = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") FVector ToNormal = FVector::XAxisVector;
+};
+
+/**
  * Client-facing view of one build/dismantle proposal (docs/PHASE4.md §2e). Replicated as a state
  * array on AAIDAProposalRelay so late joiners see pending proposals for free. Carries display
  * strings only — no spec JSON, no ids beyond the ProposalId the approve RPC echoes back.
@@ -101,6 +118,10 @@ struct FAIDAProposalView
 	//~ holograms per part at each tile so players see EXACTLY where the build will land — one part
 	//~ for v1 grids, several for spec-v2 composites.
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FAIDAGhostPart> GhostParts;
+
+	//~ Belt/pipe runs of manifold and connected-build proposals — previewed as display-only spline
+	//~ holograms so the WHOLE build (machines + attachments + belts/pipes) is visible pre-approval.
+	UPROPERTY(BlueprintReadOnly, Category = "AIDA") TArray<FAIDAGhostRun> GhostRuns;
 };
 
 /**

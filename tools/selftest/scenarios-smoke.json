@@ -44,6 +44,26 @@
           "expect": { "ok": true, "contains": ["pending"] } },
         { "action": "reject", "proposalId": "$combined" }
       ]
+    },
+    {
+      "name": "composite-with-manifold",
+      "steps": [
+        { "tool": "propose_build", "forNote": "v2 composite of identical machines - the live-failure shape",
+          "args": { "spec": { "version": 2, "yawDeg": 0, "parts": [
+                      { "buildable": "Refinery", "at": { "x": 0, "y": 0, "z": 0 } },
+                      { "buildable": "Refinery", "at": { "x": 12, "y": 0, "z": 0 } },
+                      { "buildable": "Refinery", "at": { "x": 24, "y": 0, "z": 0 } } ] } },
+          "expect": { "ok": true, "fields": { "count": 3 }, "contains": ["proposalId"] },
+          "save": { "proposalId": "composite" } },
+        { "tool": "propose_manifold", "forNote": "composites can take manifolds while still pending",
+          "args": { "spec": { "version": 1, "kind": "pipe", "direction": "in", "transport": "Pipeline" },
+                    "forProposalId": "$composite" },
+          "expect": { "ok": true, "contains": ["proposalId"], "notContains": ["error"] },
+          "save": { "proposalId": "combined" } },
+        { "tool": "get_proposal_status", "args": { "proposalId": "$combined" },
+          "expect": { "ok": true, "contains": ["pending", "manifold"] } },
+        { "action": "reject", "proposalId": "$combined" }
+      ]
     }
   ]
 }

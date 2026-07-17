@@ -23,7 +23,9 @@
 #include "Buildables/FGBuildableWire.h"
 #include "Hologram/FGBuildableHologram.h"
 #include "Hologram/FGConveyorBeltHologram.h"
+#include "Hologram/FGPipelineHologram.h"
 #include "Hologram/FGSplineHologram.h"
+#include "Components/SplineComponent.h"
 #include "FGClearanceInterface.h"
 #include "FGConstructDisqualifier.h"
 #include "FGDismantleInterface.h"
@@ -33,7 +35,11 @@
 #include "FGRecipeManager.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildableConveyorBelt.h"
 #include "Buildables/FGBuildableConveyorAttachment.h"
+#include "Buildables/FGBuildableFoundation.h"
+#include "FGConveyorChainActor.h"
+#include "FGConveyorItem.h"
 #include "Buildables/FGBuildablePipelineAttachment.h"
 #include "Buildables/FGBuildableStorage.h"
 #include "Buildables/FGBuildableWidgetSign.h"
@@ -43,6 +49,60 @@
 #include "ItemAmount.h"
 #include "Resources/FGBuildingDescriptor.h"
 #include "Resources/FGItemDescriptor.h"
+
+/**
+ * Friend of the spline hologram classes (Config/AccessTransformers.ini): ghost run previews call
+ * the holograms' own private spline router directly. The build-gun two-step drive is enough when
+ * the endpoints are LIVE actors (execute), but display-only ghosts between unbuilt endpoints came
+ * out as stubs — routing explicitly is deterministic.
+ */
+class FAIDAGhostRunAccess
+{
+public:
+	/** Route the spline from A to B with the hologram's own bend logic, then rebuild its meshes.
+	 *  Returns the routed spline's world end position (for diagnostics), or unset on failure. */
+	static bool Route(AFGHologram* Hologram, const FVector& FromCm, const FVector& FromDir,
+		const FVector& ToCm, const FVector& ToDir, FVector& OutEndCm)
+	{
+		USplineComponent* Spline = nullptr;
+		if (AFGConveyorBeltHologram* Belt = Cast<AFGConveyorBeltHologram>(Hologram))
+		{
+			Belt->AutoRouteSpline(FromCm, FromDir, ToCm, ToDir);
+			Belt->UpdateSplineComponent();
+			Spline = Belt->mSplineComponent;
+		}
+		else if (AFGPipelineHologram* Pipe = Cast<AFGPipelineHologram>(Hologram))
+		{
+			Pipe->AutoRouteSpline(FromCm, FromDir, ToCm, ToDir);
+			Pipe->UpdateSplineComponent();
+			Spline = Pipe->mSplineComponent;
+		}
+		if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+		{
+			return false;
+		}
+		OutEndCm = Spline->GetLocationAtSplinePoint(Spline->GetNumberOfSplinePoints() - 1, ESplineCoordinateSpace::World);
+		return true;
+	}
+};
+
+/**
+ * Friend of AFGBuildableConveyorBase (Config/AccessTransformers.ini): the belt-tap census reads
+ * what's riding a belt. The public GetConveyorBeltItems only answers for chain-actor belts;
+ * unchained belts keep their items in the protected mItems.
+ */
+class FAIDABeltAccess
+{
+public:
+	static int32 NumItems(const AFGBuildableConveyorBase* Belt)
+	{
+		return Belt->mItems.Num();
+	}
+	static TSubclassOf<UFGItemDescriptor> ItemClassAt(const AFGBuildableConveyorBase* Belt, int32 Index)
+	{
+		return Belt->mItems[Index].Item.GetItemClass();
+	}
+};
 
 namespace
 {
@@ -522,6 +582,479 @@ bool FAIDAActionSeam::ResolveAimPoint(UObject* WorldContext, const FString& Play
 		return false;
 	}
 	OutPointCm = Hit.ImpactPoint;
+	return true;
+}
+
+bool FAIDAActionSeam::CensusFoundationSlab(UObject* WorldContext, const FString& PlayerId,
+	const FString& DirectionHint, FAIDASlabCensus& Out)
+{
+	Out = FAIDASlabCensus();
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World)
+	{
+		Out.Error = TEXT("no world to census");
+		return false;
+	}
+
+	// Requester viewpoint + stance (same identity convention as the aim resolver).
+	APlayerController* Requester = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		APlayerState* PS = PC ? PC->PlayerState : nullptr;
+		if (!PS) { continue; }
+		const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
+		if ((NetId.IsValid() ? NetId->ToString() : FString()) == PlayerId)
+		{
+			Requester = PC;
+			break;
+		}
+	}
+	if (!Requester)
+	{
+		Out.Error = TEXT("could not resolve the requesting player");
+		return false;
+	}
+	FVector ViewLoc;
+	FRotator ViewRot;
+	Requester->GetPlayerViewPoint(ViewLoc, ViewRot);
+	APawn* Pawn = Requester->GetPawn();
+	const FVector PawnLoc = Pawn ? Pawn->GetActorLocation() : ViewLoc;
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDASlabTrace), /*bTraceComplex*/ false);
+	if (Pawn) { Params.AddIgnoredActor(Pawn); }
+
+	FHitResult AimHit;
+	const bool bAimHit = World->LineTraceSingleByChannel(AimHit, ViewLoc,
+		ViewLoc + ViewRot.Vector() * 15000.0, AIDABuildGunChannel, Params);
+	FHitResult StandHit;
+	const bool bStandHit = TraceGroundIgnoringConveyors(World,
+		PawnLoc + FVector(0.0, 0.0, 100.0), PawnLoc - FVector(0.0, 0.0, 600.0), Params, StandHit);
+
+	// Every lightweight foundation instance near the player/aim — foundations are always
+	// lightweight-instanced, so the buildable-actor walk would find nothing.
+	AFGLightweightBuildableSubsystem* Lightweights = AFGLightweightBuildableSubsystem::Get(World);
+	if (!Lightweights)
+	{
+		Out.Error = TEXT("no foundations exist yet");
+		return false;
+	}
+	struct FInst
+	{
+		FVector Loc;
+		double YawDeg;
+		int32 Part;
+	};
+	TArray<FInst> Instances;
+	const FVector Near = bAimHit ? AimHit.ImpactPoint : PawnLoc;
+	const double GatherRadiusSq = FMath::Square(16000.0); // 160 m of slab around the anchor is plenty
+	for (const auto& Pair : Lightweights->GetAllLightweightBuildableInstances())
+	{
+		UClass* BuildableClass = Pair.Key.Get();
+		if (!BuildableClass || !BuildableClass->IsChildOf(AFGBuildableFoundation::StaticClass())) { continue; }
+		const TSubclassOf<UFGRecipe> Recipe = Lightweights->GetBuiltWithRecipeForBuildableClass(Pair.Key);
+		if (!Recipe) { continue; } // can't rebuild what has no recipe
+		int32 Part = INDEX_NONE;   // registered lazily on the first in-range instance
+		for (const FRuntimeBuildableInstanceData& Instance : Pair.Value)
+		{
+			if (!Instance.IsValid()) { continue; } // removed slots linger in the array
+			const FVector Loc = Instance.Transform.GetLocation();
+			if (FVector::DistSquared2D(Loc, Near) > GatherRadiusSq) { continue; }
+			if (Part == INDEX_NONE)
+			{
+				Part = Out.PartRecipePaths.Num();
+				Out.PartRecipePaths.Add(Recipe->GetPathName());
+				const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
+				Out.PartNames.Add(Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(BuildableClass));
+			}
+			Instances.Add({ Loc, Instance.Transform.Rotator().Yaw, Part });
+		}
+	}
+	if (Instances.Num() == 0)
+	{
+		Out.Error = TEXT("no foundations near you — stand on the slab (or aim at it) and try again");
+		return false;
+	}
+
+	// Anchor: the foundation cell containing the point under the player's FEET, else their AIM.
+	const auto CellAt = [&Instances](const FVector& PointCm) -> int32
+	{
+		int32 Best = INDEX_NONE;
+		double BestD = FMath::Square(400.0 + 120.0); // half a tile + slack
+		for (int32 i = 0; i < Instances.Num(); ++i)
+		{
+			if (FMath::Abs(Instances[i].Loc.Z - PointCm.Z) > 350.0) { continue; }
+			const double D = FVector::DistSquared2D(Instances[i].Loc, PointCm);
+			if (D < BestD)
+			{
+				BestD = D;
+				Best = i;
+			}
+		}
+		return Best;
+	};
+	bool bStanding = false;
+	int32 Anchor = bStandHit ? CellAt(StandHit.ImpactPoint) : INDEX_NONE;
+	if (Anchor != INDEX_NONE)
+	{
+		bStanding = true;
+	}
+	else if (bAimHit)
+	{
+		Anchor = CellAt(AimHit.ImpactPoint);
+	}
+	if (Anchor == INDEX_NONE)
+	{
+		Out.Error = TEXT("couldn't find a foundation under your feet or your aim — stand on the slab or aim at its edge");
+		return false;
+	}
+
+	// The anchor's own lattice: 8 m cells along its yaw axes. Instances snap onto it; anything
+	// off-lattice or rotated off the 90° family is someone else's slab.
+	const FInst A = Instances[Anchor];
+	Out.OriginCm = A.Loc;
+	Out.YawDeg = A.YawDeg;
+	Out.StepCm = 800.0; // standard foundations are 8x8 m (the metre suffix is THICKNESS)
+	const double YawRad = FMath::DegreesToRadians(A.YawDeg);
+	Out.AxisU = FVector(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.0);
+	Out.AxisV = FVector(-Out.AxisU.Y, Out.AxisU.X, 0.0);
+
+	TMap<FIntPoint, FAIDASlabCell> Grid;
+	for (const FInst& Inst : Instances)
+	{
+		const double Rem = FMath::Fmod(FMath::Abs(FMath::FindDeltaAngleDegrees(Inst.YawDeg, A.YawDeg)), 90.0);
+		if (Rem > 2.0 && Rem < 88.0) { continue; }                  // rotated slab = a different lattice
+		if (FMath::Abs(Inst.Loc.Z - A.Loc.Z) > 350.0) { continue; } // other floors are other slabs
+		const FVector Delta = Inst.Loc - A.Loc;
+		const double DU = FVector::DotProduct(Delta, Out.AxisU);
+		const double DV = FVector::DotProduct(Delta, Out.AxisV);
+		const FIntPoint Coord(FMath::RoundToInt32(DU / Out.StepCm), FMath::RoundToInt32(DV / Out.StepCm));
+		if (FMath::Abs(DU - Coord.X * Out.StepCm) > 60.0 || FMath::Abs(DV - Coord.Y * Out.StepCm) > 60.0) { continue; }
+		const FAIDASlabCell* Existing = Grid.Find(Coord);
+		if (Existing && FMath::Abs(Existing->ZCm - A.Loc.Z) <= FMath::Abs(Inst.Loc.Z - A.Loc.Z)) { continue; }
+		FAIDASlabCell Cell;
+		Cell.Coord = Coord;
+		Cell.ZCm = Inst.Loc.Z;
+		Cell.Part = Inst.Part;
+		Grid.Add(Coord, Cell);
+	}
+
+	// Flood fill from the anchor — the CONTIGUOUS slab only. The per-hop |dZ| tolerance absorbs
+	// terrain-following steps without leaking onto separate platforms a gap away.
+	TSet<FIntPoint> Visited;
+	TArray<FIntPoint> Stack;
+	Visited.Add(FIntPoint::ZeroValue);
+	Stack.Push(FIntPoint::ZeroValue);
+	static const FIntPoint Neighbors[4] = { FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1) };
+	while (Stack.Num() > 0)
+	{
+		const FIntPoint At = Stack.Pop();
+		const FAIDASlabCell Cell = Grid.FindChecked(At);
+		Out.Cells.Add(Cell);
+		for (const FIntPoint& N : Neighbors)
+		{
+			const FIntPoint NextCoord(At.X + N.X, At.Y + N.Y);
+			if (Visited.Contains(NextCoord)) { continue; }
+			const FAIDASlabCell* NextCell = Grid.Find(NextCoord);
+			if (!NextCell || FMath::Abs(NextCell->ZCm - Cell.ZCm) > 220.0) { continue; }
+			Visited.Add(NextCoord);
+			Stack.Push(NextCoord);
+		}
+	}
+
+	// What "extend" points at: an explicit compass hint wins; standing on the slab means the look
+	// direction; aiming at a SIDE face from off the slab means outward through that face; a top-face
+	// aim falls back to the look direction. Snapped onto the slab's own axes either way.
+	FVector WantDir = FVector::ZeroVector;
+	FString Source;
+	const FString Hint = DirectionHint.TrimStartAndEnd().ToLower();
+	if (!Hint.IsEmpty())
+	{
+		if (Hint == TEXT("north")) { WantDir = FVector(0.0, -1.0, 0.0); }
+		else if (Hint == TEXT("south")) { WantDir = FVector(0.0, 1.0, 0.0); }
+		else if (Hint == TEXT("east")) { WantDir = FVector(1.0, 0.0, 0.0); }
+		else if (Hint == TEXT("west")) { WantDir = FVector(-1.0, 0.0, 0.0); }
+		else
+		{
+			Out.Error = FString::Printf(TEXT("unknown direction '%s' — use north, south, east or west (or omit it to use the player's aim)"), *DirectionHint);
+			return false;
+		}
+		Source = TEXT("as asked");
+	}
+	else if (bStanding)
+	{
+		WantDir = FVector(ViewRot.Vector().X, ViewRot.Vector().Y, 0.0);
+		Source = TEXT("your look direction");
+	}
+	else if (bAimHit && FMath::Abs(AimHit.ImpactNormal.Z) < 0.5)
+	{
+		WantDir = FVector(AimHit.ImpactNormal.X, AimHit.ImpactNormal.Y, 0.0);
+		Source = TEXT("outward from the aimed edge");
+	}
+	else
+	{
+		WantDir = FVector(ViewRot.Vector().X, ViewRot.Vector().Y, 0.0);
+		Source = TEXT("your look direction");
+	}
+	WantDir = WantDir.GetSafeNormal(UE_SMALL_NUMBER, Out.AxisU);
+	const double DotU = FVector::DotProduct(WantDir, Out.AxisU);
+	const double DotV = FVector::DotProduct(WantDir, Out.AxisV);
+	Out.ExtendDir = FMath::Abs(DotU) >= FMath::Abs(DotV)
+		? FIntPoint(DotU >= 0.0 ? 1 : -1, 0)
+		: FIntPoint(0, DotV >= 0.0 ? 1 : -1);
+	const FVector WorldDir = Out.AxisU * Out.ExtendDir.X + Out.AxisV * Out.ExtendDir.Y;
+	Out.DirectionNote = FString::Printf(TEXT("%s (%s)"), *AIDAActionSpec::CompassName(WorldDir), *Source);
+
+	UE_LOG(LogAIDA, Log, TEXT("[actions] slab census: %d cell(s), %d class(es), anchor %s, extend %s"),
+		Out.Cells.Num(), Out.PartRecipePaths.Num(), *A.Loc.ToCompactString(), *Out.DirectionNote);
+	return true;
+}
+
+bool FAIDAActionSeam::FindTapSource(UObject* WorldContext, const FString& ItemFilter,
+	const FVector& FeedPointCm, double MaxDistanceCm, FAIDATapSource& Out)
+{
+	Out = FAIDATapSource();
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World)
+	{
+		Out.Error = TEXT("no world to search");
+		return false;
+	}
+
+	const FString Filter = ItemFilter.TrimStartAndEnd();
+	// Splicing a splitter needs clear belt on both sides of the cut.
+	constexpr double MinCutEndClearanceCm = 250.0;
+	constexpr double MinCuttableLengthCm = 2.0 * MinCutEndClearanceCm + 10.0;
+
+	struct FCandidate
+	{
+		AFGBuildableConveyorBelt* Belt = nullptr;
+		bool bDangling = false;
+		double OffsetCm = 0.0;
+		FVector PointCm = FVector::ZeroVector;
+		FVector DirCm = FVector::XAxisVector;
+		double DistCm = 0.0;
+		FString ItemNote;
+	};
+	FCandidate Best;
+	bool bHave = false;
+	int32 Scanned = 0;
+
+	for (TActorIterator<AFGBuildableConveyorBelt> It(World); It; ++It)
+	{
+		AFGBuildableConveyorBelt* Belt = *It;
+		if (!IsValid(Belt)) { continue; }
+		++Scanned;
+
+		// What rides it: chain-actor belts answer publicly; unchained belts via friend access.
+		TArray<FString> Riding;
+		{
+			TArray<FConveyorBeltItem*> ChainItems;
+			Belt->GetConveyorBeltItems(ChainItems);
+			for (const FConveyorBeltItem* BeltItem : ChainItems)
+			{
+				if (BeltItem) { Riding.AddUnique(DescriptorName(BeltItem->Item.GetItemClass())); }
+			}
+			if (Riding.Num() == 0)
+			{
+				for (int32 i = 0; i < FAIDABeltAccess::NumItems(Belt); ++i)
+				{
+					Riding.AddUnique(DescriptorName(FAIDABeltAccess::ItemClassAt(Belt, i)));
+				}
+			}
+		}
+		if (!Filter.IsEmpty())
+		{
+			bool bMatch = false;
+			for (const FString& Name : Riding)
+			{
+				if (Name.Contains(Filter, ESearchCase::IgnoreCase)) { bMatch = true; break; }
+			}
+			if (!bMatch) { continue; }
+		}
+
+		// A free OUTPUT end needs no cut — and a stalled, full, going-nowhere belt is exactly the
+		// player's "unused coal belt". Flow runs connection0 -> connection1.
+		UFGFactoryConnectionComponent* OutEnd = Belt->GetConnection1();
+		const bool bDangling = OutEnd && !OutEnd->IsConnected();
+
+		FCandidate Candidate;
+		Candidate.Belt = Belt;
+		Candidate.ItemNote = Riding.Num() > 0 ? Riding[0] : TEXT("empty");
+		if (bDangling)
+		{
+			Candidate.bDangling = true;
+			Candidate.PointCm = OutEnd->GetConnectorLocation();
+			Candidate.DirCm = OutEnd->GetConnectorNormal();
+			Candidate.DistCm = FVector::Dist(Candidate.PointCm, FeedPointCm);
+		}
+		else
+		{
+			const double Length = Belt->GetLength();
+			if (Length < MinCuttableLengthCm) { continue; } // too short to splice a splitter into
+			const double Offset = FMath::Clamp<double>(Belt->FindOffsetClosestToLocation(FeedPointCm),
+				MinCutEndClearanceCm, Length - MinCutEndClearanceCm);
+			FVector PointCm, DirCm;
+			Belt->GetLocationAndDirectionAtOffset(Offset, PointCm, DirCm);
+			Candidate.OffsetCm = Offset;
+			Candidate.PointCm = PointCm;
+			Candidate.DirCm = DirCm.GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+			Candidate.DistCm = FVector::Dist(PointCm, FeedPointCm);
+		}
+		if (Candidate.DistCm > MaxDistanceCm) { continue; }
+
+		// Free ends beat cuts; within a class, nearest wins.
+		const bool bBetter = !bHave
+			|| (Candidate.bDangling && !Best.bDangling)
+			|| (Candidate.bDangling == Best.bDangling && Candidate.DistCm < Best.DistCm);
+		if (bBetter)
+		{
+			Best = Candidate;
+			bHave = true;
+		}
+	}
+
+	if (!bHave)
+	{
+		Out.Error = Filter.IsEmpty()
+			? FString::Printf(TEXT("no belt within %.0f m of the manifold's feed end"),
+				MaxDistanceCm / AIDAMetersToCm)
+			: FString::Printf(TEXT("no belt carrying '%s' within %.0f m of the manifold's feed end "
+				"(%d belt(s) checked — the match reads what is riding each belt right now)"),
+				*Filter, MaxDistanceCm / AIDAMetersToCm, Scanned);
+		return false;
+	}
+
+	// Display name via the built-with recipe, like the dismantle census.
+	FString BeltName = GetNameSafe(Best.Belt->GetClass());
+	if (const TSubclassOf<UFGRecipe> Recipe = Best.Belt->GetBuiltWithRecipe())
+	{
+		const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
+		if (Products.Num() > 0) { BeltName = DescriptorName(Products[0].ItemClass); }
+	}
+
+	Out.Belt = Best.Belt;
+	Out.BeltName = BeltName;
+	Out.ItemNote = Best.ItemNote;
+	Out.bDangling = Best.bDangling;
+	Out.OffsetCm = Best.OffsetCm;
+	Out.PointCm = Best.PointCm;
+	Out.DirCm = Best.DirCm;
+	Out.DistanceM = Best.DistCm / AIDAMetersToCm;
+	UE_LOG(LogAIDA, Log, TEXT("[actions] tap source: %s carrying %s, %s at %s (%.0f m from the feed end)"),
+		*Out.BeltName, *Out.ItemNote, Out.bDangling ? TEXT("free end") : TEXT("cut"),
+		*Out.PointCm.ToCompactString(), Out.DistanceM);
+	return true;
+}
+
+bool FAIDAActionSeam::ExecuteTapSplice(UObject* WorldContext, AActor* BeltActor, double OffsetCm,
+	const FString& SplitterRecipePath, TArray<FString>& OutEntityIds,
+	TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError)
+{
+	OutError.Reset();
+	OutTapActor = nullptr;
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableConveyorBase* Belt = Cast<AFGBuildableConveyorBase>(BeltActor);
+	UClass* RecipeClass = World ? FSoftClassPath(SplitterRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!Belt)
+	{
+		OutError = TEXT("the source belt no longer exists");
+		return false;
+	}
+	if (!RecipeClass)
+	{
+		OutError = TEXT("the tap splitter recipe is no longer resolvable");
+		return false;
+	}
+
+	FVector PointCm, DirCm;
+	Belt->GetLocationAndDirectionAtOffset(OffsetCm, PointCm, DirCm);
+	UE_LOG(LogAIDA, Log, TEXT("[actions][tap] splicing %s at offset %.0f (%s)"),
+		*GetNameSafe(Belt), OffsetCm, *PointCm.ToCompactString());
+	GLog->Flush();
+
+	// The player flow of dropping a splitter onto a belt: a rich hit ON the belt (real actor +
+	// primitive) lets the attachment hologram's TrySnapToActor latch and enter splice mode; the
+	// game's own Construct then splits the belt and wires both halves through the splitter.
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, PointCm);
+	if (!Hologram)
+	{
+		OutError = TEXT("could not spawn the tap splitter hologram");
+		return false;
+	}
+	FHitResult Hit(ForceInit);
+	Hit.bBlockingHit = true;
+	Hit.HitObjectHandle = FActorInstanceHandle(Belt);
+	UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Belt->GetRootComponent());
+	if (!Prim) { Prim = Belt->FindComponentByClass<UPrimitiveComponent>(); }
+	if (Prim) { Hit.Component = Prim; }
+	Hit.Location = PointCm;
+	Hit.ImpactPoint = PointCm;
+	Hit.Normal = FVector::UpVector;
+	Hit.ImpactNormal = FVector::UpVector;
+	Hit.TraceStart = PointCm + FVector(0.0, 0.0, 300.0);
+	Hit.TraceEnd = PointCm - FVector(0.0, 0.0, 100.0);
+	Hit.Distance = 300.0;
+
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(Hit);
+	Hologram->ValidatePlacementAndCost(FindValidationInventory(World));
+	TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
+	Hologram->GetConstructDisqualifiers(Disqualifiers);
+	for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+	{
+		if (IsBlockingDisqualifier(Disqualifier))
+		{
+			OutError = FString::Printf(TEXT("the tap splitter can't place on the belt: %s"),
+				*UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString());
+			Hologram->Destroy();
+			return false;
+		}
+	}
+
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	if (!Built)
+	{
+		OutError = TEXT("tap splitter Construct() returned nothing");
+		return false;
+	}
+
+	// Verify the splice took: a spliced splitter comes out with its pass-through wired into the
+	// two belt halves. An unspliced (floating) splitter is torn down again — the belt stays whole.
+	int32 Connected = 0;
+	TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
+	Built->GetComponents(Connections);
+	for (UFGFactoryConnectionComponent* Conn : Connections)
+	{
+		if (Conn && Conn->IsConnected()) { ++Connected; }
+	}
+	if (Connected < 2)
+	{
+		OutError = TEXT("the splitter did not splice into the belt (snap did not latch) — the belt was left uncut");
+		if (IFGDismantleInterface::Execute_CanDismantle(Built))
+		{
+			IFGDismantleInterface::Execute_Dismantle(Built);
+		}
+		else
+		{
+			Built->Destroy();
+		}
+		return false;
+	}
+
+	// Journal like any placement so /aida undo removes the splitter (the cut halves stay belts).
+	FAIDAEntityId Entity;
+	Entity.Type = TEXT("actor");
+	Entity.ClassPath = Built->GetClass()->GetPathName();
+	Entity.RecipePath = SplitterRecipePath;
+	Entity.Pos = Built->GetActorLocation();
+	Entity.YawDeg = FMath::RoundToInt32(Built->GetActorRotation().Yaw);
+	OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
+	OutActors.Add(Built);
+	OutTapActor = Built;
+	UE_LOG(LogAIDA, Log, TEXT("[actions][tap] splitter spliced in (%d connected port(s))."), Connected);
 	return true;
 }
 
@@ -1264,6 +1797,123 @@ AActor* FAIDAActionSeam::SpawnGhostHologram(UObject* WorldContext, const FString
 	// Display-only: kill ticking and collision on the hologram, its children, and every component.
 	// Factory-building holograms run real per-tick work meant for one build-gun frame at a time —
 	// left idling they hung the game (live-verify: assembler ghosts froze the session).
+	const auto Quiesce = [](AActor* Actor)
+	{
+		Actor->SetActorEnableCollision(false);
+		Actor->SetActorTickEnabled(false);
+		Actor->ForEachComponent<UActorComponent>(false, [](UActorComponent* Component)
+		{
+			Component->SetComponentTickEnabled(false);
+		});
+	};
+	Quiesce(Hologram);
+	TArray<AActor*> Attached;
+	Hologram->GetAttachedActors(Attached, /*bResetArray*/ true, /*bRecursivelyIncludeAttachedActors*/ true);
+	for (AActor* Child : Attached)
+	{
+		Quiesce(Child);
+	}
+	return Hologram;
+}
+
+AActor* FAIDAActionSeam::SpawnGhostRunHologram(UObject* WorldContext, const FString& RecipeClassPath,
+	const FVector& FromCm, const FVector& FromDir, const FVector& ToCm, const FVector& ToDir,
+	AActor* Owner)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(RecipeClassPath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] ghost run: transport recipe '%s' would not load."), *RecipeClassPath);
+		return nullptr;
+	}
+
+	AFGHologram* Hologram = AFGHologram::SpawnHologramFromRecipe(RecipeClass,
+		Owner ? Owner : World->GetWorldSettings(), FromCm, /*hologramInstigator*/ nullptr,
+		[](AFGHologram* PreSpawn) { PreSpawn->SetReplicates(false); });
+	if (!Hologram)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] ghost run: no hologram spawned for '%s'."), *RecipeClassPath);
+		return nullptr;
+	}
+	if (!Cast<AFGSplineHologram>(Hologram))
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] ghost run: '%s' is not a spline hologram (%s)."),
+			*RecipeClassPath, *GetNameSafe(Hologram->GetClass()));
+		Hologram->Destroy();
+		return nullptr;
+	}
+	Hologram->SetBuildModeOverride(Hologram->GetDefaultBuildGunMode());
+
+	// The build gun's two-step drive (BuildConnectingRun), display-only: the endpoints are usually
+	// UNBUILT ghosts with collision off, so engine snap has nothing to latch onto and is not
+	// required — the spline still bends from A to B, which is all a preview needs. Spline holograms
+	// DO want a real hit component though (a bare synthetic hit reads as "aiming at the sky" and
+	// the drive never shapes the spline — live-verify: run ghosts were invisible), so each endpoint
+	// borrows the floor/ground under it via the same build-gun-channel trace as tile placement,
+	// then aims the hit at the port position like MakePortHit does.
+	const auto MakeHit = [World, Hologram](const FVector& Loc, const FVector& Dir)
+	{
+		const FVector Normal = FVector(Dir.X, Dir.Y, 0.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+		FHitResult Hit(ForceInit);
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(AIDAGhostRunTrace), /*bTraceComplex*/ false);
+		Params.AddIgnoredActor(Hologram);
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (APawn* Pawn = It->Get() ? It->Get()->GetPawn() : nullptr) { Params.AddIgnoredActor(Pawn); }
+		}
+		TraceGroundIgnoringConveyors(World, Loc + FVector(0.0, 0.0, 300.0),
+			Loc - FVector(0.0, 0.0, 50000.0), Params, Hit);
+		Hit.bBlockingHit = true;
+		Hit.Location = Loc;
+		Hit.ImpactPoint = Loc;
+		Hit.Normal = Normal;
+		Hit.ImpactNormal = Normal;
+		Hit.TraceStart = Loc + Normal * 300.0 + FVector(0.0, 0.0, 150.0);
+		Hit.TraceEnd = Loc - Normal * 100.0;
+		Hit.Distance = (Hit.TraceStart - Loc).Size();
+		return Hit;
+	};
+	const FHitResult FromHit = MakeHit(FromCm, FromDir);
+	const FHitResult ToHit = MakeHit(ToCm, ToDir);
+	const bool bFromValid = Hologram->IsValidHitResult(FromHit);
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(FromHit);
+	Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false);
+	const bool bToValid = Hologram->IsValidHitResult(ToHit);
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(ToHit);
+	Hologram->ResetConstructDisqualifiers(); // keep the valid-placement look
+	if (!bFromValid || !bToValid)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] ghost run hit invalid (from=%d to=%d, comp=%s/%s) %s -> %s — spline may not preview."),
+			bFromValid ? 1 : 0, bToValid ? 1 : 0,
+			*GetNameSafe(FromHit.GetComponent()), *GetNameSafe(ToHit.GetComponent()),
+			*FromCm.ToCompactString(), *ToCm.ToCompactString());
+	}
+
+	// The drive above poses the hologram + its child poles, but display-only ghosts driven by
+	// synthetic hits leave the spline a stub (live-verify: short diagonal segments) — so the
+	// spline is routed EXPLICITLY with the hologram's own private router (friend access).
+	FVector RoutedEndCm = FVector::ZeroVector;
+	if (FAIDAGhostRunAccess::Route(Hologram, FromCm,
+			FVector(FromDir.X, FromDir.Y, 0.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector),
+			ToCm,
+			FVector(ToDir.X, ToDir.Y, 0.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector),
+			RoutedEndCm))
+	{
+		UE_LOG(LogAIDA, Log, TEXT("[actions] ghost run routed %s -> %s (spline end %s, %.0f cm off target)"),
+			*FromCm.ToCompactString(), *ToCm.ToCompactString(), *RoutedEndCm.ToCompactString(),
+			FVector::Dist(RoutedEndCm, ToCm));
+	}
+	else
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] ghost run: explicit spline route unavailable for '%s' (%s)."),
+			*RecipeClassPath, *GetNameSafe(Hologram->GetClass()));
+	}
+
+	// Same display-only quiescing as tile ghosts — idle holograms ticking real build-gun work
+	// froze the game once (see SpawnGhostHologram).
 	const auto Quiesce = [](AActor* Actor)
 	{
 		Actor->SetActorEnableCollision(false);

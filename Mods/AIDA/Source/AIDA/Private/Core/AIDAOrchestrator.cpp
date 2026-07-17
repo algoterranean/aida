@@ -147,6 +147,12 @@ namespace
 		"player to nudge the ghost onto clear ground before approving (approving as-is builds only the valid "
 		"placements and refunds the rest). Never claim something was built until "
 		"get_proposal_status says executed.\n"
+		"- propose_extend_foundations(spec): extend the foundation slab the player stands on or aims "
+		"at by spec.count tiles, across the slab's WHOLE width — the server finds the slab, its "
+		"foundation types and lattice, and the direction (their look direction when standing on it; "
+		"the aimed edge's outward face when aimed from beside it; spec.direction only when they name "
+		"one — NEVER ask for a direction or a location). ALWAYS use this when the player asks to "
+		"extend/continue/grow existing foundations, a floor, or a platform — never propose_build.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
 		"- propose_power(spec): wire EXISTING machines to electricity — poles beside them, power lines, "
 		"and a tie to the nearest powered grid. Use when the player asks to power/wire up machines that "
@@ -169,13 +175,22 @@ namespace
 		"further out, a second belt input gets the next row) — when machines need several manifolds "
 		"(refineries: belt + pipe, both sides), just propose each one; any order works, rows won't "
 		"collide.\n"
+		"- propose_belt_tap(spec, forProposalId): feed a PENDING belt-input manifold from an EXISTING "
+		"belt — the server finds the nearest belt carrying spec.item ('Coal'; omit = any belt), taps "
+		"it (splices a splitter into it mid-belt, or uses a free belt end), and routes a feed belt to "
+		"the manifold's open end — all merged into the SAME proposal, ONE approval. The flow for "
+		"'feed these generators from the nearest coal belt': call propose_manifold (direction 'in') "
+		"first, then propose_belt_tap with forProposalId = that proposal's id and item 'Coal'. "
+		"spec.maxDistanceM defaults to 100; the feed is one belt run (up to ~56 m). The item match "
+		"reads what is riding each belt RIGHT NOW.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired. "
 		"Pending proposals include their full stored 'spec' — the input for revisions.\n"
 		"REVISING A PENDING PROPOSAL (very common): when the player asks to change or extend a proposed "
 		"build while its ghost is up ('add an input manifold', 'make it 20', 'use mk.2 belts', 'add a row'), "
 		"NEVER reject it or tell them to approve first. Instead: (a) for spec changes, read the pending "
 		"proposal's spec from get_proposal_status, merge the change, and call propose_build with "
-		"replaceProposalId = the old id; (b) to add a manifold to UNBUILT proposed machines, call "
+		"replaceProposalId = the old id; (b) to add a manifold to UNBUILT proposed machines (v1 grids "
+		"and v2 composites alike), call "
 		"propose_manifold with forProposalId = the pending proposal's id (omit spec.machines) — the "
 		"machines do not need to exist yet. Either way the old proposal is replaced atomically, the ghosts "
 		"update to preview the WHOLE revised group, and ONE approval builds everything. Add more manifolds "
@@ -1497,6 +1512,87 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 				Part.TileCenters.Add(Attachment.GetLocation());
 			}
 		}
+
+		// The runs (belts/pipes) preview too — live-verify: an approved manifold surprised the
+		// player with belts the ghost never showed. Endpoints and directions mirror the executor's
+		// RunOne exactly (trunk hops in flow order, then drops), so the ghost belts curve the way
+		// the built ones will.
+		const auto AddGhostRuns = [&View](const FString& TransportPath, bool bPipe, bool bOutput,
+			const TArray<FTransform>& Attachments, const TArray<FAIDAManifoldPort>& Ports,
+			const FVector& RowAxis, const FVector& DropDir)
+		{
+			const bool bReverse = bOutput && !bPipe; // merger trunks flow descending
+			for (int32 i = 0; i + 1 < Attachments.Num(); ++i)
+			{
+				FAIDAGhostRun& Run = View.GhostRuns.AddDefaulted_GetRef();
+				Run.RecipeClassPath = TransportPath;
+				Run.FromCm = Attachments[bReverse ? i + 1 : i].GetLocation();
+				Run.ToCm = Attachments[bReverse ? i : i + 1].GetLocation();
+				Run.FromNormal = bReverse ? -RowAxis : RowAxis;
+				Run.ToNormal = bReverse ? RowAxis : -RowAxis;
+			}
+			for (int32 i = 0; i < Attachments.Num(); ++i)
+			{
+				if (!Ports.IsValidIndex(i)) { continue; }
+				FAIDAGhostRun& Run = View.GhostRuns.AddDefaulted_GetRef();
+				Run.RecipeClassPath = TransportPath;
+				if (bOutput) // machine output → attachment (merger/junction)
+				{
+					Run.FromCm = Ports[i].PosCm;
+					Run.FromNormal = Ports[i].NormalCm;
+					Run.ToCm = Attachments[i].GetLocation();
+					Run.ToNormal = DropDir;
+				}
+				else         // attachment (splitter/junction) → machine input
+				{
+					Run.FromCm = Attachments[i].GetLocation();
+					Run.FromNormal = DropDir;
+					Run.ToCm = Ports[i].PosCm;
+					Run.ToNormal = Ports[i].NormalCm;
+				}
+			}
+		};
+		for (const FAIDAManifoldSet& Set : Proposal->ManifoldSets)
+		{
+			AddGhostRuns(Set.TransportRecipePath, Set.bPipe, Set.bOutput,
+				Set.Attachments, Set.Ports, Set.RowAxis, Set.DropDir);
+		}
+		if (Proposal->bManifold)
+		{
+			AddGhostRuns(Proposal->TransportRecipePath, Proposal->bManifoldPipe, Proposal->bManifoldOutput,
+				Proposal->Placements, Proposal->Ports, Proposal->RowAxis, Proposal->DropDir);
+		}
+
+		// Belt taps preview their splitter (cut variant) and the feed run to the trunk's open end.
+		if (Proposal->bTap)
+		{
+			if (!Proposal->bTapDangling && !Proposal->TapSplitterRecipePath.IsEmpty())
+			{
+				FAIDAGhostPart& Part = View.GhostParts.AddDefaulted_GetRef();
+				Part.RecipeClassPath = Proposal->TapSplitterRecipePath;
+				Part.YawDeg = static_cast<float>(FMath::RadiansToDegrees(
+					FMath::Atan2(Proposal->TapDirCm.Y, Proposal->TapDirCm.X)));
+				Part.TileCenters.Add(Proposal->TapPointCm);
+			}
+			const bool bSet = Proposal->ManifoldSets.IsValidIndex(Proposal->TapSetIndex);
+			const FTransform* OpenEnd = bSet
+				? (Proposal->ManifoldSets[Proposal->TapSetIndex].Attachments.Num() > 0
+					? &Proposal->ManifoldSets[Proposal->TapSetIndex].Attachments[0] : nullptr)
+				: (Proposal->Placements.Num() > 0 ? &Proposal->Placements[0] : nullptr);
+			const FVector FeedRowAxis = bSet ? Proposal->ManifoldSets[Proposal->TapSetIndex].RowAxis : Proposal->RowAxis;
+			const FString FeedTransport = bSet
+				? Proposal->ManifoldSets[Proposal->TapSetIndex].TransportRecipePath : Proposal->TransportRecipePath;
+			if (OpenEnd && !FeedTransport.IsEmpty())
+			{
+				FAIDAGhostRun& Run = View.GhostRuns.AddDefaulted_GetRef();
+				Run.RecipeClassPath = FeedTransport;
+				Run.FromCm = Proposal->TapPointCm;
+				Run.FromNormal = (OpenEnd->GetLocation() - Proposal->TapPointCm)
+					.GetSafeNormal(UE_SMALL_NUMBER, Proposal->TapDirCm);
+				Run.ToCm = OpenEnd->GetLocation();
+				Run.ToNormal = -FeedRowAxis;
+			}
+		}
 	}
 	R->ServerUpsertProposal(View);
 }
@@ -1626,7 +1722,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool} — ALWAYS the form for a row/line/grid of IDENTICAL buildables ('three refineries in a line' = v1 with grid countX 3), never a composite. v2 COMPOSITE — the form for MULTI-PART structures with DIFFERENT parts (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically. Use when the player asks to change a proposed build (get its spec from get_proposal_status, merge the change, re-propose here)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -2010,6 +2106,162 @@ void UAIDAOrchestrator::RegisterActionTools()
 		}
 	});
 
+	// propose_extend_foundations: census the slab underfoot/at-aim -> pure per-lane extension ->
+	// composite-style proposal (per-class placement runs) through the standard approval flow.
+	Tools.Register({
+		TEXT("propose_extend_foundations"),
+		TEXT("PROPOSE extending the foundation slab the player is standing on or aiming at. The server finds the CONTIGUOUS slab (its foundation types, lattice, and height steps), then extends EVERY lane of the slab's full width by spec.count tiles from that lane's own edge — same foundation class, height and rotation as the edge it grows from, so ragged edges, mixed types and terrain-following steps all extend correctly. Direction: spec.direction ('north'|'south'|'east'|'west') ONLY when the player names one; otherwise the server uses their LOOK direction when standing on the slab, or the aimed edge's outward face when they aim at the slab from beside it — never ask for a direction. Spec: {version:1, count: tiles to extend (default 1), direction?}. ALWAYS use this when the player says to extend/continue/grow existing foundations, a floor, or a platform — NEVER assemble an extension with propose_build (it cannot find the existing slab's lattice). Returns the dry-run (count, cost, validity) + proposalId; same approval flow as propose_build (ghost preview, nudge, /aida approve). REVISING: pass replaceProposalId to swap a pending extension ('make it 20' = call again with count 20)."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, count?: tiles to extend (default 1), direction?: 'north'|'south'|'east'|'west' (omit = the player's stance/aim decides)}"},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+			int32 Count = 1;
+			FString Direction;
+			if (SpecObj && SpecObj->IsValid())
+			{
+				double CountNum = 1.0;
+				if ((*SpecObj)->TryGetNumberField(TEXT("count"), CountNum))
+				{
+					Count = FMath::RoundToInt32(CountNum);
+				}
+				(*SpecObj)->TryGetStringField(TEXT("direction"), Direction);
+			}
+			if (Count < 1 || Count > Config.Actions.MaxProposalItems)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+					TEXT("count must be between 1 and %d"), Config.Actions.MaxProposalItems), {}));
+			}
+
+			// Revision id validated up front (mirrors propose_build).
+			FGuid ReplaceId;
+			{
+				FString ReplaceIdStr;
+				Args->TryGetStringField(TEXT("replaceProposalId"), ReplaceIdStr);
+				if (!ReplaceIdStr.TrimStartAndEnd().IsEmpty())
+				{
+					const FAIDAProposal* Replaced = FGuid::Parse(ReplaceIdStr.TrimStartAndEnd(), ReplaceId)
+						? Actions.Store().Find(ReplaceId) : nullptr;
+					if (!Replaced || Replaced->State != EAIDAProposalState::Pending)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("replaceProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
+					}
+				}
+			}
+
+			FAIDASlabCensus Census;
+			if (!FAIDAActionSeam::CensusFoundationSlab(this, Ctx.PlayerId, Direction, Census))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Census.Error, {}));
+			}
+			const FAIDASlabExtensionPlan Plan = AIDAActionSpec::PlanSlabExtension(Census.Cells,
+				Census.ExtendDir, Count, Config.Actions.MaxProposalItems);
+			if (!Plan.Error.IsEmpty())
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+			}
+
+			// Placements grouped by part (contiguous runs) — the composite machinery (dry-run,
+			// ghost preview, batched execute, even pending manifolds) handles mixed classes for free.
+			TArray<int32> UsedParts;
+			for (const FAIDASlabCell& Cell : Plan.NewCells)
+			{
+				UsedParts.AddUnique(Cell.Part);
+			}
+			TArray<FString> PartRecipePaths;
+			TArray<FString> PartNamesUsed;
+			for (const int32 Part : UsedParts)
+			{
+				PartRecipePaths.Add(Census.PartRecipePaths.IsValidIndex(Part) ? Census.PartRecipePaths[Part] : FString());
+				PartNamesUsed.Add(Census.PartNames.IsValidIndex(Part) ? Census.PartNames[Part] : TEXT("Foundation"));
+			}
+			TArray<FTransform> Placements;
+			TArray<int32> PlacementPartIndex;
+			TArray<int32> PartCounts;
+			PartCounts.SetNumZeroed(UsedParts.Num());
+			const FRotator Rotation(0.0, Census.YawDeg, 0.0);
+			for (int32 NewPart = 0; NewPart < UsedParts.Num(); ++NewPart)
+			{
+				for (const FAIDASlabCell& Cell : Plan.NewCells)
+				{
+					if (Cell.Part != UsedParts[NewPart]) { continue; }
+					FVector Loc = Census.OriginCm
+						+ Census.AxisU * (Cell.Coord.X * Census.StepCm)
+						+ Census.AxisV * (Cell.Coord.Y * Census.StepCm);
+					Loc.Z = Cell.ZCm;
+					Placements.Emplace(Rotation, Loc);
+					PlacementPartIndex.Add(NewPart);
+					++PartCounts[NewPart];
+				}
+			}
+
+			FAIDADryRunResult DryRun;
+			if (!FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, PlacementPartIndex, Placements, DryRun, Ctx.PlayerId))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+			}
+
+			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid();
+			{
+				// The stored spec is descriptive (this tool has no grid to re-expand) — revisions
+				// re-census live instead of merging the old spec.
+				TSharedRef<FJsonObject> StoredSpec = MakeShared<FJsonObject>();
+				StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_extend_foundations"));
+				StoredSpec->SetNumberField(TEXT("count"), Count);
+				StoredSpec->SetStringField(TEXT("direction"), Census.DirectionNote);
+				Proposal.SpecJson = AIDAToCompactJson(StoredSpec);
+			}
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = Placements;
+			Proposal.RecipeClassPath = PartRecipePaths[0];
+			Proposal.PartRecipePaths = PartRecipePaths;
+			Proposal.PlacementPartIndex = MoveTemp(PlacementPartIndex);
+			Proposal.Cost = DryRun.Cost;
+			{
+				FString Kinds;
+				for (int32 i = 0; i < PartNamesUsed.Num(); ++i)
+				{
+					Kinds += FString::Printf(TEXT("%s%d x %s"), i > 0 ? TEXT(", ") : TEXT(""), PartCounts[i], *PartNamesUsed[i]);
+				}
+				Proposal.Summary = FString::Printf(TEXT("extend the foundation slab %d tile(s) %s (%s)"),
+					Count, *Census.DirectionNote, *Kinds);
+			}
+			Proposal.InvalidCount = DryRun.Failures.Num(); // advisory — never blocks the ghost
+
+			if (ReplaceId.IsValid())
+			{
+				SupersedeProposal(ReplaceId);
+			}
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s, %d blocked placement(s))"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author, Proposal.InvalidCount);
+			PublishProposal(Proposal.Id);
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""),
+				*Proposal.Summary, *AIDACostSummaryString(Proposal.Cost));
+			if (Proposal.InvalidCount > 0)
+			{
+				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving (approving as-is builds only the valid ones and refunds the rest)."),
+					Proposal.InvalidCount, Proposal.Placements.Num());
+			}
+			AnnounceSystem(Announce);
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds,
+				DryRun.bAffordable, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
+		}
+	});
+
 	// propose_dismantle: resolve live targets (count + refund) and store Pending. Targets are
 	// re-resolved at execute time (Slice 2) — never trusted from this dry-run.
 	Tools.Register({
@@ -2101,7 +2353,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
 	Tools.Register({
 		TEXT("propose_manifold"),
-		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). Call again with the NEW id to add more manifolds (both sides = one call per side)."),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). This works for v1 grids AND v2 composites (a composite's ports come from its machine parts; foundations/walls contribute none) — NEVER tell the player a pending proposal must be approved or built before manifolds can be added. Call again with the NEW id to add more manifolds (both sides = one call per side)."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."},"forProposalId":{"type":"string","description":"Optional: a PENDING machine-build proposal to manifold — the machines do NOT need to exist yet. The pending proposal is replaced by ONE combined proposal (machines + manifold, ghosts for both, one approval). Omit spec.machines when using this."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -2201,11 +2453,15 @@ void UAIDAOrchestrator::RegisterActionTools()
 						TEXT("forProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
 				}
 				if (Target->bDismantle || Target->bLabel || Target->bManifold || Target->bPowerOnly
-					|| Target->PartRecipePaths.Num() > 0 || Target->Placements.Num() == 0)
+					|| Target->Placements.Num() == 0)
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
-						TEXT("forProposalId must reference a pending v1 machine-build proposal (composites, dismantles, labels and power/manifold proposals can't take a manifold)"), {}));
+						TEXT("forProposalId must reference a pending machine-build proposal (dismantles, labels and power/manifold proposals can't take a manifold)"), {}));
 				}
+				// v2 composites qualify too: ports come from the parts that are machines — parts
+				// without matching connectors (foundations, walls) simply contribute no ports.
+				const bool bCompositeTarget = Target->PartRecipePaths.Num() > 0
+					&& Target->PlacementPartIndex.Num() == Target->Placements.Num();
 				Stage(FString::Printf(TEXT("planning against pending proposal %s (%d machine(s))"),
 					*ForId.ToString(EGuidFormats::DigitsWithHyphens), Target->Placements.Num()));
 
@@ -2225,6 +2481,23 @@ void UAIDAOrchestrator::RegisterActionTools()
 				{
 					BuildSpecObj->TryGetStringField(TEXT("buildable"), MachineName);
 				}
+				// Composite part display names ride the stored v2 spec's parts array, in the same
+				// order ParseBuildSpec resolved them into PartRecipePaths.
+				TArray<FString> PartNames;
+				if (bCompositeTarget && BuildSpecObj.IsValid())
+				{
+					const TArray<TSharedPtr<FJsonValue>>* PartsArr = nullptr;
+					if (BuildSpecObj->TryGetArrayField(TEXT("parts"), PartsArr) && PartsArr)
+					{
+						for (const TSharedPtr<FJsonValue>& PartVal : *PartsArr)
+						{
+							FString PartName = TEXT("machine");
+							const TSharedPtr<FJsonObject> PartObj = PartVal.IsValid() ? PartVal->AsObject() : nullptr;
+							if (PartObj.IsValid()) { PartObj->TryGetStringField(TEXT("buildable"), PartName); }
+							PartNames.Add(MoveTemp(PartName));
+						}
+					}
+				}
 
 				// Ports already claimed by earlier sets on this proposal are off the table.
 				TArray<FVector> UsedPorts;
@@ -2235,13 +2508,46 @@ void UAIDAOrchestrator::RegisterActionTools()
 
 				TArray<FAIDAManifoldPort> Ports;
 				TArray<int32> PortMachineIndex;
-				if (!FAIDAActionSeam::ResolvePlannedPorts(this, Target->RecipeClassPath, MachineName,
-						Target->Placements, Spec.bPipe, Spec.bOutput, Spec.PortIndex, UsedPorts, Ports, PortMachineIndex)
-					|| Ports.Num() == 0)
+				if (!bCompositeTarget)
+				{
+					FAIDAActionSeam::ResolvePlannedPorts(this, Target->RecipeClassPath, MachineName,
+						Target->Placements, Spec.bPipe, Spec.bOutput, Spec.PortIndex, UsedPorts, Ports, PortMachineIndex);
+				}
+				else
+				{
+					// Placements are grouped by part (contiguous runs) — resolve each run with its
+					// own recipe and remap the run-local machine indices to GLOBAL placement indices,
+					// which is what phase 0's per-index actor capture rebinds against at execute.
+					int32 Start = 0;
+					while (Start < Target->Placements.Num())
+					{
+						const int32 Part = Target->PlacementPartIndex[Start];
+						int32 End = Start;
+						while (End < Target->PlacementPartIndex.Num() && Target->PlacementPartIndex[End] == Part) { ++End; }
+						const TArray<FTransform> Run(Target->Placements.GetData() + Start, End - Start);
+						const FString& PartRecipe = Target->PartRecipePaths.IsValidIndex(Part)
+							? Target->PartRecipePaths[Part] : Target->RecipeClassPath;
+						TArray<FAIDAManifoldPort> RunPorts;
+						TArray<int32> RunIndex;
+						if (FAIDAActionSeam::ResolvePlannedPorts(this, PartRecipe,
+								PartNames.IsValidIndex(Part) ? PartNames[Part] : MachineName, Run,
+								Spec.bPipe, Spec.bOutput, Spec.PortIndex, UsedPorts, RunPorts, RunIndex))
+						{
+							for (int32 i = 0; i < RunPorts.Num(); ++i)
+							{
+								Ports.Add(MoveTemp(RunPorts[i]));
+								PortMachineIndex.Add(Start + RunIndex[i]);
+							}
+						}
+						Start = End;
+					}
+				}
+				if (Ports.Num() == 0)
 				{
 					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
 						TEXT("the proposed %s has no free %s %s port for this manifold — earlier manifolds may have claimed them, or the machine has none"),
-						*MachineName, Spec.bPipe ? TEXT("pipe") : TEXT("belt"), Spec.bOutput ? TEXT("output") : TEXT("input")), {}));
+						bCompositeTarget ? TEXT("composite (none of its parts)") : *MachineName,
+						Spec.bPipe ? TEXT("pipe") : TEXT("belt"), Spec.bOutput ? TEXT("output") : TEXT("input")), {}));
 				}
 				Stage(FString::Printf(TEXT("planned ports resolved: %d — planning row"), Ports.Num()));
 
@@ -3022,6 +3328,185 @@ void UAIDAOrchestrator::RegisterActionTools()
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, true, 0.0));
+		}
+	});
+
+	// propose_belt_tap: find the nearest matching source belt -> merge a tap (splice splitter or
+	// free end + feed run) into a PENDING belt-in manifold proposal. Executes as extra phases
+	// after the manifold (TickManifold/TickConnected tap phases).
+	Tools.Register({
+		TEXT("propose_belt_tap"),
+		TEXT("Feed a PENDING belt-input manifold from an EXISTING belt: the server finds the nearest belt whose riding items match spec.item (omit = the nearest belt of any kind), taps it — by SPLICING a Conveyor Splitter into it mid-belt (the source keeps flowing; the tap takes a share) or by using a FREE (unconnected) belt end — and routes one feed belt run from the tap to the pending manifold's open trunk end. Everything merges into ONE combined proposal with ONE approval. Spec: {version:1, item?: item display name ('Coal'), maxDistanceM?: search radius from the manifold's feed end (default 100)}. forProposalId is REQUIRED and must reference a PENDING proposal that contains a belt-INPUT manifold (a propose_manifold direction-'in' proposal, or a connected build with a belt-in set). Typical flow for 'feed these generators from the nearest coal belt': propose_manifold {kind belt, direction in} for the generators, then propose_belt_tap {item:'Coal'} with forProposalId = the returned id. The feed is a single belt run (up to ~56 m) — a longer distance errors with the actual gap. NOTE: /aida undo removes the tap splitter and feed but the source belt stays cut."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, item?: item display name riding the source belt, maxDistanceM?: default 100}"},"forProposalId":{"type":"string","description":"REQUIRED: the pending belt-in manifold (or connected build) proposal to feed. It is replaced by ONE combined proposal (manifold + tap, one approval)."}},"required":["spec","forProposalId"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+			FString Item;
+			double MaxDistanceM = 100.0;
+			if (SpecObj && SpecObj->IsValid())
+			{
+				(*SpecObj)->TryGetStringField(TEXT("item"), Item);
+				(*SpecObj)->TryGetNumberField(TEXT("maxDistanceM"), MaxDistanceM);
+			}
+			MaxDistanceM = FMath::Clamp(MaxDistanceM, 5.0, 500.0);
+
+			FString ForIdStr;
+			Args->TryGetStringField(TEXT("forProposalId"), ForIdStr);
+			FGuid ForId;
+			const FAIDAProposal* Target = FGuid::Parse(ForIdStr.TrimStartAndEnd(), ForId)
+				? Actions.Store().Find(ForId) : nullptr;
+			if (!Target || Target->State != EAIDAProposalState::Pending)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("forProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
+			}
+			if (Target->bTap)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("that proposal already has a belt tap — approve it, or revise the manifold first"), {}));
+			}
+
+			// The open feed end: a live belt-in manifold proposal, or a connected build's first
+			// belt-in set. Index 0 of the row carries the free trunk-end port.
+			FVector FeedPointCm = FVector::ZeroVector;
+			int32 TapSetIndex = INDEX_NONE;
+			if (Target->bManifold && !Target->bManifoldPipe && !Target->bManifoldOutput
+				&& Target->Placements.Num() > 0)
+			{
+				FeedPointCm = Target->Placements[0].GetLocation();
+			}
+			else
+			{
+				for (int32 i = 0; i < Target->ManifoldSets.Num(); ++i)
+				{
+					const FAIDAManifoldSet& Set = Target->ManifoldSets[i];
+					if (!Set.bPipe && !Set.bOutput && Set.Attachments.Num() > 0)
+					{
+						TapSetIndex = i;
+						FeedPointCm = Set.Attachments[0].GetLocation();
+						break;
+					}
+				}
+				if (TapSetIndex == INDEX_NONE)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("forProposalId must reference a pending proposal with a belt-INPUT manifold — call propose_manifold {kind belt, direction in} first, then tap that proposal"), {}));
+				}
+			}
+
+			FAIDATapSource Source;
+			if (!FAIDAActionSeam::FindTapSource(this, Item, FeedPointCm, MaxDistanceM * AIDAMetersToCm, Source))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Source.Error, {}));
+			}
+			const double FeedGapM = FVector::Dist(Source.PointCm, FeedPointCm) / AIDAMetersToCm;
+			if (FeedGapM > 56.0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+					TEXT("the nearest matching belt (%s carrying %s) is %.0f m from the manifold's feed end — beyond the 56 m single-run limit; move the manifold closer or pick another belt"),
+					*Source.BeltName, *Source.ItemNote, FeedGapM), {}));
+			}
+
+			// The tap splitter (cut variant): resolved + costed upfront like any placement.
+			FAIDARecipeResolution Splitter;
+			TArray<FAIDACostItem> SplitterCost;
+			if (!Source.bDangling)
+			{
+				if (!FAIDAActionSeam::ResolveBuildRecipe(this, TEXT("Conveyor Splitter"), Splitter))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("no unlocked buildable matches 'Conveyor Splitter' — cannot splice a tap into the belt"), {}));
+				}
+				FAIDAActionSeam::TallyRecipeCost(this, Splitter.RecipeClassPath, 1, SplitterCost);
+			}
+
+			// The combined proposal: the target (machines/manifolds) + the tap, ONE approval.
+			FAIDAProposal Combined = *Target;
+			Combined.Id = FGuid::NewGuid();
+			Combined.RequesterId = Ctx.PlayerId;
+			Combined.RequesterName = Ctx.Author;
+			Combined.bTap = true;
+			Combined.TapBelt = Source.Belt;
+			Combined.TapBeltName = Source.BeltName;
+			Combined.bTapDangling = Source.bDangling;
+			Combined.TapOffsetCm = Source.OffsetCm;
+			Combined.TapPointCm = Source.PointCm;
+			Combined.TapDirCm = Source.DirCm;
+			Combined.TapSplitterRecipePath = Source.bDangling ? FString() : Splitter.RecipeClassPath;
+			Combined.TapSplitterName = Source.bDangling ? FString() : Splitter.DisplayName;
+			Combined.TapSetIndex = TapSetIndex;
+			for (const FAIDACostItem& CostItem : SplitterCost)
+			{
+				bool bMerged = false;
+				for (FAIDACostItem& Existing : Combined.Cost)
+				{
+					if (Existing.Item == CostItem.Item)
+					{
+						Existing.Amount += CostItem.Amount;
+						bMerged = true;
+						break;
+					}
+				}
+				if (!bMerged) { Combined.Cost.Add(CostItem); }
+			}
+			if (Config.Actions.CostMode == TEXT("central")
+				&& !FAIDAActionSeam::CheckAffordable(this, Combined.Cost, Ctx.PlayerId))
+			{
+				FString Msg = TEXT("not affordable from central storage + your inventory with the tap included: needs ");
+				for (int32 i = 0; i < Combined.Cost.Num(); ++i)
+				{
+					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), Combined.Cost[i].Amount, *Combined.Cost[i].Item);
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+			Combined.Summary += Source.bDangling
+				? FString::Printf(TEXT(" + tap: free end of %s carrying %s, %.0f m away (+ feed run)"),
+					*Source.BeltName, *Source.ItemNote, Source.DistanceM)
+				: FString::Printf(TEXT(" + tap: splice %s into %s carrying %s, %.0f m away (+ feed run)"),
+					*Splitter.DisplayName, *Source.BeltName, *Source.ItemNote, Source.DistanceM);
+
+			// Compound stored spec: append the tap to whatever the target stored.
+			{
+				TSharedPtr<FJsonObject> StoredSpec;
+				const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Target->SpecJson);
+				if (!FJsonSerializer::Deserialize(Reader, StoredSpec) || !StoredSpec.IsValid())
+				{
+					StoredSpec = MakeShared<FJsonObject>();
+				}
+				TSharedRef<FJsonObject> Tap = MakeShared<FJsonObject>();
+				if (!Item.IsEmpty()) { Tap->SetStringField(TEXT("item"), Item); }
+				Tap->SetStringField(TEXT("belt"), Source.BeltName);
+				Tap->SetStringField(TEXT("mode"), Source.bDangling ? TEXT("freeEnd") : TEXT("splice"));
+				Tap->SetNumberField(TEXT("distanceM"), Source.DistanceM);
+				StoredSpec->SetObjectField(TEXT("tap"), Tap);
+				Combined.SpecJson = AIDAToCompactJson(StoredSpec.ToSharedRef());
+			}
+
+			SupersedeProposal(ForId);
+			Target = nullptr;
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Combined, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (tap): %s (by %s)"),
+				*Combined.Id.ToString(EGuidFormats::DigitsWithHyphens), *Combined.Summary, *Ctx.Author);
+			PublishProposal(Combined.Id);
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s, revised): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, *Combined.Summary, *AIDACostSummaryString(Combined.Cost));
+			if (!Combined.bTapDangling)
+			{
+				Announce += TEXT(" NOTE: approving cuts the source belt to splice the tap in (undo removes the tap but the cut stays).");
+			}
+			AnnounceSystem(Announce);
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds, true, 0.0));
 		}
 	});
 

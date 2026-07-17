@@ -152,6 +152,8 @@ private:
 	TArray<TWeakObjectPtr<AActor>> PoleActors;
 	//~ Connected-build scratch: one actor list per manifold set, per attachment index.
 	TArray<TArray<TWeakObjectPtr<AActor>>> SetAttachmentActors;
+	//~ Belt-tap scratch: the actor the feed run starts from (spliced splitter, or the source belt).
+	TWeakObjectPtr<AActor> TapSourceActor;
 	int32 RunBuiltCount = 0;
 	int32 RunFailCount = 0;
 	TArray<FString> RunFailures; // first few human-readable reasons for the outcome announcement

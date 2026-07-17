@@ -33,6 +33,39 @@ public:
 	static bool ResolveAimPoint(UObject* WorldContext, const FString& PlayerId, FVector& OutPointCm);
 
 	/**
+	 * Census the CONTIGUOUS foundation slab the requesting player stands on (preferred) or aims at:
+	 * gathers lightweight foundation instances, snaps them onto the anchor foundation's own lattice
+	 * (8 m cells, the anchor's yaw), flood-fills from the anchor (|dZ| tolerance absorbs terrain-
+	 * following steps without leaking onto other floors), and resolves the direction "extend" means —
+	 * DirectionHint ('north'|'south'|'east'|'west') when given, else the player's look direction when
+	 * standing on the slab, else the aimed side-face's outward normal. False with a model-facing
+	 * Out.Error when no slab or player can be resolved.
+	 */
+	static bool CensusFoundationSlab(UObject* WorldContext, const FString& PlayerId,
+		const FString& DirectionHint, FAIDASlabCensus& Out);
+
+	/**
+	 * Find the belt to tap for propose_belt_tap: the nearest conveyor to FeedPointCm (closest point
+	 * on its spline) whose riding items match ItemFilter (substring, "" = any belt). A belt with a
+	 * FREE OUTPUT END within range is preferred (no cut needed); otherwise the nearest matching belt
+	 * long enough to splice a splitter into is cut at the closest offset (clamped clear of its
+	 * ends). False with a model-facing Out.Error when nothing qualifies within MaxDistanceCm.
+	 */
+	static bool FindTapSource(UObject* WorldContext, const FString& ItemFilter,
+		const FVector& FeedPointCm, double MaxDistanceCm, FAIDATapSource& Out);
+
+	/**
+	 * Execute the cut variant of a belt tap: drive a conveyor-attachment (splitter) hologram onto
+	 * the LIVE source belt at OffsetCm and Construct — the game's own attachment-on-belt splice
+	 * splits the belt and wires both halves through the splitter. The splice is verified afterwards
+	 * (the splitter must come out with connected ports); an unspliced splitter is torn down again.
+	 * The built splitter is journaled like any placement. OutTapActor receives the splitter.
+	 */
+	static bool ExecuteTapSplice(UObject* WorldContext, AActor* BeltActor, double OffsetCm,
+		const FString& SplitterRecipePath, TArray<FString>& OutEntityIds,
+		TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError);
+
+	/**
 	 * The aim point, SNAPPED the way the build gun would place this recipe there: a probe hologram
 	 * is placed at the player's aim hit (running the game's TrySnapToActor / world-grid snapping —
 	 * lightweight-instance hits are first resolved to a temporary buildable so foundations actually
@@ -143,6 +176,17 @@ public:
 	 */
 	static AActor* SpawnGhostHologram(UObject* WorldContext, const FString& RecipeClassPath,
 		const FVector& CenterCm, float YawDeg, AActor* Owner);
+
+	/**
+	 * CLIENT-side ghost of one belt/pipe run: the transport recipe's own spline hologram driven
+	 * through the build gun's two-step flow from A to B (display-only — no snap requirement, no
+	 * validation, no construct), then quiesced like every other ghost. The endpoints are usually
+	 * UNBUILT machines/attachments, so the synthetic hits carry positions + directions only.
+	 * Null when the recipe can't load or isn't a spline (belt/pipe).
+	 */
+	static AActor* SpawnGhostRunHologram(UObject* WorldContext, const FString& RecipeClassPath,
+		const FVector& FromCm, const FVector& FromDir, const FVector& ToCm, const FVector& ToDir,
+		AActor* Owner);
 
 	/**
 	 * Undo of a BUILD: remove one journaled entity (docs/PHASE4.md §2d). CachedActor is the

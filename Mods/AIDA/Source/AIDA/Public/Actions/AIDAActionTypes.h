@@ -191,6 +191,61 @@ struct FAIDAManifoldSet
 	FVector DropDir = FVector::ZeroVector;
 };
 
+/**
+ * FindTapSource output (propose_belt_tap): the existing belt to feed a manifold from, and how —
+ * either a free (unconnected) output end, or a mid-belt cut where the game's own attachment-on-belt
+ * splice inserts the tap splitter.
+ */
+struct FAIDATapSource
+{
+	FString Error;                          // model-facing reason when no source qualifies
+	TWeakObjectPtr<AActor> Belt;            // the source conveyor (re-verified at execute)
+	FString BeltName;                       // display name for summaries
+	FString ItemNote;                       // what is riding it ("Coal"), or "empty"
+	bool bDangling = false;                 // free output end — no cut, feed straight off the end
+	double OffsetCm = 0.0;                  // cut offset along the belt (cut variant)
+	FVector PointCm = FVector::ZeroVector;  // tap point (cut center, or the free end connector)
+	FVector DirCm = FVector::XAxisVector;   // belt tangent (flow direction) at the tap
+	double DistanceM = 0.0;                 // tap point -> feed point, metres
+};
+
+/** One occupied cell of a foundation-slab census (pure lattice space; propose_extend_foundations). */
+struct FAIDASlabCell
+{
+	FIntPoint Coord = FIntPoint::ZeroValue; // (u,v) lattice cell
+	double ZCm = 0.0;                       // the cell's foundation Z (terrain-following slabs step)
+	int32 Part = 0;                         // index into the census's per-class tables
+};
+
+/** PlanSlabExtension output: new cells extending every lane's frontier, Part/Z copied per lane.
+ *  (New cells can never collide with the slab: same lane would have been the frontier, other
+ *  lanes differ in the perpendicular coordinate.) */
+struct FAIDASlabExtensionPlan
+{
+	TArray<FAIDASlabCell> NewCells;
+	FString Error;                          // non-empty = nothing to plan (model-facing reason)
+};
+
+/**
+ * CensusFoundationSlab output (seam): the CONTIGUOUS foundation slab under the player's feet (or
+ * aim) resolved onto its own lattice, plus the direction the player means by "extend". Cells carry
+ * per-part class indices so mixed slabs (1 m + 2 m foundations) extend with matching types.
+ */
+struct FAIDASlabCensus
+{
+	FString Error;                          // model-facing reason when the census fails
+	FVector OriginCm = FVector::ZeroVector; // world center of cell (0,0), at its foundation Z
+	FVector AxisU = FVector::XAxisVector;   // unit lattice axes (horizontal)
+	FVector AxisV = FVector::YAxisVector;
+	double StepCm = 800.0;                  // cell size (standard foundations are 8x8 m)
+	double YawDeg = 0.0;                    // rotation for new cells (the anchor's)
+	TArray<FString> PartRecipePaths;        // per part: build recipe class path
+	TArray<FString> PartNames;              // per part: display name for summaries
+	TArray<FAIDASlabCell> Cells;            // the flood-filled slab
+	FIntPoint ExtendDir = FIntPoint(1, 0);  // resolved lattice step to extend along
+	FString DirectionNote;                  // human-readable ("west — your look direction")
+};
+
 /** One line of a cost/refund tally. ClassPath (the item descriptor) is what deduction/refund acts
  *  on; Item is the display name the model and players see. */
 struct FAIDACostItem
@@ -315,6 +370,21 @@ struct FAIDAProposal
 	FVector RowAxis = FVector::XAxisVector;
 	FVector DropDir = FVector::ZeroVector; // unit, from each attachment toward its machine
 	int32 Phase = 0;                       // executor: 0 = attachments/machines, then kind-specific
+
+	//~ Belt-tap extensions (P7: feed a pending belt-in manifold from an existing belt). The tap
+	//  executes AFTER the base phases: cut/claim the source, then one feed run from the tap to the
+	//  trunk's open end (index-0 attachment). Cut variant relies on the game's native
+	//  attachment-on-belt splice (the splitter hologram snapped onto the belt splits + rewires it).
+	bool bTap = false;
+	TWeakObjectPtr<AActor> TapBelt;        // source conveyor; a dead weak ptr = tap fails loudly
+	FString TapBeltName;
+	bool bTapDangling = false;             // free end — no cut, no splitter
+	double TapOffsetCm = 0.0;              // cut offset along the source belt
+	FVector TapPointCm = FVector::ZeroVector;
+	FVector TapDirCm = FVector::XAxisVector;   // belt tangent at the tap
+	FString TapSplitterRecipePath;         // cut variant: the tap splitter
+	FString TapSplitterName;
+	int32 TapSetIndex = INDEX_NONE;        // connected builds: which ManifoldSet the tap feeds (bManifold: INDEX_NONE)
 
 	//~ Container-label extensions (P7 Slice 3). Placements carry the sign spots (ghost preview +
 	//  count + upfront cost reuse the build paths); Targets carry the containers and their texts.

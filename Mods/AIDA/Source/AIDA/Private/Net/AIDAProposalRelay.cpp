@@ -12,6 +12,8 @@ namespace
 {
 	/** Bound the local ghost count — a colossal proposal previews its first tiles, not the world. */
 	constexpr int32 kMaxGhostTiles = 400;
+	/** Runs are spline holograms (heavier than tiles) — cap them separately per refresh. */
+	constexpr int32 kMaxGhostRuns = 64;
 }
 
 AAIDAProposalRelay::AAIDAProposalRelay()
@@ -68,7 +70,7 @@ void AAIDAProposalRelay::RefreshGhosts()
 
 	for (const FAIDAProposalView& View : Proposals)
 	{
-		if (View.State != TEXT("pending") || View.GhostParts.Num() == 0)
+		if (View.State != TEXT("pending") || (View.GhostParts.Num() == 0 && View.GhostRuns.Num() == 0))
 		{
 			continue;
 		}
@@ -92,6 +94,30 @@ void AAIDAProposalRelay::RefreshGhosts()
 		if (Total > Spawned.Num())
 		{
 			UE_LOG(LogAIDA, Log, TEXT("[actions] ghost preview capped at %d of %d tiles."), Spawned.Num(), Total);
+		}
+
+		// Belt/pipe runs of manifold / connected-build proposals — display-only spline holograms.
+		// A failed spawn skips just that run (the tiles above already preview the row itself).
+		int32 RunBudget = kMaxGhostRuns;
+		int32 RunsSpawned = 0;
+		for (const FAIDAGhostRun& Run : View.GhostRuns)
+		{
+			if (RunBudget <= 0)
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[actions] ghost preview capped at %d of %d runs."), kMaxGhostRuns, View.GhostRuns.Num());
+				break;
+			}
+			if (Run.RecipeClassPath.IsEmpty()) { continue; }
+			AActor* Ghost = FAIDAActionSeam::SpawnGhostRunHologram(this, Run.RecipeClassPath,
+				Run.FromCm, Run.FromNormal, Run.ToCm, Run.ToNormal, this);
+			if (!Ghost) { continue; }
+			Spawned.Add(Ghost);
+			++RunsSpawned;
+			--RunBudget;
+		}
+		if (View.GhostRuns.Num() > 0)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("[actions] ghost preview: %d run ghost(s) of %d."), RunsSpawned, View.GhostRuns.Num());
 		}
 	}
 }

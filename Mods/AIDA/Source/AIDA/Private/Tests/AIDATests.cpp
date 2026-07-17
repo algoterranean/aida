@@ -2366,6 +2366,101 @@ bool FAIDAActionsManifoldTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsSlabExtensionTest, "AIDA.Actions.SlabExtension",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsSlabExtensionTest::RunTest(const FString&)
+{
+	const auto Cell = [](int32 U, int32 V, double ZCm = 0.0, int32 Part = 0)
+	{
+		FAIDASlabCell C;
+		C.Coord = FIntPoint(U, V);
+		C.ZCm = ZCm;
+		C.Part = Part;
+		return C;
+	};
+
+	// 3x2 rectangle extended +U by 2: both lanes grow from their frontier, coords and count exact.
+	{
+		TArray<FAIDASlabCell> Slab = { Cell(0,0), Cell(1,0), Cell(2,0), Cell(0,1), Cell(1,1), Cell(2,1) };
+		const FAIDASlabExtensionPlan Plan = AIDAActionSpec::PlanSlabExtension(Slab, FIntPoint(1, 0), 2, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		if (!TestEqual(TEXT("2 lanes x 2 tiles"), Plan.NewCells.Num(), 4)) { return false; }
+		TSet<FIntPoint> Got;
+		for (const FAIDASlabCell& C : Plan.NewCells) { Got.Add(C.Coord); }
+		TestTrue(TEXT("lane 0 first tile"), Got.Contains(FIntPoint(3, 0)));
+		TestTrue(TEXT("lane 0 second tile"), Got.Contains(FIntPoint(4, 0)));
+		TestTrue(TEXT("lane 1 first tile"), Got.Contains(FIntPoint(3, 1)));
+		TestTrue(TEXT("lane 1 second tile"), Got.Contains(FIntPoint(4, 1)));
+	}
+
+	// Ragged edge: each lane extends from ITS OWN frontier, carrying that cell's Z and part.
+	{
+		TArray<FAIDASlabCell> Slab = { Cell(0,0, 100.0, 0), Cell(0,1), Cell(1,1, 300.0, 1) };
+		const FAIDASlabExtensionPlan Plan = AIDAActionSpec::PlanSlabExtension(Slab, FIntPoint(1, 0), 1, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		if (!TestEqual(TEXT("one tile per lane"), Plan.NewCells.Num(), 2)) { return false; }
+		for (const FAIDASlabCell& C : Plan.NewCells)
+		{
+			if (C.Coord == FIntPoint(1, 0))
+			{
+				TestEqual(TEXT("lane 0 keeps its Z"), C.ZCm, 100.0);
+				TestEqual(TEXT("lane 0 keeps its part"), C.Part, 0);
+			}
+			else if (TestTrue(TEXT("lane 1 lands at (2,1)"), C.Coord == FIntPoint(2, 1)))
+			{
+				TestEqual(TEXT("lane 1 keeps its Z"), C.ZCm, 300.0);
+				TestEqual(TEXT("lane 1 keeps its part"), C.Part, 1);
+			}
+		}
+	}
+
+	// L-shaped slab: an uneven frontier means each lane grows from a DIFFERENT along-coordinate;
+	// no new cell may ever land on an existing one (frontier = per-lane max guarantees it).
+	{
+		const TArray<FAIDASlabCell> Slab = { Cell(0,0), Cell(1,0), Cell(2,0), Cell(0,1), Cell(1,1) };
+		const FAIDASlabExtensionPlan Plan = AIDAActionSpec::PlanSlabExtension(Slab, FIntPoint(1, 0), 1, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		if (!TestEqual(TEXT("one tile per lane"), Plan.NewCells.Num(), 2)) { return false; }
+		TSet<FIntPoint> Got;
+		for (const FAIDASlabCell& C : Plan.NewCells) { Got.Add(C.Coord); }
+		TestTrue(TEXT("lane 0 grows past its longer arm"), Got.Contains(FIntPoint(3, 0)));
+		TestTrue(TEXT("lane 1 grows from its shorter arm"), Got.Contains(FIntPoint(2, 1)));
+		for (const FAIDASlabCell& C : Plan.NewCells)
+		{
+			for (const FAIDASlabCell& S : Slab)
+			{
+				TestTrue(TEXT("never re-covers the slab"), C.Coord != S.Coord);
+			}
+		}
+	}
+
+	// U-shaped slab extending across the opening: every lane still grows from its own frontier.
+	{
+		const TArray<FAIDASlabCell> U = { Cell(0,0), Cell(1,0), Cell(2,0), Cell(0,1), Cell(2,1) };
+		const FAIDASlabExtensionPlan Plan = AIDAActionSpec::PlanSlabExtension(U, FIntPoint(0, 1), 2, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		// Lanes u=0 and u=2 grow from v=1 → (v=2, v=3); lane u=1 grows from v=0 → (v=1, v=2).
+		TestEqual(TEXT("six new tiles"), Plan.NewCells.Num(), 6);
+		TSet<FIntPoint> Got;
+		for (const FAIDASlabCell& C : Plan.NewCells) { Got.Add(C.Coord); }
+		TestTrue(TEXT("the U's mouth fills first"), Got.Contains(FIntPoint(1, 1)));
+	}
+
+	// Caps and degenerate inputs are loud, not silent.
+	{
+		TArray<FAIDASlabCell> Slab = { Cell(0,0), Cell(0,1), Cell(0,2) };
+		TestTrue(TEXT("over-cap errors"),
+			!AIDAActionSpec::PlanSlabExtension(Slab, FIntPoint(1, 0), 2, 5).Error.IsEmpty());
+		TestTrue(TEXT("empty slab errors"),
+			!AIDAActionSpec::PlanSlabExtension({}, FIntPoint(1, 0), 1, 400).Error.IsEmpty());
+		TestTrue(TEXT("diagonal direction errors"),
+			!AIDAActionSpec::PlanSlabExtension(Slab, FIntPoint(1, 1), 1, 400).Error.IsEmpty());
+		TestTrue(TEXT("zero count errors"),
+			!AIDAActionSpec::PlanSlabExtension(Slab, FIntPoint(1, 0), 0, 400).Error.IsEmpty());
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsPowerPlanTest, "AIDA.Actions.PowerPlan",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAActionsPowerPlanTest::RunTest(const FString&)
