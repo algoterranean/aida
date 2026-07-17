@@ -627,9 +627,11 @@ bool FAIDAActionSeam::CensusFoundationSlab(UObject* WorldContext, const FString&
 	FHitResult AimHit;
 	const bool bAimHit = World->LineTraceSingleByChannel(AimHit, ViewLoc,
 		ViewLoc + ViewRot.Vector() * 15000.0, AIDABuildGunChannel, Params);
+	// Deep stance probe: hovering/flying anywhere ABOVE the slab counts as standing on it
+	// (live-verify: a 6 m probe missed a jetpacking player, and their aim was on the horizon).
 	FHitResult StandHit;
 	const bool bStandHit = TraceGroundIgnoringConveyors(World,
-		PawnLoc + FVector(0.0, 0.0, 100.0), PawnLoc - FVector(0.0, 0.0, 600.0), Params, StandHit);
+		PawnLoc + FVector(0.0, 0.0, 100.0), PawnLoc - FVector(0.0, 0.0, 50000.0), Params, StandHit);
 
 	// Every lightweight foundation instance near the player/aim — foundations are always
 	// lightweight-instanced, so the buildable-actor walk would find nothing.
