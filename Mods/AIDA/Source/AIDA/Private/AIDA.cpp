@@ -210,12 +210,14 @@ namespace
 			}
 			if (WheelEvent.IsControlDown())
 			{
-				// Only consumed while a pending proposal exists — otherwise the game keeps the chord.
+				// Only consumed while a pending proposal exists — otherwise the game keeps the
+				// chord. 90° per notch; Shift = 15°, Alt = 1° for fine alignment.
+				const int32 Step = WheelEvent.IsAltDown() ? 1 : (WheelEvent.IsShiftDown() ? 15 : 90);
 				for (const auto& Pair : ShownChatWidgets())
 				{
 					UAIDAChatWidget* Widget = Pair.Value.Get();
 					if (Widget && Widget->IsInViewport() &&
-						Widget->TryRotatePendingProposal(WheelEvent.GetWheelDelta() > 0.f ? 90 : -90))
+						Widget->TryRotatePendingProposal(WheelEvent.GetWheelDelta() > 0.f ? Step : -Step))
 					{
 						return true; // consume — the hotbar must not also spin
 					}

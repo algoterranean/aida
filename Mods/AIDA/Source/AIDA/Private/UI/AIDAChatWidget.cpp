@@ -382,7 +382,7 @@ void UAIDAChatWidget::BuildProposalPanel(UFont* GameFont, float FontSize)
 
 	// Ghost-adjust keybind hint (the ghost itself is the feedback; this is the discoverability).
 	if (UVerticalBoxSlot* HintSlot = Column->AddChildToVerticalBox(MakeText(
-		TEXT("Ctrl+Arrows move · Ctrl+PgUp/PgDn raise · Ctrl+Wheel rotate (Shift = 1 m)"),
+		TEXT("Ctrl+Arrows move (Shift = 1 m) · Ctrl+PgUp/PgDn raise · Ctrl+Wheel rotate 90° (Shift 15°, Alt 1°)"),
 		FontSize - 1.f, FLinearColor(0.75f, 0.75f, 0.75f, 1.0f))))
 	{
 		HintSlot->SetPadding(FMargin(0.f, 8.f, 0.f, 0.f));
@@ -883,10 +883,11 @@ bool UAIDAChatWidget::TryRotatePendingProposal(int32 YawDeltaDeg)
 
 FReply UAIDAChatWidget::NativeOnMouseWheel(const FGeometry& InGeometry, const FPointerEvent& InMouseEvent)
 {
-	// Ctrl+Wheel rotates the pending proposal ghost 90° per notch.
+	// Ctrl+Wheel rotates the pending proposal ghost: 90° per notch, Shift = 15°, Alt = 1°.
 	if (InMouseEvent.IsControlDown())
 	{
-		if (TryRotatePendingProposal(InMouseEvent.GetWheelDelta() > 0.f ? 90 : -90))
+		const int32 Step = InMouseEvent.IsAltDown() ? 1 : (InMouseEvent.IsShiftDown() ? 15 : 90);
+		if (TryRotatePendingProposal(InMouseEvent.GetWheelDelta() > 0.f ? Step : -Step))
 		{
 			return FReply::Handled();
 		}
