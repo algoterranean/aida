@@ -1,5 +1,7 @@
 #include "Core/AIDAOrchestrator.h"
 
+#include "Testing/AIDASelfTest.h"
+
 #include "AIDA.h"
 #include "Core/AIDAConfigLoader.h"
 #include "Core/AIDAImageValidation.h"
@@ -234,10 +236,24 @@ void UAIDAOrchestrator::OnWorldBeginPlay(UWorld& InWorld)
 	RegisterTools();
 
 	RegisterConsoleCommands();
+
+	// Packaged-game scenario harness (docs/SELFTEST.md): armed only by -AIDASelfTest=<file> on the
+	// command line; drives the tool registry against the loaded save and writes a results file.
+	FString SelfTestScript;
+	if (FAIDASelfTestRunner::ShouldRun(SelfTestScript))
+	{
+		SelfTest = MakeUnique<FAIDASelfTestRunner>();
+		SelfTest->Start(this, SelfTestScript);
+	}
 }
 
 void UAIDAOrchestrator::Deinitialize()
 {
+	if (SelfTest)
+	{
+		SelfTest->Shutdown();
+		SelfTest.Reset();
+	}
 	if (PingCommand)
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(PingCommand);

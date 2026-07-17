@@ -35,6 +35,9 @@ tools/devserver/data/
 tools/devserver/config/
 tools/devserver/mods/
 
+# --- Debugging artifacts (hang dumps, self-test results, symbol cache) ---
+.debug/
+
 # --- OS ---
 Thumbs.db
 .DS_Store

@@ -30,6 +30,7 @@
 #include "Actions/AIDAChatCommands.h"
 #include "Actions/AIDAProposalStore.h"
 #include "UI/AIDAMarkdown.h"
+#include "Testing/AIDASelfTest.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -1803,6 +1804,115 @@ bool FAIDAMarkdownTest::RunTest(const FString&)
 		TestTrue(TEXT("text around rule kept"), T.Contains(TEXT("above")) && T.Contains(TEXT("below")));
 		TestEqual(TEXT("rule-only input terminates"), AIDAMarkdownToRichText(TEXT("---")), FString(TEXT("---")));
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDASelfTestScriptTest, "AIDA.SelfTest.Script",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDASelfTestScriptTest::RunTest(const FString&)
+{
+	FString Error;
+
+	// Full parse: settle/quit, player placement, a tool step (expect + save), and each action kind.
+	{
+		FAIDASelfTestScript Script;
+		const FString Json = TEXT(R"({
+			"settleSeconds": 2, "quitOnDone": false,
+			"scenarios": [ {
+				"name": "smelters",
+				"player": { "pos": { "x": 10, "y": -20, "z": 3 }, "yawDeg": 90, "pitchDeg": -30 },
+				"steps": [
+					{ "tool": "propose_build", "args": { "spec": { "version": 1 } },
+					  "expect": { "ok": true, "fields": { "count": 3 }, "contains": ["proposalId"], "notContains": ["error"] },
+					  "save": { "proposalId": "id" } },
+					{ "action": "nudge", "deltaM": { "x": 8 }, "yawDeg": 90 },
+					{ "action": "approve", "proposalId": "$id" },
+					{ "action": "wait", "seconds": 3 },
+					{ "action": "reject" }
+				] } ] })");
+		if (!TestTrue(FString::Printf(TEXT("script parses (%s)"), *Error), AIDASelfTest::ParseScript(Json, Script, Error)))
+		{
+			return false;
+		}
+		TestEqual(TEXT("settle"), Script.SettleSeconds, 2.0);
+		TestFalse(TEXT("quitOnDone"), Script.bQuitOnDone);
+		if (!TestEqual(TEXT("one scenario"), Script.Scenarios.Num(), 1)) { return false; }
+		const FAIDASelfTestScenario& S = Script.Scenarios[0];
+		TestTrue(TEXT("player set"), S.bHasPlayer);
+		TestEqual(TEXT("player pos"), S.PlayerPosM, FVector(10.0, -20.0, 3.0));
+		TestEqual(TEXT("pitch"), S.PitchDeg, -30.0);
+		if (!TestEqual(TEXT("five steps"), S.Steps.Num(), 5)) { return false; }
+		TestEqual(TEXT("tool name"), S.Steps[0].Tool, TEXT("propose_build"));
+		TestTrue(TEXT("args serialized"), S.Steps[0].ArgsJson.Contains(TEXT("\"version\":1")));
+		TestTrue(TEXT("expect ok"), S.Steps[0].Expect.bOk.IsSet() && S.Steps[0].Expect.bOk.GetValue());
+		TestEqual(TEXT("expect field"), S.Steps[0].Expect.Fields[TEXT("count")], FString(TEXT("3.0")));
+		TestEqual(TEXT("save maps field to var"), S.Steps[0].Save[TEXT("proposalId")], FString(TEXT("id")));
+		TestEqual(TEXT("nudge delta"), S.Steps[1].NudgeDeltaM.X, 8.0);
+		TestEqual(TEXT("nudge yaw"), S.Steps[1].NudgeYawDeg, 90);
+		TestEqual(TEXT("approve target is variable"), S.Steps[2].ActionTarget, FString(TEXT("$id")));
+		TestEqual(TEXT("wait seconds"), S.Steps[3].WaitSeconds, 3.0);
+		TestEqual(TEXT("reject action"), S.Steps[4].Action, FString(TEXT("reject")));
+	}
+
+	// Rejections: no scenarios; a step with both tool and action; an unknown action.
+	{
+		FAIDASelfTestScript Script;
+		TestFalse(TEXT("rejects empty scenarios"), AIDASelfTest::ParseScript(TEXT(R"({"scenarios":[]})"), Script, Error));
+		TestFalse(TEXT("rejects tool+action step"), AIDASelfTest::ParseScript(
+			TEXT(R"({"scenarios":[{"steps":[{"tool":"x","action":"wait"}]}]})"), Script, Error));
+		TestFalse(TEXT("rejects unknown action"), AIDASelfTest::ParseScript(
+			TEXT(R"({"scenarios":[{"steps":[{"action":"dance"}]}]})"), Script, Error));
+	}
+
+	// Variable substitution: known replaced, unknown/naked $ literal, underscores allowed.
+	{
+		TMap<FString, FString> Vars;
+		Vars.Add(TEXT("id"), TEXT("AAAA-BBBB"));
+		Vars.Add(TEXT("mf_id"), TEXT("X"));
+		TestEqual(TEXT("substitutes"), AIDASelfTest::Substitute(TEXT("{\"p\":\"$id\"}"), Vars), FString(TEXT("{\"p\":\"AAAA-BBBB\"}")));
+		TestEqual(TEXT("underscore name"), AIDASelfTest::Substitute(TEXT("$mf_id!"), Vars), FString(TEXT("X!")));
+		TestEqual(TEXT("unknown literal"), AIDASelfTest::Substitute(TEXT("$nope $"), Vars), FString(TEXT("$nope $")));
+	}
+
+	// Expectation evaluation: ok mismatch, numeric field equality, contains/notContains.
+	{
+		FString Why;
+		FAIDASelfTestExpect Expect;
+		Expect.bOk = true;
+		TestFalse(TEXT("error fails ok:true"), AIDASelfTest::EvaluateExpect(Expect, /*bIsError*/ true, TEXT("{\"error\":\"x\"}"), Why));
+		TestTrue(TEXT("success passes ok:true"), AIDASelfTest::EvaluateExpect(Expect, false, TEXT("{}"), Why));
+
+		Expect.Fields.Add(TEXT("count"), TEXT("3.0"));
+		TestTrue(TEXT("3 == 3.0 numerically"), AIDASelfTest::EvaluateExpect(Expect, false, TEXT("{\"count\":3}"), Why));
+		TestFalse(TEXT("wrong count fails"), AIDASelfTest::EvaluateExpect(Expect, false, TEXT("{\"count\":4}"), Why));
+		TestTrue(TEXT("fail reason names field"), Why.Contains(TEXT("count")));
+
+		Expect.Fields.Reset();
+		Expect.Contains.Add(TEXT("proposalId"));
+		Expect.NotContains.Add(TEXT("firstFailures"));
+		TestTrue(TEXT("contains passes"), AIDASelfTest::EvaluateExpect(Expect, false, TEXT("{\"proposalId\":\"x\"}"), Why));
+		TestFalse(TEXT("notContains fails"), AIDASelfTest::EvaluateExpect(Expect, false, TEXT("{\"proposalId\":\"x\",\"firstFailures\":[]}"), Why));
+	}
+
+	// Capture + results rendering.
+	{
+		TMap<FString, FString> Save;
+		Save.Add(TEXT("proposalId"), TEXT("id"));
+		Save.Add(TEXT("missing"), TEXT("gone"));
+		TMap<FString, FString> Vars;
+		AIDASelfTest::CaptureFields(TEXT("{\"proposalId\":\"AB-12\",\"count\":3}"), Save, Vars);
+		TestEqual(TEXT("captured id"), Vars[TEXT("id")], FString(TEXT("AB-12")));
+		TestFalse(TEXT("missing field skipped"), Vars.Contains(TEXT("gone")));
+
+		TArray<FAIDASelfTestOutcome> Outcomes;
+		Outcomes.Add({ TEXT("s"), 0, TEXT("tool_a"), true, FString() });
+		Outcomes.Add({ TEXT("s"), 1, TEXT("tool_b"), false, TEXT("nope") });
+		const FString Results = AIDASelfTest::ResultsToJson(Outcomes);
+		TestTrue(TEXT("results count pass"), Results.Contains(TEXT("\"passed\":1")));
+		TestTrue(TEXT("results count fail"), Results.Contains(TEXT("\"failed\":1")));
+		TestTrue(TEXT("results carry reason"), Results.Contains(TEXT("nope")));
+	}
+
 	return true;
 }
 

@@ -1,0 +1,49 @@
+{
+  "settleSeconds": 8,
+  "quitOnDone": true,
+  "scenarios": [
+    {
+      "name": "catalog-and-overview",
+      "steps": [
+        { "tool": "lookup_building", "args": { "name": "Smelter" },
+          "expect": { "ok": true, "contains": ["Smelter"] } },
+        { "tool": "get_factory_overview", "args": {},
+          "expect": { "ok": true, "contains": ["machines"] } }
+      ]
+    },
+    {
+      "name": "propose-nudge-reject",
+      "steps": [
+        { "tool": "propose_build",
+          "args": { "spec": { "version": 1, "buildable": "Foundation (2 m)", "yawDeg": 0,
+                              "grid": { "countX": 2, "countY": 2 } } },
+          "expect": { "ok": true, "fields": { "count": 4 }, "contains": ["proposalId", "awaiting approval"] },
+          "save": { "proposalId": "buildId" } },
+        { "action": "nudge", "deltaM": { "x": 8 } },
+        { "tool": "get_proposal_status", "args": { "proposalId": "$buildId" },
+          "expect": { "ok": true, "contains": ["pending", "spec"] } },
+        { "action": "reject", "proposalId": "$buildId" },
+        { "tool": "get_proposal_status", "args": { "proposalId": "$buildId" },
+          "expect": { "ok": true, "notContains": ["\"state\":\"pending\""] } }
+      ]
+    },
+    {
+      "name": "revise-with-manifold",
+      "steps": [
+        { "tool": "propose_build",
+          "args": { "spec": { "version": 1, "buildable": "Refinery", "yawDeg": 0,
+                              "grid": { "countX": 3, "countY": 1, "stepX": 12 }, "power": false } },
+          "expect": { "ok": true, "fields": { "count": 3 }, "contains": ["proposalId"] },
+          "save": { "proposalId": "machines" } },
+        { "tool": "propose_manifold", "forNote": "manifold the UNBUILT machines - one combined proposal",
+          "args": { "spec": { "version": 1, "kind": "pipe", "direction": "in", "transport": "Pipeline" },
+                    "forProposalId": "$machines" },
+          "expect": { "ok": true, "contains": ["proposalId"], "notContains": ["error"] },
+          "save": { "proposalId": "combined" } },
+        { "tool": "get_proposal_status", "args": { "proposalId": "$combined" },
+          "expect": { "ok": true, "contains": ["pending"] } },
+        { "action": "reject", "proposalId": "$combined" }
+      ]
+    }
+  ]
+}

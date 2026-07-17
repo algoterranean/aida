@@ -13,6 +13,7 @@
 #include "Memory/AIDAMemory.h"          // Phase 3 persistence facade (in-save + sidecar)
 #include "Core/AIDAImageStore.h"        // Phase 5 reference-image store + chunked-upload assembler
 #include "Actions/AIDAActionEngine.h"   // Phase 4 proposal pipeline (store + approve/execute coordinator)
+#include "Testing/AIDASelfTest.h"       // packaged-game scenario harness (complete type: TUniquePtr member)
 #include "Net/AIDANetTypes.h"
 #include "Adapters/AIDALLMTypes.h" // FAIDAOnChunk/FAIDAOnError typedefs used by RunToolLoop
 #include "AIDAOrchestrator.generated.h"
@@ -273,4 +274,9 @@ private:
 	UFUNCTION()
 	void OnActionTimer();
 	FTimerHandle ActionTimer;
+
+	//~ Packaged-game scenario harness (docs/SELFTEST.md): the runner drives Tools/decisions through
+	//~ the same seams the model uses, so it gets friend access instead of a widened public surface.
+	friend class FAIDASelfTestRunner;
+	TUniquePtr<FAIDASelfTestRunner> SelfTest;
 };
