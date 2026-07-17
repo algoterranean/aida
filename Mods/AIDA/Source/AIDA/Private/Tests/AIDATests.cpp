@@ -2173,6 +2173,11 @@ bool FAIDAActionsManifoldTest::RunTest(const FString&)
 			R"({ "version": 1, "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
 		TestFalse(TEXT("rejects missing machines"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
 			R"({ "version": 1, "transport": "Belt" })")), 200, Spec, Error));
+		// forProposalId manifolds take their machines from the pending proposal — selector optional.
+		TestTrue(TEXT("machines optional when not required"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "transport": "Belt", "standoffM": 6 })")), 200, Spec, Error, /*bRequireMachines*/ false));
+		TestEqual(TEXT("relaxed parse keeps standoff"), Spec.StandoffM, 6.0);
+		TestTrue(TEXT("relaxed parse leaves machines empty"), Spec.Machines.Buildable.IsEmpty());
 		TestFalse(TEXT("rejects bad kind"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
 			R"({ "version": 1, "kind": "train", "transport": "Belt", "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
 		TestFalse(TEXT("rejects bad direction"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
@@ -2469,6 +2474,7 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		Q.State = EAIDAProposalState::Pending;
 		Q.ProposedUtc = 1000;
 		Q.InvalidCount = 3; // advisory rides into the status report while pending
+		Q.SpecJson = TEXT(R"({"version":1,"buildable":"Smelter"})"); // pending spec rides along (revisions)
 		const TSharedPtr<FJsonObject> All = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P, Q }, FGuid(), /*Now*/ 1100, /*Ttl*/ 600));
 		TestEqual(TEXT("status lists both"), static_cast<int32>(All->GetNumberField(TEXT("count"))), 2);
 		const TSharedPtr<FJsonObject> One = AIDATestParseJson(AIDAActionSpec::BuildStatusJson({ P, Q }, Q.Id, 1100, 600));
@@ -2478,6 +2484,12 @@ bool FAIDAActionsReportJsonTest::RunTest(const FString&)
 		{
 			TestEqual(TEXT("pending countdown"), static_cast<int32>(List[0]->AsObject()->GetNumberField(TEXT("expiresInSec"))), 500);
 			TestEqual(TEXT("pending invalidCount advisory"), static_cast<int32>(List[0]->AsObject()->GetNumberField(TEXT("invalidCount"))), 3);
+			// The stored spec is embedded for the revise-by-prompt flow.
+			const TSharedPtr<FJsonObject>* PendingSpec = nullptr;
+			if (TestTrue(TEXT("pending spec embedded"), List[0]->AsObject()->TryGetObjectField(TEXT("spec"), PendingSpec)))
+			{
+				TestEqual(TEXT("spec round-trips"), (*PendingSpec)->GetStringField(TEXT("buildable")), TEXT("Smelter"));
+			}
 		}
 		TestEqual(TEXT("filtered pendingCount"), static_cast<int32>(One->GetNumberField(TEXT("pendingCount"))), 1);
 

@@ -169,6 +169,28 @@ struct FAIDAManifoldPort
 	FVector NormalCm = FVector::XAxisVector;
 };
 
+/**
+ * One manifold planned against a PENDING build's machines (a "connected build" — the revise-by-
+ * prompt flow: "build a line of generators" … "add an input manifold"). The attachments and their
+ * runs execute AFTER the machines; Ports carry PLANNED geometry read from the machine hologram's
+ * connection components, and Ports[i].Machine is rebound to the BUILT actor at execute (the run
+ * builder resolves live ports from the actors, so planned positions only steer the plan).
+ */
+struct FAIDAManifoldSet
+{
+	bool bPipe = false;
+	bool bOutput = false;
+	FString TransportRecipePath;
+	FString TransportName;
+	FString AttachmentRecipePath;
+	FString AttachmentName;
+	TArray<FTransform> Attachments;   // plan-sorted; index-aligned with Ports/PortMachineIndex
+	TArray<FAIDAManifoldPort> Ports;  // planned pos/normal; Machine is null until phase 0 builds
+	TArray<int32> PortMachineIndex;   // per attachment: index into the proposal's machine Placements
+	FVector RowAxis = FVector::XAxisVector;
+	FVector DropDir = FVector::ZeroVector;
+};
+
 /** One line of a cost/refund tally. ClassPath (the item descriptor) is what deduction/refund acts
  *  on; Item is the display name the model and players see. */
 struct FAIDACostItem
@@ -275,6 +297,11 @@ struct FAIDAProposal
 	 *  player nudges it somewhere valid); execute re-validates per tile, skips what still fails,
 	 *  and refunds the skips. */
 	int32 InvalidCount = 0;
+
+	//~ Connected build (revise-by-prompt): Placements/RecipeClassPath are the MACHINES, and each
+	//  set is a manifold planned against them that executes after they build (TickConnected:
+	//  machines → per-set attachments → runs → power kit when bAutoPower). Empty = not connected.
+	TArray<FAIDAManifoldSet> ManifoldSets;
 
 	//~ Manifold extensions (docs/PHASE4-MANIFOLDS.md). Defaults = a plain build/dismantle proposal.
 	//  For manifolds, Placements/RecipeClassPath/Cost describe the ATTACHMENTS (so ghosts, upfront

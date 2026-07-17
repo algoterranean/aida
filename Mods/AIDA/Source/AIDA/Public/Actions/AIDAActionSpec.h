@@ -40,7 +40,8 @@ namespace AIDAActionSpec
 	 * belt/pipe, direction in/out, transport + machines.buildable required. Machine selector
 	 * defaults: radiusM 30, maxCount 0 (= all matches, clamped to MaxItems when capped).
 	 */
-	bool ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError);
+	bool ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError,
+		bool bRequireMachines = true);
 
 	/**
 	 * Fit the manifold row (docs/PHASE4-MANIFOLDS.md §3, pure geometry): all port normals must agree

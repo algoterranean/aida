@@ -108,6 +108,15 @@ correct names, undo removes them.
 > (per-part grid repeat is an addition to the sketch below; `id`/`recipe`/`clock` and the
 > `belts`/`wires` port routing remain THIS slice). A v2 spec with `belts`/`wires` is rejected with
 > a clear error until then; v2 skips auto-power (poles are parts; wiring lands here).
+>
+> **Status (2026-07-16 later): the manifold-sugar half ALSO SHIPPED, as revise-by-prompt.**
+> `propose_manifold(forProposalId)` manifolds a PENDING v1 machine build: planned ports are read
+> off the machine hologram's cached connection components, the row plans like a live manifold, and
+> the pending proposal is superseded by ONE combined proposal (`FAIDAProposal.ManifoldSets`,
+> executed by `TickConnected`: machines → attachments → runs → power kit; ghosts preview all of
+> it; nudge moves everything). `propose_build(replaceProposalId)` + `get_proposal_status.spec`
+> cover general spec revisions. Remaining for this slice: arbitrary `belts`/`wires` port routing
+> between named v2 parts, `recipe`/`clock` assignment, lifts.
 
 The centerpiece. Build spec v2 expresses a *machine group*: typed parts + connections, not one
 buildable × N.

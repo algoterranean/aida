@@ -125,6 +125,7 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 	AccruedRefund.Reset();
 	AttachmentActors.Reset();
 	PoleActors.Reset();
+	SetAttachmentActors.Reset();
 	RunFailures.Reset();
 	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 	Proposal->Cursor = 0;
@@ -178,9 +179,11 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 
 	// Transform a copy; the original survives an invalid adjustment untouched. Auto-power pole
 	// placements ride along with the SAME transform (same rotation centroid — the machines') so a
-	// nudged grid keeps its pole lanes; the wire pairs are index-based and move with them.
+	// nudged grid keeps its pole lanes; the wire pairs are index-based and move with them. A
+	// connected build's manifold sets (attachments + planned ports + axes) ride along too.
 	TArray<FTransform> Adjusted = Proposal->Placements;
 	TArray<FTransform> AdjustedPoles = Proposal->PolePlacements;
+	TArray<FAIDAManifoldSet> AdjustedSets = Proposal->ManifoldSets;
 	if (YawDeltaDeg != 0 && Adjusted.Num() > 0)
 	{
 		FVector Centroid = FVector::ZeroVector;
@@ -197,6 +200,17 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		};
 		for (FTransform& Placement : Adjusted) { Rotate(Placement); }
 		for (FTransform& Placement : AdjustedPoles) { Rotate(Placement); }
+		for (FAIDAManifoldSet& Set : AdjustedSets)
+		{
+			for (FTransform& Placement : Set.Attachments) { Rotate(Placement); }
+			for (FAIDAManifoldPort& Port : Set.Ports)
+			{
+				Port.PosCm = Centroid + Delta.RotateVector(Port.PosCm - Centroid);
+				Port.NormalCm = Delta.RotateVector(Port.NormalCm);
+			}
+			Set.RowAxis = Delta.RotateVector(Set.RowAxis);
+			Set.DropDir = Delta.RotateVector(Set.DropDir);
+		}
 	}
 	if (!DeltaCm.IsNearlyZero())
 	{
@@ -207,6 +221,17 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		for (FTransform& Placement : AdjustedPoles)
 		{
 			Placement.SetLocation(Placement.GetLocation() + DeltaCm);
+		}
+		for (FAIDAManifoldSet& Set : AdjustedSets)
+		{
+			for (FTransform& Placement : Set.Attachments)
+			{
+				Placement.SetLocation(Placement.GetLocation() + DeltaCm);
+			}
+			for (FAIDAManifoldPort& Port : Set.Ports)
+			{
+				Port.PosCm += DeltaCm;
+			}
 		}
 	}
 
@@ -238,6 +263,7 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 
 	Proposal->Placements = MoveTemp(Adjusted);
 	Proposal->PolePlacements = MoveTemp(AdjustedPoles);
+	Proposal->ManifoldSets = MoveTemp(AdjustedSets);
 	OutMessage = (YawDeltaDeg != 0
 		? FString::Printf(TEXT("rotated %d° — %s"), YawDeltaDeg, *Proposal->Summary)
 		: FString::Printf(TEXT("nudged %.1f m — %s"), DeltaCm.Size() / 100.0, *Proposal->Summary)) + Validity;
@@ -268,6 +294,12 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 	if (Proposal->bLabel)
 	{
 		return TickLabels(WorldContext, Config, Memory, *Proposal);
+	}
+	if (Proposal->ManifoldSets.Num() > 0 && !Proposal->bDismantle)
+	{
+		// Connected build (machines + manifold sets, revise-by-prompt) — runs its own power
+		// phases when bAutoPower, so it must dispatch ahead of the plain powered path.
+		return TickConnected(WorldContext, Config, Memory, *Proposal);
 	}
 	if (Proposal->bAutoPower && !Proposal->bDismantle)
 	{
@@ -567,6 +599,235 @@ bool FAIDAActionEngine::TickPowered(UObject* WorldContext, const FAIDAActionsCon
 	return false;
 }
 
+bool FAIDAActionEngine::TickConnected(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
+{
+	const int32 Batch = FMath::Max(1, Config.BatchPerTick);
+	const int32 Sets = Proposal.ManifoldSets.Num();
+	// Phase map: 0 = machines; per set s: 1+3s attachments, 2+3s trunk runs, 3+3s drops; then
+	// poles = 1+3*Sets and wires = 2+3*Sets when the revised build carried an auto-power kit.
+	const int32 PolePhase = 1 + 3 * Sets;
+	const int32 WirePhase = PolePhase + 1;
+
+	// Phase 0 — the machines, index-captured so the sets' planned ports can rebind to real actors.
+	if (Proposal.Phase == 0)
+	{
+		int32 Skipped = 0;
+		Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.RecipeClassPath,
+			Proposal.Placements, Proposal.Cursor, Batch,
+			Proposal.AffectedEntityIds, BuiltActors, Skipped, &AttachmentActors);
+		SkippedCount += Skipped;
+		AccrueSkippedCost(WorldContext, Config, Proposal.RecipeClassPath, Skipped);
+		if (Proposal.Cursor < Proposal.Placements.Num()) { return true; }
+
+		// Rebind: planned ports (Machine was null since propose) now point at the BUILT actors.
+		// A skipped machine leaves a null and its runs fail loudly instead of re-mapping.
+		for (FAIDAManifoldSet& Set : Proposal.ManifoldSets)
+		{
+			for (int32 i = 0; i < Set.Ports.Num(); ++i)
+			{
+				const int32 MachineIdx = Set.PortMachineIndex.IsValidIndex(i) ? Set.PortMachineIndex[i] : INDEX_NONE;
+				Set.Ports[i].Machine = AttachmentActors.IsValidIndex(MachineIdx) ? AttachmentActors[MachineIdx] : nullptr;
+			}
+		}
+		SetAttachmentActors.SetNum(Sets);
+		Proposal.Phase = 1;
+		Proposal.Cursor = 0;
+		return true;
+	}
+
+	// One connecting run per tick — TickManifold's RunOne, parameterized by the owning set.
+	const auto RunOne = [&](const FAIDAManifoldSet& Set, AActor* From, const FVector& FromDir,
+		AActor* To, const FVector& ToDir, const TCHAR* What, int32 Index)
+	{
+		if (!From || !To)
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("%s run %d: endpoint missing (attachment or machine skipped)"), What, Index));
+			}
+			return;
+		}
+		TArray<FAIDACostItem> Cost;
+		FString Error;
+		if (FAIDAActionSeam::BuildConnectingRun(WorldContext, Set.TransportRecipePath, Set.bPipe,
+			From, FromDir, To, ToDir, Config.CostMode == TEXT("central"), Cost,
+			Proposal.AffectedEntityIds, BuiltActors, Error, Proposal.RequesterId))
+		{
+			MergeCost(Proposal.Cost, Cost); // the journaled refund covers the whole group
+			++RunBuiltCount;
+		}
+		else
+		{
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("%s run %d: %s"), What, Index, *Error));
+			}
+			UE_LOG(LogAIDA, Warning, TEXT("[actions] connected %s run %d failed: %s"), What, Index, *Error);
+		}
+	};
+
+	if (Proposal.Phase < PolePhase)
+	{
+		const int32 SetIdx = (Proposal.Phase - 1) / 3;
+		const int32 Sub = (Proposal.Phase - 1) % 3; // 0 = attachments, 1 = trunk, 2 = drops
+		if (!Proposal.ManifoldSets.IsValidIndex(SetIdx))
+		{
+			Proposal.Phase = PolePhase;
+			Proposal.Cursor = 0;
+			return true;
+		}
+		FAIDAManifoldSet& Set = Proposal.ManifoldSets[SetIdx];
+		const int32 N = Set.Attachments.Num();
+		if (SetAttachmentActors.Num() < Sets) { SetAttachmentActors.SetNum(Sets); }
+		TArray<TWeakObjectPtr<AActor>>& Attachments = SetAttachmentActors[SetIdx];
+		const auto AttachmentAt = [&Attachments](int32 Index) -> AActor*
+		{
+			return Attachments.IsValidIndex(Index) ? Attachments[Index].Get() : nullptr;
+		};
+
+		if (Sub == 0) // the set's attachment row, batched with per-index capture
+		{
+			int32 Skipped = 0;
+			Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Set.AttachmentRecipePath,
+				Set.Attachments, Proposal.Cursor, Batch,
+				Proposal.AffectedEntityIds, BuiltActors, Skipped, &Attachments);
+			SkippedCount += Skipped;
+			AccrueSkippedCost(WorldContext, Config, Set.AttachmentRecipePath, Skipped);
+			if (Proposal.Cursor < N) { return true; }
+			++Proposal.Phase;
+			Proposal.Cursor = 0;
+			return true;
+		}
+		if (Sub == 1) // trunk hops between consecutive attachments
+		{
+			if (Proposal.Cursor >= N - 1) // single machine: no trunk at all
+			{
+				++Proposal.Phase;
+				Proposal.Cursor = 0;
+				return true;
+			}
+			const int32 Index = Proposal.Cursor++;
+			// Splitter trunks flow ascending (feed at index 0); merger trunks flow descending.
+			const bool bReverse = Set.bOutput && !Set.bPipe;
+			AActor* From = AttachmentAt(bReverse ? Index + 1 : Index);
+			AActor* To = AttachmentAt(bReverse ? Index : Index + 1);
+			const FVector FromDir = bReverse ? -Set.RowAxis : Set.RowAxis;
+			RunOne(Set, From, FromDir, To, -FromDir, TEXT("trunk"), Index);
+			return true;
+		}
+		// Sub == 2 — drops between each attachment and its machine's port.
+		if (Proposal.Cursor < N)
+		{
+			const int32 Index = Proposal.Cursor++;
+			AActor* Attachment = AttachmentAt(Index);
+			AActor* Machine = Set.Ports.IsValidIndex(Index) ? Set.Ports[Index].Machine.Get() : nullptr;
+			const FVector MachineDir = Set.Ports.IsValidIndex(Index) ? Set.Ports[Index].NormalCm : -Set.DropDir;
+			if (Set.bOutput) // machine output → attachment (merger/junction) input
+			{
+				RunOne(Set, Machine, MachineDir, Attachment, Set.DropDir, TEXT("drop"), Index);
+			}
+			else             // attachment (splitter/junction) output → machine input
+			{
+				RunOne(Set, Attachment, Set.DropDir, Machine, MachineDir, TEXT("drop"), Index);
+			}
+			if (Proposal.Cursor < N) { return true; }
+		}
+		++Proposal.Phase;
+		Proposal.Cursor = 0;
+		return true;
+	}
+
+	// Auto-power kit carried over from the revised build: pole lane, then wires + one grid tie —
+	// the same shape as TickPowered, against the machine slots captured in phase 0.
+	if (Proposal.bAutoPower && Proposal.Phase == PolePhase)
+	{
+		if (Proposal.Cursor < Proposal.PolePlacements.Num())
+		{
+			int32 Skipped = 0;
+			Proposal.Cursor += FAIDAActionSeam::ExecuteBuildBatch(WorldContext, Proposal.PoleRecipePath,
+				Proposal.PolePlacements, Proposal.Cursor, Batch,
+				Proposal.AffectedEntityIds, BuiltActors, Skipped, &PoleActors);
+			SkippedCount += Skipped;
+			AccrueSkippedCost(WorldContext, Config, Proposal.PoleRecipePath, Skipped);
+			if (Proposal.Cursor < Proposal.PolePlacements.Num()) { return true; }
+		}
+		Proposal.Phase = WirePhase;
+		Proposal.Cursor = 0;
+		return true;
+	}
+	if (Proposal.bAutoPower && Proposal.Phase == WirePhase)
+	{
+		const auto ActorAt = [](const TArray<TWeakObjectPtr<AActor>>& Arr, int32 Index) -> AActor*
+		{
+			return Arr.IsValidIndex(Index) ? Arr[Index].Get() : nullptr;
+		};
+		const auto WireOne = [&](AActor* A, AActor* B, const TCHAR* What, int32 Index) -> bool
+		{
+			if (!A || !B)
+			{
+				++RunFailCount;
+				if (RunFailures.Num() < 5)
+				{
+					RunFailures.Add(FString::Printf(TEXT("%s wire %d: endpoint missing (machine or pole skipped)"), What, Index));
+				}
+				return false;
+			}
+			TArray<FAIDACostItem> Cost;
+			FString Error;
+			if (FAIDAActionSeam::BuildWire(WorldContext, Proposal.WireRecipePath, A, B,
+				Config.CostMode == TEXT("central"), Cost, Proposal.AffectedEntityIds, BuiltActors, Error,
+				Proposal.RequesterId))
+			{
+				MergeCost(Proposal.Cost, Cost);
+				++RunBuiltCount;
+				return true;
+			}
+			++RunFailCount;
+			if (RunFailures.Num() < 5)
+			{
+				RunFailures.Add(FString::Printf(TEXT("%s wire %d: %s"), What, Index, *Error));
+			}
+			UE_LOG(LogAIDA, Warning, TEXT("[actions] %s wire %d failed: %s"), What, Index, *Error);
+			return false;
+		};
+
+		const int32 TotalWires = Proposal.MachineWires.Num() + Proposal.ChainWires.Num();
+		int32 DoneThisTick = 0;
+		while (Proposal.Cursor < TotalWires && DoneThisTick < Batch)
+		{
+			const int32 Index = Proposal.Cursor++;
+			++DoneThisTick;
+			if (Index < Proposal.MachineWires.Num())
+			{
+				const FIntPoint& Pair = Proposal.MachineWires[Index];
+				WireOne(ActorAt(AttachmentActors, Pair.X), ActorAt(PoleActors, Pair.Y), TEXT("machine"), Index);
+			}
+			else
+			{
+				const FIntPoint& Pair = Proposal.ChainWires[Index - Proposal.MachineWires.Num()];
+				WireOne(ActorAt(PoleActors, Pair.X), ActorAt(PoleActors, Pair.Y), TEXT("chain"), Index);
+			}
+		}
+		if (Proposal.Cursor < TotalWires) { return true; }
+
+		AActor* External = nullptr;
+		int32 FromPole = INDEX_NONE;
+		if (FAIDAActionSeam::FindGridTie(WorldContext, PoleActors, /*RangeCm*/ 10000.0, External, FromPole))
+		{
+			WireOne(ActorAt(PoleActors, FromPole), External, TEXT("grid tie"), 0);
+		}
+		else if (Proposal.PolePlacements.Num() > 0)
+		{
+			RunReport.Add(TEXT("no existing power grid within 100 m — connect the feed line manually"));
+		}
+	}
+
+	FinishExecution(WorldContext, Config, Memory, Proposal);
+	return false;
+}
+
 void FAIDAActionEngine::AccrueSkippedCost(UObject* WorldContext, const FAIDAActionsConfig& Config, const FString& RecipeClassPath, int32 Skipped)
 {
 	if (Skipped <= 0 || Config.CostMode != TEXT("central")) { return; }
@@ -624,13 +885,19 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed, NowUtc);
 
 	const int32 Affected = Proposal.AffectedEntityIds.Num();
-	if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel)
+	if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel || Proposal.ManifoldSets.Num() > 0)
 	{
-		const TCHAR* Kind = Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels") : TEXT("power"));
-		const TCHAR* Piece = Proposal.bManifold ? TEXT("run") : (Proposal.bLabel ? TEXT("sign") : TEXT("wire"));
-		const int32 PlacementTotal = Proposal.bPowerOnly
+		const TCHAR* Kind = Proposal.ManifoldSets.Num() > 0 ? TEXT("connected")
+			: (Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels") : TEXT("power")));
+		const TCHAR* Piece = (Proposal.bManifold || Proposal.ManifoldSets.Num() > 0) ? TEXT("run")
+			: (Proposal.bLabel ? TEXT("sign") : TEXT("wire"));
+		int32 PlacementTotal = Proposal.bPowerOnly
 			? Proposal.PolePlacements.Num() // Placements mirror the poles for ghosts — don't double count
 			: Proposal.Placements.Num() + Proposal.PolePlacements.Num();
+		for (const FAIDAManifoldSet& Set : Proposal.ManifoldSets)
+		{
+			PlacementTotal += Set.Attachments.Num();
+		}
 		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (%s): %d placement(s) (%d skipped), %d %s(s) built, %d %s(s) failed (journal %s)."),
 			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), Kind,
 			PlacementTotal - SkippedCount, SkippedCount,
@@ -672,6 +939,7 @@ void FAIDAActionEngine::ResetScratch()
 	AccruedRefund.Reset();
 	AttachmentActors.Reset();
 	PoleActors.Reset();
+	SetAttachmentActors.Reset();
 	RunFailures.Reset();
 	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 }

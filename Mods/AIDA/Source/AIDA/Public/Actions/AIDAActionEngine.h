@@ -107,6 +107,15 @@ private:
 	 */
 	bool TickPowered(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 
+	/**
+	 * Advance a CONNECTED build (revise-by-prompt: machines + manifold sets in one proposal):
+	 * phase 0 machines (index-captured; every set's planned ports rebind to the built actors),
+	 * then per set: attachments (captured) → trunk runs → drops, then the auto-power kit when
+	 * present (poles → wires + grid tie, same shape as TickPowered). Run failures are counted and
+	 * announced, never fatal. True while more work remains.
+	 */
+	bool TickConnected(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
+
 	/** One journal entry queued for reversal. */
 	struct FUndoJob
 	{
@@ -141,6 +150,8 @@ private:
 	TArray<TWeakObjectPtr<AActor>> AttachmentActors;
 	//~ Powered-build scratch: phase-1 poles, per placement index.
 	TArray<TWeakObjectPtr<AActor>> PoleActors;
+	//~ Connected-build scratch: one actor list per manifold set, per attachment index.
+	TArray<TArray<TWeakObjectPtr<AActor>>> SetAttachmentActors;
 	int32 RunBuiltCount = 0;
 	int32 RunFailCount = 0;
 	TArray<FString> RunFailures; // first few human-readable reasons for the outcome announcement

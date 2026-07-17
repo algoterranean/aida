@@ -110,6 +110,11 @@ private:
 	/** Push one proposal's current state to the replicated view (docs/PHASE4.md §4a). Server-only. */
 	void PublishProposal(const FGuid& ProposalId);
 
+	/** Retire a pending proposal QUIETLY because a revision replaces it (revise-by-prompt): removed
+	 *  from the store and the relay with no terminal announce/linger — the new proposal's ghost
+	 *  takes over in the same publish cycle. */
+	void SupersedeProposal(const FGuid& ProposalId);
+
 	/** Post a System line to the shared default conversation (proposal announcements/outcomes). */
 	void AnnounceSystem(const FString& Text);
 

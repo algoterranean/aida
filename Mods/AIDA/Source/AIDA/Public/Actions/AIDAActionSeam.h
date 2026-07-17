@@ -172,6 +172,21 @@ public:
 		TArray<FAIDAManifoldPort>& OutPorts, int32& OutSkippedConnected, FString& OutMachineName);
 
 	/**
+	 * Resolve a manifold's machine ports for PLANNED machines (a pending build proposal — nothing
+	 * exists in the world yet): one validation hologram of the machine recipe is walked across the
+	 * placements and its cached connection components are read (belts snap to holograms in-game, so
+	 * the hologram carries real, world-posed connectors). Each placement contributes its
+	 * PortIndex-th port of the wanted kind/direction, skipping any connector within ~30 cm of a
+	 * position in UsedPortPositions (ports already claimed by earlier manifold sets on the same
+	 * proposal). Ports return with a null Machine (rebound to the built actor at execute) and
+	 * OutPortMachineIndex names each port's placement index. False = recipe/hologram unavailable.
+	 */
+	static bool ResolvePlannedPorts(UObject* WorldContext, const FString& MachineRecipePath,
+		const FString& MachineName, const TArray<FTransform>& Placements,
+		bool bPipe, bool bOutput, int32 PortIndex, const TArray<FVector>& UsedPortPositions,
+		TArray<FAIDAManifoldPort>& OutPorts, TArray<int32>& OutPortMachineIndex);
+
+	/**
 	 * Deterministic lane assignment for a manifold row (user rule: don't probe — every port on a
 	 * machine side gets its OWN row). From the first machine matching the selector: pipe ports of
 	 * this direction occupy the inner lanes (0..P-1, they hug the machines), belt ports the outer

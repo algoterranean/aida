@@ -21,6 +21,7 @@
 #include "FGPowerConnectionComponent.h"
 #include "Buildables/FGBuildablePowerPole.h"
 #include "Buildables/FGBuildableWire.h"
+#include "Hologram/FGBuildableHologram.h"
 #include "Hologram/FGConveyorBeltHologram.h"
 #include "Hologram/FGSplineHologram.h"
 #include "FGClearanceInterface.h"
@@ -1665,6 +1666,107 @@ bool FAIDAActionSeam::ResolveMachinePorts(UObject* WorldContext, const FAIDADism
 		Port.MachineName = Name;
 		OutPorts.Add(MoveTemp(Port));
 	}
+	return true;
+}
+
+bool FAIDAActionSeam::ResolvePlannedPorts(UObject* WorldContext, const FString& MachineRecipePath,
+	const FString& MachineName, const TArray<FTransform>& Placements,
+	bool bPipe, bool bOutput, int32 PortIndex, const TArray<FVector>& UsedPortPositions,
+	TArray<FAIDAManifoldPort>& OutPorts, TArray<int32>& OutPortMachineIndex)
+{
+	OutPorts.Reset();
+	OutPortMachineIndex.Reset();
+
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(MachineRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass || Placements.Num() == 0) { return false; }
+
+	// One hologram walked across every placement, like the dry-run. Positioned DIRECTLY at the
+	// stored transform (no UpdateHologramPlacement — the placements are final and a snap pass
+	// could move them); the cached connection components ride the root, so their connector
+	// locations/normals come out world-posed.
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, Placements[0].GetLocation());
+	AFGBuildableHologram* BuildableHologram = Cast<AFGBuildableHologram>(Hologram);
+	if (!BuildableHologram)
+	{
+		if (Hologram) { Hologram->Destroy(); }
+		return false;
+	}
+
+	constexpr double UsedPortToleranceSq = 30.0 * 30.0; // cm — same connector across sets
+	const auto IsUsed = [&UsedPortPositions](const FVector& Pos)
+	{
+		for (const FVector& Used : UsedPortPositions)
+		{
+			if (FVector::DistSquared(Used, Pos) <= UsedPortToleranceSq) { return true; }
+		}
+		return false;
+	};
+
+	for (int32 Index = 0; Index < Placements.Num(); ++Index)
+	{
+		BuildableHologram->SetActorLocationAndRotation(Placements[Index].GetLocation(), Placements[Index].GetRotation());
+
+		FAIDAManifoldPort Port;
+		bool bFound = false;
+		int32 Free = 0;
+		if (!bPipe)
+		{
+			// Stable name order (SortComponentList wants a TInlineComponentArray; the name sort is
+			// what it does for identically-priorities connections anyway).
+			TArray<UFGFactoryConnectionComponent*> Connections = BuildableHologram->GetCachedFactoryConnectionComponents();
+			Connections.Sort([](const UFGFactoryConnectionComponent& A, const UFGFactoryConnectionComponent& B)
+			{
+				return A.GetName() < B.GetName();
+			});
+			for (UFGFactoryConnectionComponent* Conn : Connections)
+			{
+				if (!Conn) { continue; }
+				if (Conn->GetDirection() != (bOutput ? EFactoryConnectionDirection::FCD_OUTPUT : EFactoryConnectionDirection::FCD_INPUT))
+				{
+					continue;
+				}
+				if (IsUsed(Conn->GetConnectorLocation())) { continue; }
+				if (Free++ < PortIndex) { continue; }
+				Port.PosCm = Conn->GetConnectorLocation();
+				Port.NormalCm = Conn->GetConnectorNormal();
+				bFound = true;
+				break;
+			}
+		}
+		else
+		{
+			TArray<UFGPipeConnectionComponent*> Connections = BuildableHologram->GetCachedPipeConnectionComponents();
+			Connections.Sort([](const UFGPipeConnectionComponent& A, const UFGPipeConnectionComponent& B)
+			{
+				return A.GetName() < B.GetName();
+			});
+			for (UFGPipeConnectionComponent* Conn : Connections)
+			{
+				if (!Conn) { continue; }
+				const EPipeConnectionType Type = Conn->GetPipeConnectionType();
+				if (Type != (bOutput ? EPipeConnectionType::PCT_PRODUCER : EPipeConnectionType::PCT_CONSUMER))
+				{
+					continue;
+				}
+				if (IsUsed(Conn->GetConnectorLocation())) { continue; }
+				if (Free++ < PortIndex) { continue; }
+				Port.PosCm = Conn->GetConnectorLocation();
+				Port.NormalCm = Conn->GetConnectorNormal();
+				bFound = true;
+				break;
+			}
+		}
+
+		if (!bFound) { continue; } // machine has no free port of this kind — silently not part of the row
+
+		Port.Machine = nullptr; // rebound to the built actor at execute (phase 0 capture)
+		Port.MachineName = MachineName;
+		OutPorts.Add(MoveTemp(Port));
+		OutPortMachineIndex.Add(Index);
+	}
+
+	BuildableHologram->Destroy();
 	return true;
 }
 

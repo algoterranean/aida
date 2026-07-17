@@ -167,7 +167,17 @@ namespace
 		"further out, a second belt input gets the next row) — when machines need several manifolds "
 		"(refineries: belt + pipe, both sides), just propose each one; any order works, rows won't "
 		"collide.\n"
-		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired.\n"
+		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired. "
+		"Pending proposals include their full stored 'spec' — the input for revisions.\n"
+		"REVISING A PENDING PROPOSAL (very common): when the player asks to change or extend a proposed "
+		"build while its ghost is up ('add an input manifold', 'make it 20', 'use mk.2 belts', 'add a row'), "
+		"NEVER reject it or tell them to approve first. Instead: (a) for spec changes, read the pending "
+		"proposal's spec from get_proposal_status, merge the change, and call propose_build with "
+		"replaceProposalId = the old id; (b) to add a manifold to UNBUILT proposed machines, call "
+		"propose_manifold with forProposalId = the pending proposal's id (omit spec.machines) — the "
+		"machines do not need to exist yet. Either way the old proposal is replaced atomically, the ghosts "
+		"update to preview the WHOLE revised group, and ONE approval builds everything. Add more manifolds "
+		"by calling propose_manifold again with the NEW proposal id ('both sides' = two calls).\n"
 		"You CANNOT undo actions yourself — when a player wants something reversed, tell them to type "
 		"/aida undo (or /aida undo N) in this chat. Players decide proposals with the on-screen card or "
 		"/aida approve, /aida reject — a pending proposal shows a live hologram ghost of the whole build, "
@@ -1458,6 +1468,19 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 			}
 			Current->TileCenters.Add(Proposal->Placements[i].GetLocation());
 		}
+		// Connected builds: every manifold set's attachment row ghosts alongside the machines, so
+		// a revised proposal previews the WHOLE group before approval.
+		for (const FAIDAManifoldSet& Set : Proposal->ManifoldSets)
+		{
+			if (Set.Attachments.Num() == 0) { continue; }
+			FAIDAGhostPart& Part = View.GhostParts.AddDefaulted_GetRef();
+			Part.RecipeClassPath = Set.AttachmentRecipePath;
+			Part.YawDeg = static_cast<float>(Set.Attachments[0].Rotator().Yaw);
+			for (const FTransform& Attachment : Set.Attachments)
+			{
+				Part.TileCenters.Add(Attachment.GetLocation());
+			}
+		}
 	}
 	R->ServerUpsertProposal(View);
 }
@@ -1468,6 +1491,17 @@ void UAIDAOrchestrator::AnnounceSystem(const FString& Text)
 	{
 		Session->PostSystemMessage(Text, AIDADefaultConversationId());
 	}
+}
+
+void UAIDAOrchestrator::SupersedeProposal(const FGuid& ProposalId)
+{
+	Actions.Store().Remove(ProposalId);
+	if (AAIDAProposalRelay* R = GetProposalRelay())
+	{
+		R->ServerRemoveProposal(ProposalId);
+	}
+	UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s superseded by a revision."),
+		*ProposalId.ToString(EGuidFormats::DigitsWithHyphens));
 }
 
 void UAIDAOrchestrator::HandleProposalAdjust(const FAIDARequester& Requester, const FVector& DeltaCm, int32 YawDeltaDeg,
@@ -1576,8 +1610,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'."),
-		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."}},"required":["spec"]})"),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool}. v2 COMPOSITE — THE FORM FOR ANY MULTI-PART STRUCTURE (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically. Use when the player asks to change a proposed build (get its spec from get_proposal_status, merge the change, re-propose here)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
 		{
@@ -1591,6 +1625,27 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (!AIDAActionSpec::ParseBuildSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+
+			// Revision (revise-by-prompt): the new proposal replaces a pending one on SUCCESS —
+			// validated up front so a typo'd id fails before any dry-run work, resolved again
+			// (supersede) only after everything else succeeded.
+			FGuid ReplaceId;
+			bool bReplacedHadManifolds = false;
+			{
+				FString ReplaceIdStr;
+				Args->TryGetStringField(TEXT("replaceProposalId"), ReplaceIdStr);
+				if (!ReplaceIdStr.TrimStartAndEnd().IsEmpty())
+				{
+					const FAIDAProposal* Replaced = FGuid::Parse(ReplaceIdStr.TrimStartAndEnd(), ReplaceId)
+						? Actions.Store().Find(ReplaceId) : nullptr;
+					if (!Replaced || Replaced->State != EAIDAProposalState::Pending)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("replaceProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
+					}
+					bReplacedHadManifolds = Replaced->ManifoldSets.Num() > 0;
+				}
 			}
 			// Resolve every buildable up front — v1 = one resolution, v2 = one per part. Resolutions[0]
 			// is the ANCHOR part: it drives aim snapping and stands in for the v1 single recipe.
@@ -1905,6 +1960,13 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.Summary += PowerNote;
 			Proposal.InvalidCount = DryRun.Failures.Num(); // advisory — never blocks the ghost
 
+			// Everything validated: the revision may now retire the proposal it replaces (freeing
+			// its pending-cap slot) — the new ghost takes over in the same publish cycle.
+			if (ReplaceId.IsValid())
+			{
+				SupersedeProposal(ReplaceId);
+			}
+
 			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
 			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
 			{
@@ -1913,12 +1975,17 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s, %d blocked placement(s))"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author, Proposal.InvalidCount);
 			PublishProposal(Proposal.Id);
-			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s): %s — cost %s. Awaiting approval."),
-				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost));
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""),
+				*Proposal.Summary, *AIDACostSummaryString(Proposal.Cost));
 			if (Proposal.InvalidCount > 0)
 			{
 				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving (approving as-is builds only the valid ones and refunds the rest)."),
 					Proposal.InvalidCount, Proposal.Placements.Num());
+			}
+			if (bReplacedHadManifolds)
+			{
+				Announce += TEXT(" NOTE: the previous revision's manifolds were dropped — re-add them with propose_manifold (forProposalId).");
 			}
 			AnnounceSystem(Announce);
 
@@ -2018,8 +2085,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
 	Tools.Register({
 		TEXT("propose_manifold"),
-		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly."),
-		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."}},"required":["spec"]})"),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). Call again with the NEW id to add more manifolds (both sides = one call per side)."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."},"forProposalId":{"type":"string","description":"Optional: a PENDING machine-build proposal to manifold — the machines do NOT need to exist yet. The pending proposal is replaced by ONE combined proposal (machines + manifold, ghosts for both, one approval). Omit spec.machines when using this."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
 		{
@@ -2036,9 +2103,16 @@ void UAIDAOrchestrator::RegisterActionTools()
 			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
 			Args->TryGetObjectField(TEXT("spec"), SpecObj);
 
+			// forProposalId = a manifold FOR A PENDING BUILD (revise-by-prompt): the machines come
+			// from that proposal's placements, so the spec's machines selector is optional.
+			FString ForIdStr;
+			Args->TryGetStringField(TEXT("forProposalId"), ForIdStr);
+			ForIdStr = ForIdStr.TrimStartAndEnd();
+
 			FAIDAManifoldSpec Spec;
 			FString Error;
-			if (!AIDAActionSpec::ParseManifoldSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
+			if (!AIDAActionSpec::ParseManifoldSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error,
+				/*bRequireMachines*/ ForIdStr.IsEmpty()))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
@@ -2094,6 +2168,270 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 				Msg += TEXT("; you can pass 'attachment' with the exact build-menu name");
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			// ---- Manifold for a PENDING build (revise-by-prompt) --------------------------------
+			// The machines are the pending proposal's PLANNED placements: ports are read from a
+			// machine hologram walked across them, the row is planned exactly like a live manifold,
+			// and the pending proposal is superseded by ONE combined proposal (machines + every
+			// manifold added so far) — one ghost preview, one approval, TickConnected executes.
+			if (!ForIdStr.IsEmpty())
+			{
+				FGuid ForId;
+				const FAIDAProposal* Target = FGuid::Parse(ForIdStr, ForId) ? Actions.Store().Find(ForId) : nullptr;
+				if (!Target || Target->State != EAIDAProposalState::Pending)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("forProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
+				}
+				if (Target->bDismantle || Target->bLabel || Target->bManifold || Target->bPowerOnly
+					|| Target->PartRecipePaths.Num() > 0 || Target->Placements.Num() == 0)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("forProposalId must reference a pending v1 machine-build proposal (composites, dismantles, labels and power/manifold proposals can't take a manifold)"), {}));
+				}
+				Stage(FString::Printf(TEXT("planning against pending proposal %s (%d machine(s))"),
+					*ForId.ToString(EGuidFormats::DigitsWithHyphens), Target->Placements.Num()));
+
+				// The machine's display name + the stored build spec (for the compound record).
+				TSharedPtr<FJsonObject> StoredSpec;
+				{
+					const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Target->SpecJson);
+					FJsonSerializer::Deserialize(Reader, StoredSpec);
+				}
+				TSharedPtr<FJsonObject> BuildSpecObj = StoredSpec;
+				if (StoredSpec.IsValid() && StoredSpec->HasTypedField<EJson::Object>(TEXT("build")))
+				{
+					BuildSpecObj = StoredSpec->GetObjectField(TEXT("build"));
+				}
+				FString MachineName = TEXT("machine");
+				if (BuildSpecObj.IsValid())
+				{
+					BuildSpecObj->TryGetStringField(TEXT("buildable"), MachineName);
+				}
+
+				// Ports already claimed by earlier sets on this proposal are off the table.
+				TArray<FVector> UsedPorts;
+				for (const FAIDAManifoldSet& Set : Target->ManifoldSets)
+				{
+					for (const FAIDAManifoldPort& Port : Set.Ports) { UsedPorts.Add(Port.PosCm); }
+				}
+
+				TArray<FAIDAManifoldPort> Ports;
+				TArray<int32> PortMachineIndex;
+				if (!FAIDAActionSeam::ResolvePlannedPorts(this, Target->RecipeClassPath, MachineName,
+						Target->Placements, Spec.bPipe, Spec.bOutput, Spec.PortIndex, UsedPorts, Ports, PortMachineIndex)
+					|| Ports.Num() == 0)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("the proposed %s has no free %s %s port for this manifold — earlier manifolds may have claimed them, or the machine has none"),
+						*MachineName, Spec.bPipe ? TEXT("pipe") : TEXT("belt"), Spec.bOutput ? TEXT("output") : TEXT("input")), {}));
+				}
+				Stage(FString::Printf(TEXT("planned ports resolved: %d — planning row"), Ports.Num()));
+
+				TArray<FAIDAManifoldPortPoint> Points;
+				Points.Reserve(Ports.Num());
+				FVector AvgNormal = FVector::ZeroVector;
+				for (const FAIDAManifoldPort& Port : Ports)
+				{
+					Points.Add({ Port.PosCm, Port.NormalCm });
+					AvgNormal += Port.NormalCm;
+				}
+				AvgNormal = AvgNormal.GetSafeNormal();
+
+				// Deterministic lanes without a world to inspect: every EARLIER set on the same
+				// machine side pushes this row one lane further out (mirrors ResolveManifoldLane).
+				const double FootprintM = FMath::Max(Attachment.FootprintXM, Attachment.FootprintYM);
+				const double LaneWidthM = FMath::Max(4.0, FootprintM) + 1.0;
+				int32 Lane = 0;
+				for (const FAIDAManifoldSet& Set : Target->ManifoldSets)
+				{
+					FVector SetNormal = FVector::ZeroVector;
+					for (const FAIDAManifoldPort& Port : Set.Ports) { SetNormal += Port.NormalCm; }
+					if (FVector::DotProduct(SetNormal.GetSafeNormal(), AvgNormal) > 0.5) { ++Lane; }
+				}
+				const double BaseStandoffM = Spec.StandoffM + Lane * LaneWidthM;
+
+				// Step outward on trouble, same fallback ladder as live manifolds: clean lane >
+				// valid-but-clipping > blocked-with-advisory (validation never prohibits a ghost).
+				FAIDAManifoldPlan Plan;
+				FAIDADryRunResult DryRun;
+				double UsedStandoffM = BaseStandoffM;
+				FAIDAManifoldPlan NearestValidPlan;
+				FAIDADryRunResult NearestValidDryRun;
+				double NearestValidStandoffM = -1.0;
+				FAIDAManifoldPlan FirstFailPlan;
+				FAIDADryRunResult FirstFailRun;
+				double FirstFailStandoffM = -1.0;
+				bool bPlaced = false;
+				bool bClips = false;
+				bool bBlockedSome = false;
+				for (int32 Attempt = 0; Attempt < 4; ++Attempt)
+				{
+					UsedStandoffM = BaseStandoffM + Attempt * 3.0;
+					Plan = AIDAActionSpec::PlanManifold(Points, Spec.bOutput, Spec.bPipe,
+						UsedStandoffM, FootprintM, /*MaxRunM*/ 56.0);
+					if (!Plan.Error.IsEmpty())
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+					}
+					for (FTransform& Placement : Plan.Attachments)
+					{
+						double GroundZ;
+						if (FAIDAActionSeam::ProbeGroundZ(this, Placement.GetLocation(), GroundZ))
+						{
+							// Never bury an attachment under a floor that is ITSELF still pending
+							// (revision chains) — ground far below the port means the real floor
+							// doesn't exist yet, so stay near the port's level instead.
+							FVector Location = Placement.GetLocation();
+							Location.Z = (Location.Z - GroundZ > 400.0) ? Location.Z - 100.0 : GroundZ;
+							Placement.SetLocation(Location);
+						}
+					}
+					if (!FAIDAActionSeam::DryRunBuild(this, Attachment.RecipeClassPath, Plan.Attachments, DryRun, Ctx.PlayerId))
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+					}
+					const int32 Overlaps = FAIDAActionSeam::CountAttachmentOverlaps(this, Plan.Attachments, FootprintM * 100.0);
+					if (DryRun.bOk && DryRun.ClippingCount == 0 && Overlaps == 0)
+					{
+						bPlaced = true;
+						break;
+					}
+					if (DryRun.bOk && NearestValidStandoffM < 0.0)
+					{
+						NearestValidPlan = Plan;
+						NearestValidDryRun = DryRun;
+						NearestValidStandoffM = UsedStandoffM;
+					}
+					else if (!DryRun.bOk && FirstFailStandoffM < 0.0)
+					{
+						FirstFailPlan = Plan;
+						FirstFailRun = DryRun;
+						FirstFailStandoffM = UsedStandoffM;
+					}
+				}
+				if (!bPlaced && NearestValidStandoffM >= 0.0)
+				{
+					Plan = MoveTemp(NearestValidPlan);
+					DryRun = MoveTemp(NearestValidDryRun);
+					UsedStandoffM = NearestValidStandoffM;
+					bPlaced = true;
+					bClips = true;
+				}
+				if (!bPlaced && FirstFailStandoffM >= 0.0)
+				{
+					Plan = MoveTemp(FirstFailPlan);
+					DryRun = MoveTemp(FirstFailRun);
+					UsedStandoffM = FirstFailStandoffM;
+					bPlaced = true;
+					bBlockedSome = true;
+				}
+				if (!bPlaced)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("no attachment lane could be evaluated for the planned machines"), DryRun.Failures));
+				}
+
+				// Reorder the ports to the plan's sort so everything downstream is index-aligned.
+				FAIDAManifoldSet NewSet;
+				NewSet.bPipe = Spec.bPipe;
+				NewSet.bOutput = Spec.bOutput;
+				NewSet.TransportRecipePath = Transport.RecipeClassPath;
+				NewSet.TransportName = Transport.DisplayName;
+				NewSet.AttachmentRecipePath = Attachment.RecipeClassPath;
+				NewSet.AttachmentName = Attachment.DisplayName;
+				for (const int32 PortIdx : Plan.PortOrder)
+				{
+					NewSet.Ports.Add(Ports[PortIdx]);
+					NewSet.PortMachineIndex.Add(PortMachineIndex[PortIdx]);
+				}
+				NewSet.Attachments = MoveTemp(Plan.Attachments);
+				NewSet.RowAxis = Plan.RowAxis;
+				NewSet.DropDir = Plan.DropDir;
+				const int32 SetCount = NewSet.Attachments.Num();
+				const int32 RunCount = 2 * SetCount - 1;
+
+				// The combined proposal: the target build + every manifold so far, ONE approval.
+				FAIDAProposal Combined = *Target;
+				Combined.Id = FGuid::NewGuid();
+				Combined.RequesterId = Ctx.PlayerId; // the reviser owns the revision
+				Combined.RequesterName = Ctx.Author;
+				Combined.ManifoldSets.Add(MoveTemp(NewSet));
+				for (const FAIDACostItem& Item : DryRun.Cost)
+				{
+					bool bMerged = false;
+					for (FAIDACostItem& Existing : Combined.Cost)
+					{
+						if (Existing.Item == Item.Item) { Existing.Amount += Item.Amount; bMerged = true; break; }
+					}
+					if (!bMerged) { Combined.Cost.Add(Item); }
+				}
+				if (Config.Actions.CostMode == TEXT("central") && !FAIDAActionSeam::CheckAffordable(this, Combined.Cost, Ctx.PlayerId))
+				{
+					FString Msg = TEXT("not affordable from central storage + your inventory with the manifold included: needs ");
+					for (int32 i = 0; i < Combined.Cost.Num(); ++i)
+					{
+						Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), Combined.Cost[i].Amount, *Combined.Cost[i].Item);
+					}
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+				}
+				Combined.InvalidCount = Target->InvalidCount + DryRun.Failures.Num();
+				Combined.Summary += FString::Printf(TEXT(" + %s-%s manifold (%d x %s + %d runs)"),
+					Spec.bPipe ? TEXT("pipe") : TEXT("belt"), Spec.bOutput ? TEXT("out") : TEXT("in"),
+					SetCount, *Attachment.DisplayName, RunCount);
+				if (bClips)
+				{
+					Combined.Summary += TEXT(" [manifold clips nearby structures]");
+				}
+
+				// Compound stored spec {"build":…, "manifolds":[…]} — later revisions read it back.
+				{
+					const double EffectiveBaseM = UsedStandoffM - Lane * LaneWidthM;
+					(*SpecObj)->SetNumberField(TEXT("standoffM"), EffectiveBaseM);
+					TSharedRef<FJsonObject> Compound = MakeShared<FJsonObject>();
+					TArray<TSharedPtr<FJsonValue>> ManifoldSpecs;
+					if (StoredSpec.IsValid() && StoredSpec->HasTypedField<EJson::Object>(TEXT("build")))
+					{
+						Compound = StoredSpec.ToSharedRef();
+						const TArray<TSharedPtr<FJsonValue>>* Existing = nullptr;
+						if (Compound->TryGetArrayField(TEXT("manifolds"), Existing) && Existing)
+						{
+							ManifoldSpecs = *Existing;
+						}
+					}
+					else if (StoredSpec.IsValid())
+					{
+						Compound->SetObjectField(TEXT("build"), StoredSpec);
+					}
+					ManifoldSpecs.Add(MakeShared<FJsonValueObject>(*SpecObj));
+					Compound->SetArrayField(TEXT("manifolds"), ManifoldSpecs);
+					Combined.SpecJson = AIDAToCompactJson(Compound);
+				}
+
+				Stage(TEXT("combined proposal ready — superseding + storing"));
+				SupersedeProposal(ForId); // Target dangles from here — Combined carries everything
+				Target = nullptr;
+
+				const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+				if (!Actions.Store().Add(Combined, Now, Config.Actions.MaxPendingProposals, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+				UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (connected): %s (by %s)"),
+					*Combined.Id.ToString(EGuidFormats::DigitsWithHyphens), *Combined.Summary, *Ctx.Author);
+				PublishProposal(Combined.Id);
+				FString Announce = FString::Printf(TEXT("AIDA proposes (for %s, revised): %s — cost %s. Awaiting approval."),
+					*Ctx.Author, *Combined.Summary, *AIDACostSummaryString(Combined.Cost));
+				if (Combined.InvalidCount > 0)
+				{
+					Announce += FString::Printf(TEXT(" NOTE: %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving."),
+						Combined.InvalidCount);
+				}
+				AnnounceSystem(Announce);
+
+				return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds,
+					/*bAffordable*/ true, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
 			}
 
 			// No center = "the machines the player is looking at", falling back to their position —

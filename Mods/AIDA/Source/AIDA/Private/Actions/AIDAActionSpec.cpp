@@ -486,7 +486,8 @@ FAIDAPowerPlan AIDAActionSpec::PlanPowerForPoints(const TArray<FVector>& Machine
 	return Plan;
 }
 
-bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError)
+bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDAManifoldSpec& Out, FString& OutError,
+	bool bRequireMachines)
 {
 	if (!Spec.IsValid()) { OutError = TEXT("missing spec object"); return false; }
 	if (!CheckVersion(Spec, OutError)) { return false; }
@@ -514,45 +515,57 @@ bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int3
 	Spec->TryGetStringField(TEXT("attachment"), Parsed.Attachment);
 	Parsed.Attachment = Parsed.Attachment.TrimStartAndEnd();
 
+	// The machines selector is optional for forProposalId manifolds (bRequireMachines false —
+	// the machines come from the pending proposal, not a world search).
 	const TSharedPtr<FJsonObject>* Machines = nullptr;
 	if (!Spec->TryGetObjectField(TEXT("machines"), Machines) || !Machines)
 	{
-		OutError = TEXT("'machines' selector object is required");
-		return false;
-	}
-	if (!(*Machines)->TryGetStringField(TEXT("buildable"), Parsed.Machines.Buildable) ||
-		Parsed.Machines.Buildable.TrimStartAndEnd().IsEmpty())
-	{
-		OutError = TEXT("'machines.buildable' (machine display name) is required");
-		return false;
-	}
-	Parsed.Machines.Buildable = Parsed.Machines.Buildable.TrimStartAndEnd();
-	if ((*Machines)->HasField(TEXT("center")))
-	{
-		if (!ReadVectorM(*Machines, TEXT("center"), Parsed.Machines.CenterM))
+		if (bRequireMachines)
 		{
-			OutError = TEXT("'machines.center' must be an object with numeric x and y (metres) — or omit it to use where the requester is aiming");
+			OutError = TEXT("'machines' selector object is required");
 			return false;
 		}
-		Parsed.Machines.bHasCenter = true;
 	}
-	Parsed.Machines.RadiusM = 30.0;
-	if ((*Machines)->TryGetNumberField(TEXT("radiusM"), Parsed.Machines.RadiusM) && Parsed.Machines.RadiusM <= 0.0)
+	else
 	{
-		OutError = TEXT("'machines.radiusM' must be a positive number");
-		return false;
-	}
-	Parsed.Machines.MaxCount = 0; // 0 = every match in radius
-	int32 MaxCount = 0;
-	if ((*Machines)->TryGetNumberField(TEXT("maxCount"), MaxCount))
-	{
-		if (MaxCount < 0) { OutError = TEXT("'machines.maxCount' must be >= 0 (0 = all)"); return false; }
-		Parsed.Machines.MaxCount = MaxCount;
-	}
-	if (MaxItems > 0)
-	{
-		Parsed.Machines.MaxCount = (Parsed.Machines.MaxCount == 0)
-			? MaxItems : FMath::Min(Parsed.Machines.MaxCount, MaxItems);
+		if (!(*Machines)->TryGetStringField(TEXT("buildable"), Parsed.Machines.Buildable) ||
+			Parsed.Machines.Buildable.TrimStartAndEnd().IsEmpty())
+		{
+			if (bRequireMachines)
+			{
+				OutError = TEXT("'machines.buildable' (machine display name) is required");
+				return false;
+			}
+			Parsed.Machines.Buildable.Reset();
+		}
+		Parsed.Machines.Buildable = Parsed.Machines.Buildable.TrimStartAndEnd();
+		if ((*Machines)->HasField(TEXT("center")))
+		{
+			if (!ReadVectorM(*Machines, TEXT("center"), Parsed.Machines.CenterM))
+			{
+				OutError = TEXT("'machines.center' must be an object with numeric x and y (metres) — or omit it to use where the requester is aiming");
+				return false;
+			}
+			Parsed.Machines.bHasCenter = true;
+		}
+		Parsed.Machines.RadiusM = 30.0;
+		if ((*Machines)->TryGetNumberField(TEXT("radiusM"), Parsed.Machines.RadiusM) && Parsed.Machines.RadiusM <= 0.0)
+		{
+			OutError = TEXT("'machines.radiusM' must be a positive number");
+			return false;
+		}
+		Parsed.Machines.MaxCount = 0; // 0 = every match in radius
+		int32 MaxCount = 0;
+		if ((*Machines)->TryGetNumberField(TEXT("maxCount"), MaxCount))
+		{
+			if (MaxCount < 0) { OutError = TEXT("'machines.maxCount' must be >= 0 (0 = all)"); return false; }
+			Parsed.Machines.MaxCount = MaxCount;
+		}
+		if (MaxItems > 0)
+		{
+			Parsed.Machines.MaxCount = (Parsed.Machines.MaxCount == 0)
+				? MaxItems : FMath::Min(Parsed.Machines.MaxCount, MaxItems);
+		}
 	}
 
 	if (Spec->TryGetNumberField(TEXT("standoffM"), Parsed.StandoffM) && (Parsed.StandoffM < 1.0 || Parsed.StandoffM > 20.0))
@@ -954,6 +967,15 @@ FString AIDAActionSpec::BuildStatusJson(const TArray<FAIDAProposal>& Proposals, 
 				// Advisory: blocked at the last dry-run (propose or nudge) — a nudge onto clear
 				// ground drops this to 0; approval as-is builds the valid subset + refunds the rest.
 				O->SetNumberField(TEXT("invalidCount"), P.InvalidCount);
+			}
+			// The stored spec rides along so the model can REVISE a pending proposal by prompting:
+			// merge the player's change into this spec and re-propose with replaceProposalId (or
+			// propose_manifold forProposalId for "add a manifold" on unbuilt machines).
+			TSharedPtr<FJsonObject> SpecObj;
+			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(P.SpecJson);
+			if (FJsonSerializer::Deserialize(Reader, SpecObj) && SpecObj.IsValid())
+			{
+				O->SetObjectField(TEXT("spec"), SpecObj);
 			}
 		}
 
