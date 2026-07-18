@@ -44,6 +44,14 @@ public:
 	/** Flag a journal entry as undone (so /aida undo skips past it). False if the Id is unknown. */
 	bool MarkUndone(const FGuid& Id);
 
+	//~ P8 Slice 5 standing tasks (human-created recurring Query-only checks).
+	/** Add a standing task (mints an Id if unset). Returns the task Id. */
+	FGuid AddTask(FAIDAStandingTask Task);
+	const TArray<FAIDAStandingTask>& GetTasks() const { return Tasks; }
+	/** Mutable lookup for the scheduler (LastRunUtc/LastResult) and pause/resume. Null = unknown. */
+	FAIDAStandingTask* FindTask(const FGuid& Id);
+	bool RemoveTask(const FGuid& Id);
+
 	//~ IFGSaveInterface — persist SaveGame properties; mint the session id on load.
 	virtual bool ShouldSave_Implementation() const override { return true; }
 	virtual void PreSaveGame_Implementation(int32 saveVersion, int32 gameVersion) override {}
@@ -58,6 +66,7 @@ public:
 	UPROPERTY(SaveGame) TArray<FAIDANote> Notes;
 	UPROPERTY(SaveGame) TArray<FAIDAJournalEntry> Journal;
 	UPROPERTY(SaveGame) TArray<FAIDAMarkerRecord> Markers;
+	UPROPERTY(SaveGame) TArray<FAIDAStandingTask> Tasks;
 
 private:
 	void EnsureSessionId();

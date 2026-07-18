@@ -16,8 +16,11 @@ struct FAIDAChatCommand
 		Approve,  // "/aida approve [proposalId]" — no id = the newest pending proposal
 		Reject,   // "/aida reject [proposalId]"
 		Nudge,    // "/aida nudge <north|south|east|west|up|down> [metres]" — move the pending ghost
-		Rotate    // "/aida rotate [degrees]" — rotate the pending ghost (default 90)
+		Rotate,   // "/aida rotate [degrees]" — rotate the pending ghost (default 90)
+		Task      // "/aida task add \"<prompt>\" every <N>m | list | rm/pause/resume <n>" (P8 Slice 5)
 	};
+
+	enum class ETaskOp : uint8 { List, Add, Remove, Pause, Resume };
 
 	EKind Kind = EKind::None;
 	int32 Count = 1;                          // Undo: how many actions to reverse
@@ -25,6 +28,10 @@ struct FAIDAChatCommand
 	FVector NudgeDir = FVector::ZeroVector;   // Nudge: world-axis unit direction
 	double NudgeDistM = 8.0;                  // Nudge: metres (default = one foundation tile)
 	int32 RotateDeg = 90;                     // Rotate: yaw delta
+	ETaskOp TaskOp = ETaskOp::List;           // Task: which sub-operation
+	FString TaskPrompt;                       // Task add: the check to run (from the quoted string)
+	int32 TaskIntervalMinutes = 10;           // Task add: requested cadence
+	int32 TaskIndex = 0;                      // Task rm/pause/resume: 1-based index from `task list`
 };
 
 namespace AIDAChatCommands

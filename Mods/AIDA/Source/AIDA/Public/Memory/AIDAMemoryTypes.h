@@ -66,6 +66,26 @@ struct FAIDAJournalEntry
 	UPROPERTY(SaveGame) FString MutationJson;
 };
 
+/**
+ * A standing task (P8 Slice 5): a HUMAN-created recurring check, run through the tool loop with
+ * Query-tier tools only — it can look but never mutate; findings are reported, a human decides.
+ * Persisted in-save so checks survive sessions.
+ */
+USTRUCT()
+struct FAIDAStandingTask
+{
+	GENERATED_BODY()
+
+	UPROPERTY(SaveGame) FGuid Id;
+	UPROPERTY(SaveGame) FString Prompt;
+	UPROPERTY(SaveGame) int32 IntervalMinutes = 10;
+	UPROPERTY(SaveGame) FString CreatedById;     // runs use the creator's identity
+	UPROPERTY(SaveGame) FString CreatedByName;
+	UPROPERTY(SaveGame) bool bEnabled = true;
+	UPROPERTY(SaveGame) int64 LastRunUtc = 0;
+	UPROPERTY(SaveGame) FString LastResult;      // last reply ("OK" = quiet)
+};
+
 /** One item's net production−consumption at snapshot time. */
 struct FAIDASnapshotItem
 {

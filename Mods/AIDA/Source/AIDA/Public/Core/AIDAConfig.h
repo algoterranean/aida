@@ -90,6 +90,20 @@ struct FAIDAActionsConfig
 	UPROPERTY() bool bAllowDirectFuseReset = true;
 };
 
+/** P8 Slice 5 standing tasks: guard-rails-first — off by default, tokens are spent unattended. */
+USTRUCT()
+struct FAIDATasksConfig
+{
+	GENERATED_BODY()
+
+	/** Master gate: off ⇒ tasks never run and /aida task add refuses. */
+	UPROPERTY() bool bEnabled = false;
+	/** Floor applied to every task's interval, whatever was asked for. */
+	UPROPERTY() int32 MinIntervalMinutes = 5;
+	/** Global LLM-run budget per UTC day across all tasks. */
+	UPROPERTY() int32 MaxPerDay = 200;
+};
+
 USTRUCT()
 struct FAIDAUploadsConfig
 {
@@ -133,4 +147,5 @@ struct FAIDAConfig
 	UPROPERTY() FAIDAActionsConfig Actions;
 	UPROPERTY() FAIDAUploadsConfig Uploads;
 	UPROPERTY() FAIDAPromptsConfig Prompts;
+	UPROPERTY() FAIDATasksConfig Tasks;
 };

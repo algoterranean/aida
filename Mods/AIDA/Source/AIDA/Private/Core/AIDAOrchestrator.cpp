@@ -287,6 +287,15 @@ void UAIDAOrchestrator::OnWorldBeginPlay(UWorld& InWorld)
 
 	RegisterConsoleCommands();
 
+	// P8 Slice 5: standing tasks poll slowly while enabled — the poll itself is nearly free; only
+	// a DUE task spends an LLM run (budgeted in OnTaskTimer).
+	if (Config.Tasks.bEnabled)
+	{
+		InWorld.GetTimerManager().SetTimer(TaskTimer, this, &UAIDAOrchestrator::OnTaskTimer, 60.0f, /*bLoop=*/true);
+		UE_LOG(LogAIDA, Log, TEXT("[tasks] standing tasks enabled (min interval %d min, %d runs/day)."),
+			Config.Tasks.MinIntervalMinutes, Config.Tasks.MaxPerDay);
+	}
+
 	// Packaged-game scenario harness (docs/SELFTEST.md): armed only by -AIDASelfTest=<file> on the
 	// command line; drives the tool registry against the loaded save and writes a results file.
 	FString SelfTestScript;
@@ -566,6 +575,18 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 			}
 
 			HandleProposalDecision(Requester, Target, Command.Kind == FAIDAChatCommand::EKind::Approve);
+			return;
+		}
+
+		// Standing tasks grant recurring token spend — act tier, humans only (never an LLM tool).
+		if (Command.Kind == FAIDAChatCommand::EKind::Task)
+		{
+			if (!Permissions.IsAllowed(EAIDATier::Act, Requester.PlayerId))
+			{
+				Session->PostSystemMessage(TEXT("You don't have act permission to manage standing tasks."), ConversationId);
+				return;
+			}
+			HandleTaskCommand(Requester, Command, ConversationId);
 			return;
 		}
 
@@ -4714,7 +4735,8 @@ void UAIDAOrchestrator::BuildToolDefs(TArray<FAIDAToolDef>& OutDefs) const
 }
 
 void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages, FAIDARequester Requester,
-	int32 RoundsLeft, FAIDAOnChunk OnDelta, TFunction<void(const FString&)> OnDone, FAIDAOnError OnError)
+	int32 RoundsLeft, FAIDAOnChunk OnDelta, TFunction<void(const FString&)> OnDone, FAIDAOnError OnError,
+	bool bReadOnly)
 {
 	if (!LLMClient.IsValid() || !LLMClient->IsReady())
 	{
@@ -4727,7 +4749,7 @@ void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode
 
 	TWeakObjectPtr<UAIDAOrchestrator> Weak(this);
 	LLMClient->CompleteChat(*Messages, ToolDefs, OnDelta,
-		[Weak, Messages, Requester, RoundsLeft, OnDelta, OnDone, OnError](const FAIDACompletionResult& Result)
+		[Weak, Messages, Requester, RoundsLeft, OnDelta, OnDone, OnError, bReadOnly](const FAIDACompletionResult& Result)
 		{
 			UAIDAOrchestrator* O = Weak.Get();
 			if (!O)
@@ -4774,7 +4796,7 @@ void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode
 					TruncTurn.ToolResults.Add(MoveTemp(Part));
 				}
 				Messages->Add(MoveTemp(TruncTurn));
-				O->RunToolLoop(Messages, Requester, RoundsLeft - 1, OnDelta, OnDone, OnError);
+				O->RunToolLoop(Messages, Requester, RoundsLeft - 1, OnDelta, OnDone, OnError, bReadOnly);
 				return;
 			}
 
@@ -4794,7 +4816,14 @@ void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode
 				Part.ToolCallId = Call.Id;
 
 				const FAIDAToolSpec* Spec = O->Tools.Find(Call.Name);
-				if (Spec && !O->Permissions.IsAllowed(ToPermissionTier(Spec->Tier), Requester.PlayerId))
+				if (Spec && bReadOnly && Spec->Tier == EAIDAToolTier::Act)
+				{
+					// Standing tasks can never mutate (docs/PHASE7.md Slice 6) — a check that finds
+					// drift REPORTS; a human decides.
+					Part.bIsError = true;
+					Part.Content = FString::Printf(TEXT("This is a read-only background check: '%s' can modify the world and is not available. Report the finding in your reply instead."), *Call.Name);
+				}
+				else if (Spec && !O->Permissions.IsAllowed(ToPermissionTier(Spec->Tier), Requester.PlayerId))
 				{
 					Part.bIsError = true;
 					Part.Content = FString::Printf(TEXT("Permission denied: you may not use the '%s' tool."), *Call.Name);
@@ -4812,9 +4841,210 @@ void UAIDAOrchestrator::RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode
 			}
 			Messages->Add(MoveTemp(ToolTurn));
 
-			O->RunToolLoop(Messages, Requester, RoundsLeft - 1, OnDelta, OnDone, OnError);
+			O->RunToolLoop(Messages, Requester, RoundsLeft - 1, OnDelta, OnDone, OnError, bReadOnly);
 		},
 		OnError);
+}
+
+void UAIDAOrchestrator::HandleTaskCommand(const FAIDARequester& Requester, const FAIDAChatCommand& Command, const FGuid& ConversationId)
+{
+	AAIDAMemoryStore* Store = Memory.Store(this);
+	if (!Store || !Session.IsValid())
+	{
+		return;
+	}
+	const auto Post = [this, &ConversationId](const FString& Message)
+	{
+		Session->PostSystemMessage(Message, ConversationId);
+	};
+
+	switch (Command.TaskOp)
+	{
+	case FAIDAChatCommand::ETaskOp::Add:
+	{
+		if (!Config.Tasks.bEnabled)
+		{
+			Post(TEXT("Standing tasks are disabled on this server — a server admin can turn them on with tasks.enabled in the AIDA config."));
+			return;
+		}
+		FAIDAStandingTask Task;
+		Task.Prompt = Command.TaskPrompt;
+		Task.IntervalMinutes = FMath::Max(Command.TaskIntervalMinutes, Config.Tasks.MinIntervalMinutes);
+		Task.CreatedById = Requester.PlayerId;
+		Task.CreatedByName = Requester.Author;
+		Task.LastRunUtc = FDateTime::UtcNow().ToUnixTimestamp(); // first run one interval from now
+		Store->AddTask(Task);
+		Post(FString::Printf(TEXT("Standing task #%d added: \"%s\" every %d min (read-only; first check in ~%d min). Quiet checks say nothing — you only hear about findings."),
+			Store->GetTasks().Num(), *Task.Prompt, Task.IntervalMinutes, Task.IntervalMinutes));
+		return;
+	}
+	case FAIDAChatCommand::ETaskOp::List:
+	{
+		const TArray<FAIDAStandingTask>& Tasks = Store->GetTasks();
+		if (Tasks.Num() == 0)
+		{
+			Post(TEXT("No standing tasks. Add one with: /aida task add \"<what to check>\" every 10m"));
+			return;
+		}
+		FString Lines = FString::Printf(TEXT("%d standing task(s)%s:"), Tasks.Num(),
+			Config.Tasks.bEnabled ? TEXT("") : TEXT(" (tasks are DISABLED in config — none will run)"));
+		const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+		for (int32 i = 0; i < Tasks.Num(); ++i)
+		{
+			const FAIDAStandingTask& Task = Tasks[i];
+			const int64 AgeMin = Task.LastRunUtc > 0 ? (Now - Task.LastRunUtc) / 60 : -1;
+			Lines += FString::Printf(TEXT("\n%d. [%s] \"%s\" every %d min (by %s%s%s)"),
+				i + 1, Task.bEnabled ? TEXT("on") : TEXT("paused"), *Task.Prompt, Task.IntervalMinutes,
+				*Task.CreatedByName,
+				AgeMin >= 0 ? *FString::Printf(TEXT(", last run %lld min ago"), AgeMin) : TEXT(""),
+				Task.LastResult.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(": %s"), *Task.LastResult.Left(120)));
+		}
+		Post(Lines);
+		return;
+	}
+	case FAIDAChatCommand::ETaskOp::Remove:
+	case FAIDAChatCommand::ETaskOp::Pause:
+	case FAIDAChatCommand::ETaskOp::Resume:
+	{
+		const TArray<FAIDAStandingTask>& Tasks = Store->GetTasks();
+		if (!Tasks.IsValidIndex(Command.TaskIndex - 1))
+		{
+			Post(FString::Printf(TEXT("No task #%d — /aida task list shows the numbers."), Command.TaskIndex));
+			return;
+		}
+		const FGuid Id = Tasks[Command.TaskIndex - 1].Id;
+		if (Command.TaskOp == FAIDAChatCommand::ETaskOp::Remove)
+		{
+			Store->RemoveTask(Id);
+			Post(FString::Printf(TEXT("Standing task #%d removed."), Command.TaskIndex));
+		}
+		else if (FAIDAStandingTask* Task = Store->FindTask(Id))
+		{
+			Task->bEnabled = Command.TaskOp == FAIDAChatCommand::ETaskOp::Resume;
+			Post(FString::Printf(TEXT("Standing task #%d %s."), Command.TaskIndex,
+				Task->bEnabled ? TEXT("resumed") : TEXT("paused")));
+		}
+		return;
+	}
+	default:
+		return;
+	}
+}
+
+void UAIDAOrchestrator::OnTaskTimer()
+{
+	if (bTaskRunning || !Config.Tasks.bEnabled || !LLMClient.IsValid() || !LLMClient->IsReady())
+	{
+		return;
+	}
+	AAIDAMemoryStore* Store = Memory.Store(this);
+	if (!Store)
+	{
+		return;
+	}
+
+	// Daily budget: a hard cap on unattended LLM runs, reset at UTC midnight.
+	const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+	const int64 Day = Now / 86400;
+	if (Day != TaskDayStamp)
+	{
+		TaskDayStamp = Day;
+		TaskRunsToday = 0;
+	}
+	if (TaskRunsToday >= Config.Tasks.MaxPerDay)
+	{
+		return; // quiet — the budget line was logged when the last run spent it
+	}
+
+	// Most-overdue due task wins; one runs at a time.
+	FGuid DueId;
+	int64 MostOverdue = 0;
+	for (const FAIDAStandingTask& Task : Store->GetTasks())
+	{
+		if (!Task.bEnabled) { continue; }
+		const int64 IntervalSeconds = 60 * static_cast<int64>(FMath::Max(Task.IntervalMinutes, Config.Tasks.MinIntervalMinutes));
+		const int64 Overdue = Now - Task.LastRunUtc - IntervalSeconds;
+		if (Overdue >= 0 && Overdue >= MostOverdue)
+		{
+			MostOverdue = Overdue;
+			DueId = Task.Id;
+		}
+	}
+	FAIDAStandingTask* Due = DueId.IsValid() ? Store->FindTask(DueId) : nullptr;
+	if (!Due)
+	{
+		return;
+	}
+
+	Due->LastRunUtc = Now; // stamped up front so a hung run can't hot-loop
+	++TaskRunsToday;
+	bTaskRunning = true;
+	UE_LOG(LogAIDA, Log, TEXT("[tasks] running \"%s\" (run %d/%d today)."),
+		*Due->Prompt, TaskRunsToday, Config.Tasks.MaxPerDay);
+
+	// A compact task-specific system prompt (the chat prompt's build guidance is noise here); the
+	// next chat request sets its own prompt again, so this never leaks into conversations.
+	LLMClient->SetSystemPrompt(TEXT(
+		"You are AIDA running a standing background check inside the game Satisfactory — no player is chatting "
+		"with you right now. Use your read-only factory tools to perform the check below, then reply with ONE "
+		"short line for the chat feed. CONTRACT: if everything is fine and nothing needs a player's attention, "
+		"reply with exactly OK and nothing else — quiet results are silently discarded, and padding them wastes "
+		"everyone's attention. If something IS wrong, say what and where (metres) in one or two sentences. "
+		"World-modifying tools are unavailable in background checks — report, never fix."));
+
+	const TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages =
+		MakeShared<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe>();
+	Messages->Add({ TEXT("user"), FString::Printf(TEXT("Standing check (created by %s): %s"), *Due->CreatedByName, *Due->Prompt) });
+
+	FAIDARequester Requester;
+	Requester.Author = Due->CreatedByName;
+	Requester.PlayerId = Due->CreatedById;
+
+	TWeakObjectPtr<UAIDAOrchestrator> Weak(this);
+	const FGuid TaskId = Due->Id;
+	RunToolLoop(Messages, Requester, MaxToolRoundTrips,
+		[](const FString&) {}, // background — nothing streams to a widget
+		[Weak, TaskId](const FString& Text)
+		{
+			UAIDAOrchestrator* O = Weak.Get();
+			if (!O) { return; }
+			O->bTaskRunning = false;
+			const FString Result = Text.TrimStartAndEnd();
+			if (AAIDAMemoryStore* S = O->Memory.Store(O))
+			{
+				if (FAIDAStandingTask* Task = S->FindTask(TaskId))
+				{
+					Task->LastResult = Result.Left(300);
+				}
+			}
+			// The OK contract: quiet results are swallowed; findings go to chat as a System line.
+			const bool bQuiet = Result.IsEmpty() || Result.Equals(TEXT("OK"), ESearchCase::IgnoreCase)
+				|| (Result.Len() <= 4 && Result.StartsWith(TEXT("OK"), ESearchCase::IgnoreCase));
+			if (bQuiet)
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[tasks] check quiet (OK)."));
+			}
+			else
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[tasks] check found something: %s"), *Result);
+				O->AnnounceSystem(FString::Printf(TEXT("AIDA standing check: %s"), *Result.Left(400)));
+			}
+		},
+		[Weak, TaskId](int32 /*Code*/, const FString& Message)
+		{
+			UAIDAOrchestrator* O = Weak.Get();
+			if (!O) { return; }
+			O->bTaskRunning = false;
+			UE_LOG(LogAIDA, Warning, TEXT("[tasks] check failed: %s"), *Message);
+			if (AAIDAMemoryStore* S = O->Memory.Store(O))
+			{
+				if (FAIDAStandingTask* Task = S->FindTask(TaskId))
+				{
+					Task->LastResult = FString::Printf(TEXT("error: %s"), *Message.Left(200));
+				}
+			}
+		},
+		/*bReadOnly*/ true);
 }
 
 bool UAIDAOrchestrator::GetMessageBody(const FGuid& Id, FAIDATranscriptEntry& OutEntry) const

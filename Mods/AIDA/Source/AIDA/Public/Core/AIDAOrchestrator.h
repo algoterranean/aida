@@ -141,7 +141,8 @@ private:
 	 * async rounds. OnDelta streams visible text; OnDone fires once with the final text.
 	 */
 	void RunToolLoop(TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages, FAIDARequester Requester,
-		int32 RoundsLeft, FAIDAOnChunk OnDelta, TFunction<void(const FString&)> OnDone, FAIDAOnError OnError);
+		int32 RoundsLeft, FAIDAOnChunk OnDelta, TFunction<void(const FString&)> OnDone, FAIDAOnError OnError,
+		bool bReadOnly = false);
 
 	/** Assemble the privacy-filtered chat context (one conversation's recent transcript) sent to the LLM. */
 	void BuildChatContext(const FGuid& ConversationId, TArray<FAIDAChatMessage>& OutMessages) const;
@@ -274,6 +275,16 @@ private:
 	UFUNCTION()
 	void OnActionTimer();
 	FTimerHandle ActionTimer;
+
+	//~ P8 Slice 5 standing tasks: a slow poll (60 s) that runs at most ONE due task at a time
+	//~ through the tool loop with Query-tier tools only. Human-created via /aida task commands.
+	void HandleTaskCommand(const FAIDARequester& Requester, const struct FAIDAChatCommand& Command, const FGuid& ConversationId);
+	UFUNCTION()
+	void OnTaskTimer();
+	FTimerHandle TaskTimer;
+	bool bTaskRunning = false;
+	int32 TaskRunsToday = 0;
+	int64 TaskDayStamp = 0; // UTC day number the counter belongs to
 
 	//~ Packaged-game scenario harness (docs/SELFTEST.md): the runner drives Tools/decisions through
 	//~ the same seams the model uses, so it gets friend access instead of a widened public surface.

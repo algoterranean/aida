@@ -3109,6 +3109,38 @@ bool FAIDAChatCommandsTest::RunTest(const FString&)
 	TestTrue(TEXT("rotate -90"), AIDAChatCommands::TryParse(TEXT("/aida rotate -90"), Cmd, Error));
 	TestEqual(TEXT("rotate parsed"), Cmd.RotateDeg, -90);
 
+	// /aida task … (P8 Slice 5 standing tasks).
+	TestTrue(TEXT("task add"), AIDAChatCommands::TryParse(
+		TEXT("/aida task add \"check the coal containers stay above 500\" every 10m"), Cmd, Error));
+	TestTrue(TEXT("task kind"), Cmd.Kind == FAIDAChatCommand::EKind::Task);
+	TestTrue(TEXT("task op add"), Cmd.TaskOp == FAIDAChatCommand::ETaskOp::Add);
+	TestEqual(TEXT("task prompt from quotes"), Cmd.TaskPrompt, TEXT("check the coal containers stay above 500"));
+	TestEqual(TEXT("task interval minutes"), Cmd.TaskIntervalMinutes, 10);
+
+	TestTrue(TEXT("task add hours"), AIDAChatCommands::TryParse(TEXT("/aida task add \"anything wrong?\" every 2h"), Cmd, Error));
+	TestEqual(TEXT("hours -> minutes"), Cmd.TaskIntervalMinutes, 120);
+	TestTrue(TEXT("task add no cadence"), AIDAChatCommands::TryParse(TEXT("/aida task add \"anything wrong?\""), Cmd, Error));
+	TestEqual(TEXT("default cadence 10m"), Cmd.TaskIntervalMinutes, 10);
+
+	TestTrue(TEXT("task add unquoted intercepts"), AIDAChatCommands::TryParse(TEXT("/aida task add check stuff every 5m"), Cmd, Error));
+	TestTrue(TEXT("task add unquoted -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
+	TestFalse(TEXT("task add unquoted has usage"), Error.IsEmpty());
+
+	TestTrue(TEXT("task list"), AIDAChatCommands::TryParse(TEXT("/aida task list"), Cmd, Error));
+	TestTrue(TEXT("task list op"), Cmd.Kind == FAIDAChatCommand::EKind::Task && Cmd.TaskOp == FAIDAChatCommand::ETaskOp::List);
+	TestTrue(TEXT("bare task = list"), AIDAChatCommands::TryParse(TEXT("/aida task"), Cmd, Error));
+	TestTrue(TEXT("bare task op"), Cmd.TaskOp == FAIDAChatCommand::ETaskOp::List);
+
+	TestTrue(TEXT("task rm"), AIDAChatCommands::TryParse(TEXT("/aida task rm 2"), Cmd, Error));
+	TestTrue(TEXT("task rm op"), Cmd.TaskOp == FAIDAChatCommand::ETaskOp::Remove);
+	TestEqual(TEXT("task rm index"), Cmd.TaskIndex, 2);
+	TestTrue(TEXT("task pause"), AIDAChatCommands::TryParse(TEXT("/aida task pause 1"), Cmd, Error));
+	TestTrue(TEXT("task pause op"), Cmd.TaskOp == FAIDAChatCommand::ETaskOp::Pause);
+	TestTrue(TEXT("task resume"), AIDAChatCommands::TryParse(TEXT("/aida task resume 1"), Cmd, Error));
+	TestTrue(TEXT("task resume op"), Cmd.TaskOp == FAIDAChatCommand::ETaskOp::Resume);
+	TestTrue(TEXT("task rm no index intercepts"), AIDAChatCommands::TryParse(TEXT("/aida task rm"), Cmd, Error));
+	TestTrue(TEXT("task rm no index -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
+
 	// Malformed/unknown commands still short-circuit, carrying usage text.
 	TestTrue(TEXT("bad count intercepts"), AIDAChatCommands::TryParse(TEXT("/aida undo zero"), Cmd, Error));
 	TestTrue(TEXT("bad count -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);

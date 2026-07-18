@@ -40,6 +40,13 @@
     "costMode": "central",                        // "central" (deduct vs central storage) | "free"
     "allowDirectFuseReset": true                  // reset_fuse acts immediately; false disables it
   },
+  // P8 standing tasks: "/aida task add \"<prompt>\" every 10m" — recurring READ-ONLY checks that
+  // spend LLM tokens unattended, so they are opt-in and budgeted.
+  "tasks": {
+    "enabled": false,
+    "minIntervalMinutes": 5,                      // floor on every task's interval
+    "maxPerDay": 200                              // global LLM-run budget per UTC day
+  },
   // Phase 5 reference-image uploads. PRIVACY: attached images are sent to the configured LLM
   // provider (that is the feature); "enabled": false is the server admin's off switch.
   "uploads": {

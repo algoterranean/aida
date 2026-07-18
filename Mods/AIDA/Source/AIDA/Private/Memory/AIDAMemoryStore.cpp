@@ -70,6 +70,29 @@ bool AAIDAMemoryStore::MarkUndone(const FGuid& Id)
 	return false;
 }
 
+FGuid AAIDAMemoryStore::AddTask(FAIDAStandingTask Task)
+{
+	if (!Task.Id.IsValid()) { Task.Id = FGuid::NewGuid(); }
+	const FGuid Id = Task.Id;
+	Tasks.Add(MoveTemp(Task));
+	UE_LOG(LogAIDA, Log, TEXT("[memory] standing task added (%s); %d total."), *Id.ToString(EGuidFormats::DigitsWithHyphens), Tasks.Num());
+	return Id;
+}
+
+FAIDAStandingTask* AAIDAMemoryStore::FindTask(const FGuid& Id)
+{
+	for (FAIDAStandingTask& Task : Tasks)
+	{
+		if (Task.Id == Id) { return &Task; }
+	}
+	return nullptr;
+}
+
+bool AAIDAMemoryStore::RemoveTask(const FGuid& Id)
+{
+	return Tasks.RemoveAll([&Id](const FAIDAStandingTask& Task) { return Task.Id == Id; }) > 0;
+}
+
 void AAIDAMemoryStore::PostLoadGame_Implementation(int32 /*saveVersion*/, int32 /*gameVersion*/)
 {
 	// A save that predates AIDA (or a brand-new one) has no session id yet — mint one so the sidecar has
