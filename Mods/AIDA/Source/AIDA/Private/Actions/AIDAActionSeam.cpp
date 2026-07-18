@@ -1192,26 +1192,81 @@ bool FAIDAActionSeam::FindFreePort(UObject* WorldContext, const FVector& CenterC
 	}
 
 	const double RadiusSq = RadiusCm * RadiusCm;
+	// Layered name matching (live-verify: "coal miner" found nothing because the machine is named
+	// "Miner Mk.3"): whole-filter substring beats any-word-token ("coal MINER" → "MINER Mk.3"),
+	// and a matched machine whose ports are all TAKEN resolves to the free open end of the nearest
+	// attachment (its manifold row) — "the miner's output" means the merger row once one exists.
 	const FString WantedName = NormalizeName(NameFilter);
-	AActor* BestActor = nullptr;
-	FVector BestPos = FVector::ZeroVector;
-	FVector BestNormal = FVector::XAxisVector;
-	int32 BestTier = MAX_int32;
-	double BestDistSq = TNumericLimits<double>::Max();
+	TArray<FString> WantedTokens;
+	{
+		TArray<FString> RawTokens;
+		NameFilter.ParseIntoArrayWS(RawTokens);
+		for (const FString& Token : RawTokens)
+		{
+			const FString Normalized = NormalizeName(Token);
+			if (Normalized.Len() >= 3) { WantedTokens.Add(Normalized); }
+		}
+	}
+	// 0 = whole-filter match, 1 = token match, 2 = unmatched (usable only via the attachment
+	// fallback or when no filter was given).
+	const auto MatchRank = [&](AFGBuildable* Buildable) -> int32
+	{
+		if (WantedName.IsEmpty()) { return 0; }
+		const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
+		const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
+		const FString Name = NormalizeName(Products.Num() > 0
+			? DescriptorName(Products[0].ItemClass) : GetNameSafe(Buildable->GetClass()));
+		if (Name.Contains(WantedName)) { return 0; }
+		for (const FString& Token : WantedTokens)
+		{
+			if (Name.Contains(Token)) { return 1; }
+		}
+		return 2;
+	};
+
+	struct FFound
+	{
+		AActor* Actor = nullptr;
+		FVector Pos = FVector::ZeroVector;
+		FVector Normal = FVector::XAxisVector;
+		int32 Tier = MAX_int32;      // attachments beat machines
+		int32 Rank = 2;              // name-match quality
+		double DistSq = TNumericLimits<double>::Max();
+	};
+	FFound Best;                     // best name-matched port (rank, then tier, then distance)
+	FFound BestUnfiltered;           // best port of the right kind regardless of name (fallback anchor pool)
+	AActor* NamedButPortless = nullptr; // best name-matched buildable that has NO free port
+	double NamedButPortlessDistSq = TNumericLimits<double>::Max();
+
 	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
 	{
 		if (!IsValid(Buildable)) { continue; }
 		if (Buildable->IsA<AFGBuildableConveyorBase>() || Buildable->IsA<AFGBuildablePipeBase>()) { continue; }
-		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
-		if (!WantedName.IsEmpty())
-		{
-			const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
-			const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
-			const FString Name = Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Buildable->GetClass());
-			if (!NormalizeName(Name).Contains(WantedName)) { continue; }
-		}
+		const double ActorDistSq = FVector::DistSquared(Buildable->GetActorLocation(), CenterCm);
+		if (ActorDistSq > RadiusSq) { continue; }
+		const int32 Rank = MatchRank(Buildable);
 		const int32 Tier = (Buildable->IsA<AFGBuildableConveyorAttachment>() || Buildable->IsA<AFGBuildablePipelineAttachment>()) ? 0 : 1;
 
+		bool bAnyFreePort = false;
+		const auto Consider = [&](const FVector& Pos, const FVector& Normal)
+		{
+			bAnyFreePort = true;
+			const double DistSq = FVector::DistSquared(Pos, CenterCm);
+			const auto Better = [&](const FFound& Current, int32 UseRank) -> bool
+			{
+				if (UseRank != Current.Rank) { return UseRank < Current.Rank; }
+				if (Tier != Current.Tier) { return Tier < Current.Tier; }
+				return DistSq < Current.DistSq;
+			};
+			if (Rank < 2 && Better(Best, Rank))
+			{
+				Best = { Buildable, Pos, Normal, Tier, Rank, DistSq };
+			}
+			if (Better(BestUnfiltered, 0))
+			{
+				BestUnfiltered = { Buildable, Pos, Normal, Tier, 0, DistSq };
+			}
+		};
 		if (!bPipe)
 		{
 			TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
@@ -1223,15 +1278,7 @@ bool FAIDAActionSeam::FindFreePort(UObject* WorldContext, const FVector& CenterC
 				const bool bMatches = Dir == EFactoryConnectionDirection::FCD_ANY
 					|| (bOutput ? Dir == EFactoryConnectionDirection::FCD_OUTPUT : Dir == EFactoryConnectionDirection::FCD_INPUT);
 				if (!bMatches) { continue; }
-				const double DistSq = FVector::DistSquared(Conn->GetConnectorLocation(), CenterCm);
-				if (Tier < BestTier || (Tier == BestTier && DistSq < BestDistSq))
-				{
-					BestTier = Tier;
-					BestDistSq = DistSq;
-					BestActor = Buildable;
-					BestPos = Conn->GetConnectorLocation();
-					BestNormal = Conn->GetConnectorNormal();
-				}
+				Consider(Conn->GetConnectorLocation(), Conn->GetConnectorNormal());
 			}
 		}
 		else
@@ -1245,20 +1292,42 @@ bool FAIDAActionSeam::FindFreePort(UObject* WorldContext, const FVector& CenterC
 				const bool bMatches = Kind == EPipeConnectionType::PCT_ANY
 					|| (bOutput ? Kind == EPipeConnectionType::PCT_PRODUCER : Kind == EPipeConnectionType::PCT_CONSUMER);
 				if (!bMatches) { continue; }
-				const double DistSq = FVector::DistSquared(Conn->GetConnectorLocation(), CenterCm);
-				if (Tier < BestTier || (Tier == BestTier && DistSq < BestDistSq))
-				{
-					BestTier = Tier;
-					BestDistSq = DistSq;
-					BestActor = Buildable;
-					BestPos = Conn->GetConnectorLocation();
-					BestNormal = Conn->GetConnectorNormal();
-				}
+				Consider(Conn->GetConnectorLocation(), Conn->GetConnectorNormal());
 			}
+		}
+		if (!bAnyFreePort && Rank < 2 && !WantedName.IsEmpty() && ActorDistSq < NamedButPortlessDistSq)
+		{
+			NamedButPortless = Buildable;
+			NamedButPortlessDistSq = ActorDistSq;
+		}
+	}
+
+	AActor* BestActor = Best.Actor;
+	FVector BestPos = Best.Pos;
+	FVector BestNormal = Best.Normal;
+	if (!BestActor && NamedButPortless && BestUnfiltered.Actor)
+	{
+		// The named machine is there but every matching port is taken — its manifold's open end
+		// (the nearest free attachment port within ~15 m of it) IS "its" port now.
+		const double NearSq = FMath::Square(1500.0);
+		if (BestUnfiltered.Tier == 0
+			&& FVector::DistSquared(BestUnfiltered.Actor->GetActorLocation(), NamedButPortless->GetActorLocation()) <= NearSq)
+		{
+			BestActor = BestUnfiltered.Actor;
+			BestPos = BestUnfiltered.Pos;
+			BestNormal = BestUnfiltered.Normal;
+			UE_LOG(LogAIDA, Log, TEXT("[actions] connect: '%s' ports are taken — using the manifold open end on %s beside it."),
+				*NameFilter, *GetNameSafe(BestActor));
 		}
 	}
 	if (!BestActor)
 	{
+		if (NamedButPortless)
+		{
+			OutError = FString::Printf(TEXT("found a match for '%s' but every %s %s port on it is already connected, and no manifold open end sits beside it"),
+				*NameFilter, bPipe ? TEXT("pipe") : TEXT("belt"), bOutput ? TEXT("output") : TEXT("input"));
+			return false;
+		}
 		OutError = FString::Printf(TEXT("no free %s %s port%s within %.0f m of that point"),
 			bPipe ? TEXT("pipe") : TEXT("belt"), bOutput ? TEXT("output") : TEXT("input"),
 			NameFilter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" on anything matching '%s'"), *NameFilter),
