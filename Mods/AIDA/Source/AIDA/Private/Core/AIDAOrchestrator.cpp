@@ -171,6 +171,17 @@ namespace
 		"one — NEVER ask for a direction or a location). ALWAYS use this when the player asks to "
 		"extend/continue/grow existing foundations, a floor, or a platform — never propose_build.\n"
 		"- propose_dismantle(selector): same flow for removing buildables near a point.\n"
+		"- propose_set_clocks(selector?, percent? | advised:true): change machine clock speeds in place "
+		"(approval-gated, undoable). 'underclock what you recommended' = one call with advised:true; a "
+		"specific percent (1-100) applies to every machine the selector matches. Above 100% is not "
+		"supported yet (power shards).\n"
+		"- propose_set_recipe(selector?, recipe, force?): retask manufacturers to a different production "
+		"recipe. Machines with items inside are skipped unless force:true, which DESTROYS their contents "
+		"— warn the player before proposing force. Use when the player says to switch/change what "
+		"machines make.\n"
+		"- propose_upgrade_belts(selector?, targetMk): upgrade (or downgrade) conveyor belts to a mark, "
+		"preserving connections and items. Use for 'upgrade these belts / all belts within X m to Mk.N'. "
+		"Each new belt's cost is charged as built.\n"
 		"- propose_power(spec): wire EXISTING machines to electricity — poles beside them, power lines, "
 		"and a tie to the nearest powered grid. Use when the player asks to power/wire up machines that "
 		"are already built ('connect to power', 'wire it up'). Omit spec.center to wire what they're "
@@ -2740,6 +2751,319 @@ void UAIDAOrchestrator::RegisterActionTools()
 				DryRun.bAffordable, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
 		}
 	});
+
+	// P8 Slice 2 in-place mutations: propose -> approve -> mutate, journaled as before/after
+	// values (undo restores). No placements, so no ghost — the summary is the preview.
+	{
+		// Selector parsing + center defaulting shared by the three mutation tools.
+		const auto ParseMutationSelector = [this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx,
+			FAIDADismantleSpec& OutSelector, FString& OutError) -> bool
+		{
+			const TSharedPtr<FJsonObject>* SelectorObj = nullptr;
+			Args->TryGetObjectField(TEXT("selector"), SelectorObj);
+			if (!AIDAActionSpec::ParseDismantleSpec(SelectorObj ? *SelectorObj : nullptr,
+				Config.Actions.MaxProposalItems, OutSelector, OutError))
+			{
+				return false;
+			}
+			if (!OutSelector.bHasCenter)
+			{
+				FVector AimCm;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm))
+				{
+					OutSelector.CenterM = AimCm / 100.0;
+				}
+				else if (Ctx.bHasLocation)
+				{
+					OutSelector.CenterM = Ctx.Location / 100.0;
+				}
+				else
+				{
+					OutError = TEXT("couldn't resolve the requesting player's aim or position — pass an explicit 'center' {x,y in metres}");
+					return false;
+				}
+				OutSelector.bHasCenter = true; // the struct is stored on the proposal — no JSON write-back needed
+			}
+			return true;
+		};
+		// Store + publish + announce, shared tail. Returns the tool result JSON.
+		const auto StoreMutationProposal = [this](FAIDAProposal&& Proposal, const FAIDAToolContext& Ctx,
+			const FGuid& ReplaceId, const FString& Warning) -> FAIDAToolResult
+		{
+			Proposal.Id = FGuid::NewGuid();
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			if (ReplaceId.IsValid())
+			{
+				SupersedeProposal(ReplaceId);
+			}
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s. Awaiting approval."),
+				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""), *Proposal.Summary);
+			if (!Warning.IsEmpty()) { Announce += FString::Printf(TEXT(" NOTE: %s"), *Warning); }
+			AnnounceSystem(Announce);
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetStringField(TEXT("proposalId"), Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens));
+			Root->SetNumberField(TEXT("targets"), Proposal.TargetCount);
+			Root->SetStringField(TEXT("summary"), Proposal.Summary);
+			Root->SetNumberField(TEXT("expiresInSeconds"), Config.Actions.TtlSeconds);
+			if (!Warning.IsEmpty()) { Root->SetStringField(TEXT("note"), Warning); }
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+		};
+		// replaceProposalId validation, shared (mirrors propose_build).
+		const auto ParseReplaceId = [this](const TSharedRef<FJsonObject>& Args, FGuid& OutReplaceId, FString& OutError) -> bool
+		{
+			FString ReplaceIdStr;
+			Args->TryGetStringField(TEXT("replaceProposalId"), ReplaceIdStr);
+			if (ReplaceIdStr.TrimStartAndEnd().IsEmpty()) { return true; }
+			const FAIDAProposal* Replaced = FGuid::Parse(ReplaceIdStr.TrimStartAndEnd(), OutReplaceId)
+				? Actions.Store().Find(OutReplaceId) : nullptr;
+			if (!Replaced || Replaced->State != EAIDAProposalState::Pending)
+			{
+				OutError = TEXT("replaceProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status");
+				return false;
+			}
+			return true;
+		};
+
+		Tools.Register({
+			TEXT("propose_set_clocks"),
+			TEXT("PROPOSE changing machine clock speeds (SetPendingPotential). Two modes: (1) selector + percent — every matching machine gets that clock; (2) {advised:true} — apply get_clock_advice's per-machine recommendations exactly ('underclock what you recommended' = one call). v1 caps at 100% (overclocking needs power shards — not handled yet). Selector: {buildable?: name substring, center?: {x,y,z metres}, radiusM, maxCount?} — OMIT center to use the player's aim/position, never ask for coordinates. Nothing changes until approved; undo restores the previous clocks. Returns targets + proposalId (no ghost — the summary is the preview). REVISING: pass replaceProposalId."),
+			TEXT(R"({"type":"object","properties":{"selector":{"type":"object","description":"{buildable?, center?:{x,y,z metres}, radiusM, maxCount?} — machines to re-clock (ignored when advised:true)."},"percent":{"type":"number","description":"Target clock percent, 1-100."},"advised":{"type":"boolean","description":"true = apply the live get_clock_advice recommendations (per-machine percents)."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises."}},"required":[]})"),
+			EAIDAToolTier::Act,
+			[this, ParseMutationSelector, StoreMutationProposal, ParseReplaceId](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+			{
+				SweepProposals();
+				FGuid ReplaceId;
+				FString Error;
+				if (!ParseReplaceId(Args, ReplaceId, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+
+				FAIDAProposal Proposal;
+				Proposal.MutationKind = EAIDAMutationKind::Clock;
+
+				bool bAdvised = false;
+				Args->TryGetBoolField(TEXT("advised"), bAdvised);
+				if (bAdvised)
+				{
+					UWorld* World = GetWorld();
+					const double Now = World ? World->GetTimeSeconds() : 0.0;
+					const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+					const FAIDAClockAdviceReport Advice = FAIDAFactoryAggregator::BuildClockAdvice(Snapshot.Machines);
+					if (Advice.Advice.Num() == 0)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("no underclock advice right now — every producer is either busy or already tuned"), {}));
+					}
+					// Advice rows are snapshot data — bind each to its live actor by location now;
+					// approve re-checks the weak ptrs (dead machines just drop out).
+					AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+					if (!Subsystem)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(TEXT("no buildables to search"), {}));
+					}
+					for (const FAIDAClockAdvice& Entry : Advice.Advice)
+					{
+						for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+						{
+							AFGBuildableFactory* Factory = Cast<AFGBuildableFactory>(Buildable);
+							if (!Factory || !Factory->GetCanChangePotential()) { continue; }
+							if (!Factory->GetActorLocation().Equals(Entry.Location, 100.0)) { continue; }
+							FAIDAMutationTarget Target;
+							Target.Actor = Factory;
+							Target.Detail = Entry.BuildingClass;
+							Target.ClockPct = FMath::Clamp(static_cast<double>(Entry.SuggestedClock) * 100.0, 1.0, 100.0);
+							Proposal.MutationAdvised.Add(MoveTemp(Target));
+							break;
+						}
+					}
+					if (Proposal.MutationAdvised.Num() == 0)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("couldn't bind the advice to live machines — re-run get_clock_advice and try again"), {}));
+					}
+					Proposal.TargetCount = Proposal.MutationAdvised.Num();
+					Proposal.Summary = FString::Printf(TEXT("underclock %d machine(s) as advised (saves ~%.0f MW)"),
+						Proposal.TargetCount, Advice.TotalSavableMW);
+				}
+				else
+				{
+					double Percent = 0.0;
+					if (!Args->TryGetNumberField(TEXT("percent"), Percent))
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("pass percent (1-100) or advised:true"), {}));
+					}
+					if (Percent > 100.0)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("clocks above 100% need power shards — not supported yet; use 1-100"), {}));
+					}
+					Proposal.MutationClockPct = FMath::Clamp(Percent, 1.0, 100.0);
+
+					if (!ParseMutationSelector(Args, Ctx, Proposal.MutationSelector, Error))
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+					}
+					TArray<FAIDAMutationTarget> Targets;
+					if (!FAIDAActionSeam::ResolveMutationTargets(this, EAIDAMutationKind::Clock,
+						Proposal.MutationSelector, FString(), Targets, Error))
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+					}
+					if (Targets.Num() == 0)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("no machine with an adjustable clock matches the selector"), {}));
+					}
+					Proposal.TargetCount = Targets.Num();
+					Proposal.Summary = FString::Printf(TEXT("set the clock to %.4g%% on %d machine(s)%s%s"),
+						Proposal.MutationClockPct, Targets.Num(),
+						Proposal.MutationSelector.Buildable.IsEmpty() ? TEXT("") : TEXT(" matching "),
+						*Proposal.MutationSelector.Buildable);
+				}
+				Proposal.SpecJson = TEXT("{\"tool\":\"propose_set_clocks\"}");
+				return StoreMutationProposal(MoveTemp(Proposal), Ctx, ReplaceId, FString());
+			}
+		});
+
+		Tools.Register({
+			TEXT("propose_set_recipe"),
+			TEXT("PROPOSE changing what machines produce (SetRecipe on manufacturers). Selector: {buildable?: machine name substring, center?: {x,y,z metres}, radiusM, maxCount?} — OMIT center to use the player's aim/position; never ask for coordinates. recipe = the production recipe's display name (alternates work when unlocked). Machines already running that recipe are excluded. Machines with items inside are SKIPPED unless force:true — force DESTROYS their contents (say so before proposing it). Nothing changes until approved; undo restores each machine's previous recipe. Returns targets + proposalId. REVISING: pass replaceProposalId."),
+			TEXT(R"({"type":"object","properties":{"selector":{"type":"object","description":"{buildable?, center?:{x,y,z metres}, radiusM, maxCount?} — the machines to retask."},"recipe":{"type":"string","description":"Production recipe display name (e.g. \"Iron Plate\", \"Alternate: Cast Screw\")."},"force":{"type":"boolean","description":"true = machines with items get their contents DESTROYED instead of being skipped."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises."}},"required":["recipe"]})"),
+			EAIDAToolTier::Act,
+			[this, ParseMutationSelector, StoreMutationProposal, ParseReplaceId](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+			{
+				SweepProposals();
+				FGuid ReplaceId;
+				FString Error;
+				if (!ParseReplaceId(Args, ReplaceId, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+
+				FString RecipeName;
+				Args->TryGetStringField(TEXT("recipe"), RecipeName);
+				FString RecipePath, RecipeDisplay;
+				TArray<FString> Suggestions;
+				if (!FAIDAActionSeam::ResolveProductionRecipe(this, RecipeName, RecipePath, RecipeDisplay, Suggestions))
+				{
+					FString Msg = FString::Printf(TEXT("no available production recipe matches '%s'"), *RecipeName);
+					if (Suggestions.Num() > 0)
+					{
+						Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Suggestions, TEXT(", ")));
+					}
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+				}
+
+				FAIDAProposal Proposal;
+				Proposal.MutationKind = EAIDAMutationKind::Recipe;
+				Proposal.MutationRecipePath = RecipePath;
+				Proposal.MutationRecipeName = RecipeDisplay;
+				Args->TryGetBoolField(TEXT("force"), Proposal.bMutationForce);
+				if (!ParseMutationSelector(Args, Ctx, Proposal.MutationSelector, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+
+				TArray<FAIDAMutationTarget> Targets;
+				if (!FAIDAActionSeam::ResolveMutationTargets(this, EAIDAMutationKind::Recipe,
+					Proposal.MutationSelector, RecipePath, Targets, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+				if (Targets.Num() == 0)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("no manufacturer matches the selector (machines already on that recipe are excluded)"), {}));
+				}
+				int32 WithContents = 0;
+				for (const FAIDAMutationTarget& Target : Targets)
+				{
+					if (Target.bHasContents) { ++WithContents; }
+				}
+				Proposal.TargetCount = Targets.Num();
+				Proposal.Summary = FString::Printf(TEXT("set %d machine(s) to the %s recipe"), Targets.Num(), *RecipeDisplay);
+				FString Warning;
+				if (WithContents > 0)
+				{
+					Warning = Proposal.bMutationForce
+						? FString::Printf(TEXT("%d machine(s) have items inside — approving DESTROYS those contents."), WithContents)
+						: FString::Printf(TEXT("%d machine(s) have items inside and will be SKIPPED (re-propose with force:true to destroy their contents)."), WithContents);
+				}
+				Proposal.SpecJson = TEXT("{\"tool\":\"propose_set_recipe\"}");
+				return StoreMutationProposal(MoveTemp(Proposal), Ctx, ReplaceId, Warning);
+			}
+		});
+
+		Tools.Register({
+			TEXT("propose_upgrade_belts"),
+			TEXT("PROPOSE upgrading (or downgrading) conveyor belts to a target mark via the game's own upgrade path — connections and items in transit are preserved. Selector: {buildable?: e.g. 'Mk.1' to only touch that mark, center?: {x,y,z metres}, radiusM, maxCount?} — OMIT center to use the player's aim/position; never ask for coordinates. targetMk 1-6 picks the belt tier (must be unlocked). Belts already at the target are excluded. Cost = each new belt's length-scaled cost, charged as built at execute (unaffordable belts are skipped and reported). Nothing changes until approved; undo drives the same path back to each belt's previous mark. Returns targets + proposalId. REVISING: pass replaceProposalId."),
+			TEXT(R"({"type":"object","properties":{"selector":{"type":"object","description":"{buildable?, center?:{x,y,z metres}, radiusM, maxCount?} — the belts to upgrade."},"targetMk":{"type":"number","description":"Target conveyor belt mark, 1-6."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises."}},"required":["targetMk"]})"),
+			EAIDAToolTier::Act,
+			[this, ParseMutationSelector, StoreMutationProposal, ParseReplaceId](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+			{
+				SweepProposals();
+				FGuid ReplaceId;
+				FString Error;
+				if (!ParseReplaceId(Args, ReplaceId, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+
+				double TargetMk = 0.0;
+				Args->TryGetNumberField(TEXT("targetMk"), TargetMk);
+				const int32 Mk = FMath::RoundToInt32(TargetMk);
+				if (Mk < 1 || Mk > 6)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(TEXT("targetMk must be 1-6"), {}));
+				}
+				FAIDARecipeResolution Belt;
+				if (!FAIDAActionSeam::ResolveBuildRecipe(this, FString::Printf(TEXT("Conveyor Belt Mk.%d"), Mk), Belt))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						FString::Printf(TEXT("Conveyor Belt Mk.%d is not unlocked yet"), Mk), {}));
+				}
+
+				FAIDAProposal Proposal;
+				Proposal.MutationKind = EAIDAMutationKind::BeltMk;
+				Proposal.MutationBeltRecipePath = Belt.RecipeClassPath;
+				Proposal.MutationBeltName = Belt.DisplayName;
+				if (!ParseMutationSelector(Args, Ctx, Proposal.MutationSelector, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+
+				TArray<FAIDAMutationTarget> Targets;
+				if (!FAIDAActionSeam::ResolveMutationTargets(this, EAIDAMutationKind::BeltMk,
+					Proposal.MutationSelector, Proposal.MutationBeltRecipePath, Targets, Error))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+				}
+				if (Targets.Num() == 0)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("no belt matches the selector (belts already at that mark are excluded)"), {}));
+				}
+				Proposal.TargetCount = Targets.Num();
+				Proposal.Summary = FString::Printf(TEXT("upgrade %d belt(s) to %s (length-scaled cost charged per belt at execute)"),
+					Targets.Num(), *Belt.DisplayName);
+				Proposal.SpecJson = TEXT("{\"tool\":\"propose_upgrade_belts\"}");
+				return StoreMutationProposal(MoveTemp(Proposal), Ctx, ReplaceId, FString());
+			}
+		});
+	}
 
 	// propose_dismantle: resolve live targets (count + refund) and store Pending. Targets are
 	// re-resolved at execute time (Slice 2) — never trusted from this dry-run.

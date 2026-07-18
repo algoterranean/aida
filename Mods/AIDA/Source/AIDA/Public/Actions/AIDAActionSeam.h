@@ -152,6 +152,49 @@ public:
 	static bool ResolveDismantleTargets(UObject* WorldContext, const FAIDADismantleSpec& Selector, FAIDADismantleResolution& Out);
 
 	/**
+	 * P8 Slice 2: live targets for an in-place mutation, matched like the dismantle resolver
+	 * (display name substring + radius + MaxCount). Clock → factories that can change potential;
+	 * Recipe → manufacturers not already running TargetRecipePath (bHasContents flags items in
+	 * flight); BeltMk → conveyor belts not already built with TargetRecipePath. Called at dry-run
+	 * for the report and AGAIN at approve — never trusted across the gap.
+	 */
+	static bool ResolveMutationTargets(UObject* WorldContext, EAIDAMutationKind Kind,
+		const FAIDADismantleSpec& Selector, const FString& TargetRecipePath,
+		TArray<FAIDAMutationTarget>& Out, FString& OutError);
+
+	/** Set a factory's pending potential (percent). OutBeforePct = the previous pending percent. */
+	static bool ApplyClockMutation(AActor* Target, double Pct, double& OutBeforePct);
+
+	/**
+	 * Set a manufacturer's recipe. Machines with items in flight are refused unless bForce, which
+	 * EMPTIES both inventories first (contents destroyed — surfaced before approval). An empty
+	 * RecipePath clears the recipe (the undo path for machines that had none).
+	 */
+	static bool ApplyRecipeMutation(UObject* WorldContext, AActor* Target, const FString& RecipePath,
+		bool bForce, FString& OutBeforePath, FString& OutError);
+
+	/**
+	 * Upgrade (or downgrade) one conveyor belt to TargetRecipePath via the game's own path: the
+	 * target-mk belt hologram's TryUpgrade + Construct. Cost is the hologram's length-scaled tally,
+	 * charged as built when bChargeCost. OutNewEncodedId identifies the REPLACEMENT belt actor —
+	 * undo re-resolves it and runs the same call back toward OutBeforePath.
+	 */
+	static bool ApplyBeltUpgrade(UObject* WorldContext, AActor* BeltActor, const FString& TargetRecipePath,
+		bool bChargeCost, const FString& PayerPlayerId, TArray<FAIDACostItem>& OutCharged,
+		FString& OutBeforePath, FString& OutNewEncodedId, FString& OutError);
+
+	/** Re-resolve a mutation journal entity to its live actor (class + transform epsilon). */
+	static AActor* ResolveMutationActor(UObject* WorldContext, const FAIDAEntityId& Entity);
+
+	/**
+	 * Resolve a display name to an AVAILABLE production recipe (one produced in a manufacturer —
+	 * not a build-gun recipe). Exact match wins, then unique substring; on failure returns false
+	 * with close matches in OutSuggestions. Alternate recipes resolve too when unlocked.
+	 */
+	static bool ResolveProductionRecipe(UObject* WorldContext, const FString& DisplayName,
+		FString& OutRecipePath, FString& OutDisplayName, TArray<FString>& OutSuggestions);
+
+	/**
 	 * Deduct a tallied cost upfront (docs/PHASE4.md §3 — one failure point; a mid-run change can't
 	 * strand a half-built grid). Draws from central storage FIRST, then the payer's inventory when
 	 * PayerPlayerId names a reachable player (the game's own build gun pulls from pockets too).

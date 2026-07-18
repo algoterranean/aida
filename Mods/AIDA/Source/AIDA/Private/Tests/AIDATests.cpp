@@ -2712,6 +2712,65 @@ bool FAIDAActionsWallRecipeCandidatesTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsMutationJsonTest, "AIDA.Actions.MutationJson",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsMutationJsonTest::RunTest(const FString&)
+{
+	// Round-trip each kind: what execute journals is exactly what undo reads back.
+	{
+		TArray<FAIDAMutationChange> Changes;
+		Changes.Add({ TEXT("actor|/Game/X.Constructor_C|100,200,300|90"), TEXT("100"), TEXT("65.5") });
+		Changes.Add({ TEXT("actor|/Game/X.Smelter_C|400,500,600|0"), TEXT("50"), TEXT("65.5") });
+		const FString Json = AIDAActionSpec::BuildMutationJson(EAIDAMutationKind::Clock, Changes);
+
+		EAIDAMutationKind Kind = EAIDAMutationKind::None;
+		TArray<FAIDAMutationChange> Parsed;
+		TestTrue(TEXT("clock payload parses"), AIDAActionSpec::ParseMutationJson(Json, Kind, Parsed));
+		TestTrue(TEXT("clock kind survives"), Kind == EAIDAMutationKind::Clock);
+		if (TestEqual(TEXT("both changes survive"), Parsed.Num(), 2))
+		{
+			TestEqual(TEXT("entity survives"), Parsed[0].EncodedEntity, Changes[0].EncodedEntity);
+			TestEqual(TEXT("before survives"), Parsed[0].Before, TEXT("100"));
+			TestEqual(TEXT("after survives"), Parsed[1].After, TEXT("65.5"));
+		}
+	}
+	{
+		TArray<FAIDAMutationChange> Changes;
+		Changes.Add({ TEXT("actor|/Game/X.Assembler_C|0,0,0|0"), TEXT("/Game/R/A.A_C"), TEXT("/Game/R/B.B_C") });
+		const FString Json = AIDAActionSpec::BuildMutationJson(EAIDAMutationKind::Recipe, Changes);
+		EAIDAMutationKind Kind = EAIDAMutationKind::None;
+		TArray<FAIDAMutationChange> Parsed;
+		TestTrue(TEXT("recipe payload parses"), AIDAActionSpec::ParseMutationJson(Json, Kind, Parsed));
+		TestTrue(TEXT("recipe kind survives"), Kind == EAIDAMutationKind::Recipe);
+		TestEqual(TEXT("recipe change survives"), Parsed.Num(), 1);
+	}
+	{
+		// An EMPTY before (machine had no recipe) must survive — undo clears the recipe with it.
+		TArray<FAIDAMutationChange> Changes;
+		Changes.Add({ TEXT("actor|/Game/X.Belt_C|1,2,3|45"), FString(), TEXT("/Game/R/Mk5.Mk5_C") });
+		const FString Json = AIDAActionSpec::BuildMutationJson(EAIDAMutationKind::BeltMk, Changes);
+		EAIDAMutationKind Kind = EAIDAMutationKind::None;
+		TArray<FAIDAMutationChange> Parsed;
+		TestTrue(TEXT("belt payload parses"), AIDAActionSpec::ParseMutationJson(Json, Kind, Parsed));
+		TestTrue(TEXT("belt kind survives"), Kind == EAIDAMutationKind::BeltMk);
+		if (TestEqual(TEXT("belt change survives"), Parsed.Num(), 1))
+		{
+			TestTrue(TEXT("empty before survives"), Parsed[0].Before.IsEmpty());
+		}
+	}
+
+	// Garbage and non-mutation payloads are refused, not misread.
+	{
+		EAIDAMutationKind Kind = EAIDAMutationKind::None;
+		TArray<FAIDAMutationChange> Parsed;
+		TestTrue(TEXT("empty string refused"), !AIDAActionSpec::ParseMutationJson(FString(), Kind, Parsed));
+		TestTrue(TEXT("non-json refused"), !AIDAActionSpec::ParseMutationJson(TEXT("not json"), Kind, Parsed));
+		TestTrue(TEXT("unknown kind refused"), !AIDAActionSpec::ParseMutationJson(TEXT("{\"kind\":\"paint\",\"changes\":[]}"), Kind, Parsed));
+		TestTrue(TEXT("missing changes refused"), !AIDAActionSpec::ParseMutationJson(TEXT("{\"kind\":\"clock\"}"), Kind, Parsed));
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsPowerPlanTest, "AIDA.Actions.PowerPlan",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAActionsPowerPlanTest::RunTest(const FString&)

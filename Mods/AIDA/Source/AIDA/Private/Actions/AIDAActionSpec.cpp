@@ -916,6 +916,61 @@ TArray<FString> AIDAActionSpec::WallRecipeCandidatesForFoundation(const FString&
 	return Candidates;
 }
 
+FString AIDAActionSpec::BuildMutationJson(EAIDAMutationKind Kind, const TArray<FAIDAMutationChange>& Changes)
+{
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	switch (Kind)
+	{
+	case EAIDAMutationKind::Clock:  Root->SetStringField(TEXT("kind"), TEXT("clock")); break;
+	case EAIDAMutationKind::Recipe: Root->SetStringField(TEXT("kind"), TEXT("recipe")); break;
+	case EAIDAMutationKind::BeltMk: Root->SetStringField(TEXT("kind"), TEXT("belt")); break;
+	default:                        Root->SetStringField(TEXT("kind"), TEXT("none")); break;
+	}
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const FAIDAMutationChange& Change : Changes)
+	{
+		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("id"), Change.EncodedEntity);
+		O->SetStringField(TEXT("before"), Change.Before);
+		O->SetStringField(TEXT("after"), Change.After);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("changes"), Arr);
+	return AIDAToCompactJson(Root);
+}
+
+bool AIDAActionSpec::ParseMutationJson(const FString& Json, EAIDAMutationKind& OutKind, TArray<FAIDAMutationChange>& OutChanges)
+{
+	OutKind = EAIDAMutationKind::None;
+	OutChanges.Reset();
+	if (Json.TrimStartAndEnd().IsEmpty()) { return false; }
+
+	TSharedPtr<FJsonObject> Root;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid()) { return false; }
+
+	FString Kind;
+	Root->TryGetStringField(TEXT("kind"), Kind);
+	if (Kind == TEXT("clock")) { OutKind = EAIDAMutationKind::Clock; }
+	else if (Kind == TEXT("recipe")) { OutKind = EAIDAMutationKind::Recipe; }
+	else if (Kind == TEXT("belt")) { OutKind = EAIDAMutationKind::BeltMk; }
+	else { return false; }
+
+	const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+	if (!Root->TryGetArrayField(TEXT("changes"), Arr)) { return false; }
+	for (const TSharedPtr<FJsonValue>& Value : *Arr)
+	{
+		const TSharedPtr<FJsonObject>* O = nullptr;
+		if (!Value.IsValid() || !Value->TryGetObject(O) || !O->IsValid()) { continue; }
+		FAIDAMutationChange Change;
+		(*O)->TryGetStringField(TEXT("id"), Change.EncodedEntity);
+		(*O)->TryGetStringField(TEXT("before"), Change.Before);
+		(*O)->TryGetStringField(TEXT("after"), Change.After);
+		if (!Change.EncodedEntity.IsEmpty()) { OutChanges.Add(MoveTemp(Change)); }
+	}
+	return true;
+}
+
 FString AIDAActionSpec::CompassName(const FVector& Dir)
 {
 	// Game convention (AIDAChatCommands): north = -Y, east = +X. 8-way, 45° sectors.

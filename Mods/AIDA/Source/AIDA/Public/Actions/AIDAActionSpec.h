@@ -86,6 +86,12 @@ namespace AIDAActionSpec
 	 */
 	TArray<FString> WallRecipeCandidatesForFoundation(const FString& FoundationRecipePath);
 
+	/** Serialize a mutation journal payload (P8 Slice 2): {kind, changes:[{id, before, after}]}. */
+	FString BuildMutationJson(EAIDAMutationKind Kind, const TArray<FAIDAMutationChange>& Changes);
+
+	/** Parse a mutation journal payload back. False = not a valid mutation payload. */
+	bool ParseMutationJson(const FString& Json, EAIDAMutationKind& OutKind, TArray<FAIDAMutationChange>& OutChanges);
+
 	/**
 	 * Parse + validate a propose_power spec: version 1, everything optional — buildable filter,
 	 * pole override, center (omitted = requester's aim), radiusM (default 30), maxCount (0 = all,

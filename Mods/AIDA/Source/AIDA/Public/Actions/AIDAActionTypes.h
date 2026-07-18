@@ -354,6 +354,33 @@ struct FAIDADismantleHandle
 	FString EncodedId;
 };
 
+/** Kind of an in-place mutation proposal (P8 Slice 2). None = not a mutation proposal. */
+enum class EAIDAMutationKind : uint8
+{
+	None,
+	Clock,   // SetPendingPotential on producers
+	Recipe,  // SetRecipe on manufacturers
+	BeltMk   // upgrade/downgrade conveyor belts via the game's TryUpgrade hologram path
+};
+
+/** One journaled mutation change: the entity touched and its before/after values. Values are
+ *  strings — clock percents print as numbers, recipe/belt changes carry recipe class paths. */
+struct FAIDAMutationChange
+{
+	FString EncodedEntity;
+	FString Before;
+	FString After;
+};
+
+/** One live mutation target resolved from a selector (P8 Slice 2) — re-resolved at approve. */
+struct FAIDAMutationTarget
+{
+	TWeakObjectPtr<AActor> Actor;
+	FString Detail;                  // display/class name for reports
+	double ClockPct = 100.0;         // Clock: per-target percent (advised mode varies per machine)
+	bool bHasContents = false;       // Recipe: items in flight at resolve time (skipped unless force)
+};
+
 /**
  * A stored proposal (docs/PHASE4.md §2c). Server-side and in-memory only — a restart voids pending
  * proposals (TTL is 10 min; approval must reference live server state); only the journal persists.
@@ -428,6 +455,20 @@ struct FAIDAProposal
 	//  count + upfront cost reuse the build paths); Targets carry the containers and their texts.
 	bool bLabel = false;
 	TArray<FAIDALabelTarget> LabelTargets; // index-aligned with Placements
+
+	//~ In-place mutation extensions (P8 Slice 2). No placements, no ghosts: targets re-resolve at
+	//  approve from the stored selector (never trusted from the dry-run), execute journals
+	//  per-entity before/after values (journal MutationJson), undo restores the before values.
+	//  Clock/recipe cost nothing; belt upgrades charge each new belt as built (length-scaled).
+	EAIDAMutationKind MutationKind = EAIDAMutationKind::None;
+	FAIDADismantleSpec MutationSelector;   // reused selector shape; center is always concrete
+	double MutationClockPct = 100.0;       // Clock: the target percent (v1 caps at 100 — no shards)
+	TArray<FAIDAMutationTarget> MutationAdvised; // Clock "as advised": per-machine targets + percents
+	FString MutationRecipePath;            // Recipe: the production recipe to set
+	FString MutationRecipeName;
+	bool bMutationForce = false;           // Recipe: machines with items get their contents destroyed
+	FString MutationBeltRecipePath;        // BeltMk: the target belt recipe
+	FString MutationBeltName;
 
 	//~ Auto-power extensions (docs/PHASE4-POWER.md). Powered builds run phases 0 machines →
 	//  1 poles → 2 wires + grid tie. Empty/false = a plain (or manifold) proposal.

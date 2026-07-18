@@ -61,6 +61,9 @@ struct FAIDAJournalEntry
 	// Phase 4 additions — tagged-property serialization defaults them on saves that predate the field.
 	UPROPERTY(SaveGame) bool bDismantle = false;
 	UPROPERTY(SaveGame) bool bUndone = false;
+	/** P8 Slice 2: non-empty = a mutation entry — {kind, changes:[{id, before, after}]}; undo
+	 *  restores the before values instead of dismantling/rebuilding. */
+	UPROPERTY(SaveGame) FString MutationJson;
 };
 
 /** One item's net production−consumption at snapshot time. */

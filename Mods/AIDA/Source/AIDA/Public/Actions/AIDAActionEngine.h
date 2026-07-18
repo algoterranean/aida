@@ -123,6 +123,14 @@ private:
 	 */
 	bool TickTapOnly(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
 
+	/**
+	 * Advance an in-place mutation (P8 Slice 2): batchPerTick targets per tick — set the clock/
+	 * recipe, or drive one belt upgrade (charged as built). Every applied change records its
+	 * before/after for the journal's MutationJson; failures are counted + reported like manifold
+	 * runs, never fatal. True while more targets remain.
+	 */
+	bool TickMutation(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal);
+
 	/** Splice the tap splitter into the source belt (or claim its free end) into TapSourceActor.
 	 *  False = tap failed (recorded in RunFailures; splitter cost refunded). */
 	bool PrepareTapSource(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAProposal& Proposal);
@@ -144,6 +152,10 @@ private:
 		TArray<FAIDAEntityId> Entities;
 		TArray<TWeakObjectPtr<AActor>> CachedActors;   // in-session fast path (builds only)
 		TArray<FAIDACostItem> Refund;                  // journaled RefundJson (cost to refund / re-deduct)
+		//~ Mutation entries (P8 Slice 2): restore each change's before value instead of
+		//  dismantling/rebuilding. Non-None supersedes the Entities walk.
+		EAIDAMutationKind MutationKind = EAIDAMutationKind::None;
+		TArray<FAIDAMutationChange> MutationRestores;
 		int32 Cursor = 0;
 		int32 Done = 0;
 		int32 Missing = 0;
@@ -158,6 +170,11 @@ private:
 	//~ The executing proposal's scratch state (one at a time).
 	FGuid ExecutingId;
 	TArray<FAIDADismantleHandle> DismantleQueue; // resolved at approval, consumed by Cursor
+	//~ Mutation scratch (P8 Slice 2): targets resolved at approval; applied changes accumulate
+	//  their before/after for the journal, and belt upgrades their charged (as-built) cost.
+	TArray<FAIDAMutationTarget> MutationQueue;
+	TArray<FAIDAMutationChange> MutationChanges;
+	TArray<FAIDACostItem> MutationCharged;
 	TArray<TWeakObjectPtr<AActor>> BuiltActors;
 	TArray<FAIDACostItem> AccruedRefund;
 	int32 SkippedCount = 0;

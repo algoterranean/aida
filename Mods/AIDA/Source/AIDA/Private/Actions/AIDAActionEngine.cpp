@@ -106,6 +106,46 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 		}
 		DismantleQueue = MoveTemp(Handles);
 	}
+	else if (Proposal->MutationKind != EAIDAMutationKind::None)
+	{
+		// Mutation targets re-resolve NOW, like dismantles — the world moved on since the dry-run.
+		// Advised clocks carry their own per-machine targets from propose (weak ptrs; dead = skip).
+		if (Proposal->MutationAdvised.Num() > 0)
+		{
+			MutationQueue.Reset();
+			for (const FAIDAMutationTarget& Target : Proposal->MutationAdvised)
+			{
+				if (Target.Actor.IsValid()) { MutationQueue.Add(Target); }
+			}
+		}
+		else
+		{
+			const FString TargetRecipe = Proposal->MutationKind == EAIDAMutationKind::Recipe
+				? Proposal->MutationRecipePath
+				: (Proposal->MutationKind == EAIDAMutationKind::BeltMk ? Proposal->MutationBeltRecipePath : FString());
+			FString Error;
+			TArray<FAIDAMutationTarget> Targets;
+			FAIDAActionSeam::ResolveMutationTargets(WorldContext, Proposal->MutationKind,
+				Proposal->MutationSelector, TargetRecipe, Targets, Error);
+			for (FAIDAMutationTarget& Target : Targets)
+			{
+				Target.ClockPct = Proposal->MutationClockPct;
+			}
+			MutationQueue = MoveTemp(Targets);
+		}
+		if (MutationQueue.Num() == 0)
+		{
+			ProposalStore.Transition(Id, EAIDAProposalState::Rejected, FDateTime::UtcNow().ToUnixTimestamp());
+			OutMessage = TEXT("nothing left matching the selector — proposal rejected");
+			return false;
+		}
+		if (MutationQueue.Num() != Proposal->TargetCount)
+		{
+			UE_LOG(LogAIDA, Log, TEXT("[actions] mutation target drift: %d at dry-run, %d at approval."),
+				Proposal->TargetCount, MutationQueue.Num());
+		}
+		// No upfront cost: clocks/recipes are free, belt upgrades charge each belt as built.
+	}
 	else if (Config.CostMode == TEXT("central"))
 	{
 		// Pay the whole tally upfront (central storage first, then the REQUESTER's inventory —
@@ -129,11 +169,14 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 	TapSourceActor = nullptr;
 	ChainPrevActor = nullptr;
 	RunFailures.Reset();
+	MutationChanges.Reset();
+	MutationCharged.Reset();
 	SkippedCount = RemovedCount = MissingCount = RunBuiltCount = RunFailCount = 0;
 	Proposal->Cursor = 0;
 	Proposal->Phase = 0;
 
-	const int32 Total = Proposal->bDismantle ? DismantleQueue.Num() : Proposal->Placements.Num();
+	const int32 Total = Proposal->bDismantle ? DismantleQueue.Num()
+		: (Proposal->MutationKind != EAIDAMutationKind::None ? MutationQueue.Num() : Proposal->Placements.Num());
 	OutMessage = FString::Printf(TEXT("approved — %s (%d item(s), batched)"), *Proposal->Summary, Total);
 	UE_LOG(LogAIDA, Log, TEXT("[actions] %s: executing %s"), *Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal->Summary);
 	return true;
@@ -163,7 +206,7 @@ bool FAIDAActionEngine::AdjustPending(UObject* WorldContext, const FAIDAActionsC
 		OutMessage = TEXT("no pending proposal to adjust");
 		return false;
 	}
-	if (Proposal->bDismantle)
+	if (Proposal->bDismantle || Proposal->MutationKind != EAIDAMutationKind::None)
 	{
 		OutMessage = TEXT("only build proposals can be nudged/rotated");
 		return false;
@@ -289,6 +332,10 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 		return false;
 	}
 
+	if (Proposal->MutationKind != EAIDAMutationKind::None)
+	{
+		return TickMutation(WorldContext, Config, Memory, *Proposal);
+	}
 	if (Proposal->bManifold)
 	{
 		return TickManifold(WorldContext, Config, Memory, *Proposal);
@@ -354,6 +401,113 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 	}
 
 	FinishExecution(WorldContext, Config, Memory, *Proposal);
+	return false;
+}
+
+bool FAIDAActionEngine::TickMutation(UObject* WorldContext, const FAIDAActionsConfig& Config, FAIDAMemory& Memory, FAIDAProposal& Proposal)
+{
+	const auto EncodeActor = [](AActor* Actor)
+	{
+		FAIDAEntityId Entity;
+		Entity.Type = TEXT("actor");
+		Entity.ClassPath = Actor->GetClass()->GetPathName();
+		Entity.Pos = Actor->GetActorLocation();
+		Entity.YawDeg = FMath::RoundToInt32(Actor->GetActorRotation().Yaw);
+		return AIDAActionSpec::EncodeEntityId(Entity);
+	};
+	const auto Fail = [this](const FString& Detail, const FString& Reason)
+	{
+		++RunFailCount;
+		if (RunFailures.Num() < 5)
+		{
+			RunFailures.Add(FString::Printf(TEXT("%s: %s"), *Detail, *Reason));
+		}
+	};
+
+	const int32 End = FMath::Min(Proposal.Cursor + FMath::Max(1, Config.BatchPerTick), MutationQueue.Num());
+	for (int32 i = Proposal.Cursor; i < End; ++i)
+	{
+		const FAIDAMutationTarget& Target = MutationQueue[i];
+		AActor* Actor = Target.Actor.Get();
+		if (!Actor)
+		{
+			++MissingCount;
+			continue;
+		}
+
+		FAIDAMutationChange Change;
+		switch (Proposal.MutationKind)
+		{
+		case EAIDAMutationKind::Clock:
+		{
+			double BeforePct = 100.0;
+			if (!FAIDAActionSeam::ApplyClockMutation(Actor, Target.ClockPct, BeforePct))
+			{
+				Fail(Target.Detail, TEXT("can't change this machine's clock"));
+				continue;
+			}
+			Change.EncodedEntity = EncodeActor(Actor);
+			Change.Before = FString::Printf(TEXT("%.4g"), BeforePct);
+			Change.After = FString::Printf(TEXT("%.4g"), Target.ClockPct);
+			break;
+		}
+		case EAIDAMutationKind::Recipe:
+		{
+			FString Before, Error;
+			if (!FAIDAActionSeam::ApplyRecipeMutation(WorldContext, Actor, Proposal.MutationRecipePath,
+				Proposal.bMutationForce, Before, Error))
+			{
+				Fail(Target.Detail, Error);
+				continue;
+			}
+			Change.EncodedEntity = EncodeActor(Actor);
+			Change.Before = Before;
+			Change.After = Proposal.MutationRecipePath;
+			break;
+		}
+		case EAIDAMutationKind::BeltMk:
+		{
+			// The upgrade REPLACES the belt actor — the journal carries the NEW actor's identity so
+			// undo can find it and drive the same path back to the old recipe.
+			TArray<FAIDACostItem> Charged;
+			FString Before, NewId, Error;
+			if (!FAIDAActionSeam::ApplyBeltUpgrade(WorldContext, Actor, Proposal.MutationBeltRecipePath,
+				Config.CostMode == TEXT("central"), Proposal.RequesterId, Charged, Before, NewId, Error))
+			{
+				Fail(Target.Detail, Error);
+				continue;
+			}
+			for (const FAIDACostItem& Item : Charged)
+			{
+				bool bMerged = false;
+				for (FAIDACostItem& Existing : MutationCharged)
+				{
+					if (Existing.ClassPath == Item.ClassPath)
+					{
+						Existing.Amount += Item.Amount;
+						bMerged = true;
+						break;
+					}
+				}
+				if (!bMerged) { MutationCharged.Add(Item); }
+			}
+			Change.EncodedEntity = NewId;
+			Change.Before = Before;
+			Change.After = Proposal.MutationBeltRecipePath;
+			break;
+		}
+		default:
+			continue;
+		}
+
+		Proposal.AffectedEntityIds.Add(Change.EncodedEntity);
+		MutationChanges.Add(MoveTemp(Change));
+		++RunBuiltCount;
+	}
+	Proposal.Cursor = End;
+	if (Proposal.Cursor < MutationQueue.Num()) { return true; }
+
+	FinishExecution(WorldContext, Config, Memory, Proposal);
 	return false;
 }
 
@@ -1085,8 +1239,14 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	Entry.ProposedUtc = Proposal.ProposedUtc;
 	Entry.ExecutedUtc = NowUtc;
 	Entry.AffectedEntityIds = Proposal.AffectedEntityIds;
-	Entry.RefundJson = AIDAActionSpec::CostItemsToJson(Proposal.bDismantle ? AccruedRefund : Proposal.Cost);
+	Entry.RefundJson = AIDAActionSpec::CostItemsToJson(
+		Proposal.MutationKind != EAIDAMutationKind::None ? MutationCharged
+		: (Proposal.bDismantle ? AccruedRefund : Proposal.Cost));
 	Entry.bDismantle = Proposal.bDismantle;
+	if (Proposal.MutationKind != EAIDAMutationKind::None)
+	{
+		Entry.MutationJson = AIDAActionSpec::BuildMutationJson(Proposal.MutationKind, MutationChanges);
+	}
 	const FGuid JournalId = Memory.AppendJournal(WorldContext, MoveTemp(Entry));
 
 	if (JournalId.IsValid() && BuiltActors.Num() > 0)
@@ -1097,7 +1257,19 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 	ProposalStore.Transition(Proposal.Id, EAIDAProposalState::Executed, NowUtc);
 
 	const int32 Affected = Proposal.AffectedEntityIds.Num();
-	if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel || Proposal.ManifoldSets.Num() > 0)
+	if (Proposal.MutationKind != EAIDAMutationKind::None)
+	{
+		UE_LOG(LogAIDA, Log, TEXT("[actions] %s DONE (mutation): %d change(s), %d failed, %d missing (journal %s)."),
+			*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), RunBuiltCount, RunFailCount, MissingCount,
+			*JournalId.ToString(EGuidFormats::DigitsWithHyphens));
+		if (RunFailCount > 0 || MissingCount > 0)
+		{
+			RunReport.Add(FString::Printf(TEXT("mutation: %d change(s) applied, %d skipped/failed"),
+				RunBuiltCount, RunFailCount + MissingCount));
+			RunReport.Append(RunFailures);
+		}
+	}
+	else if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel || Proposal.ManifoldSets.Num() > 0)
 	{
 		const TCHAR* Kind = Proposal.ManifoldSets.Num() > 0 ? TEXT("connected")
 			: (Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels") : TEXT("power")));
@@ -1147,6 +1319,9 @@ void FAIDAActionEngine::ResetScratch()
 {
 	ExecutingId.Invalidate();
 	DismantleQueue.Reset();
+	MutationQueue.Reset();
+	MutationChanges.Reset();
+	MutationCharged.Reset();
 	BuiltActors.Reset();
 	AccruedRefund.Reset();
 	AttachmentActors.Reset();
@@ -1185,6 +1360,16 @@ bool FAIDAActionEngine::StartUndo(UObject* WorldContext, const FAIDAActionsConfi
 		FUndoJob Job;
 		Job.JournalId = Entry.Id;
 		Job.bDismantle = Entry.bDismantle;
+		// Mutation entries restore before-values — their entity list is inside MutationJson, and
+		// the AffectedEntityIds walk must not ALSO dismantle the touched machines.
+		if (!Entry.MutationJson.IsEmpty()
+			&& AIDAActionSpec::ParseMutationJson(Entry.MutationJson, Job.MutationKind, Job.MutationRestores))
+		{
+			Job.Refund = AIDAActionSpec::ParseCostItems(Entry.RefundJson);
+			TotalEntities += Job.MutationRestores.Num();
+			UndoQueue.Add(MoveTemp(Job));
+			continue;
+		}
 		for (const FString& Encoded : Entry.AffectedEntityIds)
 		{
 			FAIDAEntityId Entity;
@@ -1216,6 +1401,57 @@ bool FAIDAActionEngine::TickUndo(UObject* WorldContext, const FAIDAActionsConfig
 	if (UndoQueue.Num() == 0) { return false; }
 
 	FUndoJob& Job = UndoQueue[0];
+	if (Job.MutationKind != EAIDAMutationKind::None)
+	{
+		// Restore each change's before value on the re-resolved actor (belts drive the same
+		// upgrade path back to the old recipe, free of charge — the refund flows at finish).
+		const int32 MutEnd = FMath::Min(Job.Cursor + FMath::Max(1, Config.BatchPerTick), Job.MutationRestores.Num());
+		for (int32 i = Job.Cursor; i < MutEnd; ++i)
+		{
+			const FAIDAMutationChange& Change = Job.MutationRestores[i];
+			FAIDAEntityId Entity;
+			AActor* Actor = AIDAActionSpec::DecodeEntityId(Change.EncodedEntity, Entity)
+				? FAIDAActionSeam::ResolveMutationActor(WorldContext, Entity) : nullptr;
+			bool bOk = false;
+			if (Actor)
+			{
+				switch (Job.MutationKind)
+				{
+				case EAIDAMutationKind::Clock:
+				{
+					double Dummy = 0.0;
+					bOk = FAIDAActionSeam::ApplyClockMutation(Actor, FCString::Atod(*Change.Before), Dummy);
+					break;
+				}
+				case EAIDAMutationKind::Recipe:
+				{
+					FString DummyBefore, Error;
+					bOk = FAIDAActionSeam::ApplyRecipeMutation(WorldContext, Actor, Change.Before,
+						/*bForce*/ true, DummyBefore, Error);
+					break;
+				}
+				case EAIDAMutationKind::BeltMk:
+				{
+					TArray<FAIDACostItem> DummyCharged;
+					FString DummyBefore, DummyNewId, Error;
+					bOk = FAIDAActionSeam::ApplyBeltUpgrade(WorldContext, Actor, Change.Before,
+						/*bChargeCost*/ false, FString(), DummyCharged, DummyBefore, DummyNewId, Error);
+					break;
+				}
+				default: break;
+				}
+			}
+			bOk ? ++Job.Done : ++Job.Missing;
+		}
+		Job.Cursor = MutEnd;
+		if (Job.Cursor >= Job.MutationRestores.Num())
+		{
+			FinishUndoJob(WorldContext, Config, Memory, Job);
+			UndoQueue.RemoveAt(0);
+		}
+		return UndoQueue.Num() > 0;
+	}
+
 	const int32 End = FMath::Min(Job.Cursor + FMath::Max(1, Config.BatchPerTick), Job.Entities.Num());
 	for (int32 i = Job.Cursor; i < End; ++i)
 	{
@@ -1258,8 +1494,9 @@ void FAIDAActionEngine::FinishUndoJob(UObject* WorldContext, const FAIDAActionsC
 	Memory.MarkUndone(WorldContext, Job.JournalId);
 	SessionActors.Remove(Job.JournalId);
 
-	const TCHAR* Verb = Job.bDismantle ? TEXT("rebuilt") : TEXT("removed");
-	const int32 Total = Job.Entities.Num();
+	const TCHAR* Verb = Job.MutationKind != EAIDAMutationKind::None ? TEXT("restored")
+		: (Job.bDismantle ? TEXT("rebuilt") : TEXT("removed"));
+	const int32 Total = Job.MutationKind != EAIDAMutationKind::None ? Job.MutationRestores.Num() : Job.Entities.Num();
 	FString Line = FString::Printf(TEXT("undo: %s %d of %d entit%s"), Verb, Job.Done, Total, Total == 1 ? TEXT("y") : TEXT("ies"));
 	if (Job.Missing > 0)
 	{

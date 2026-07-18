@@ -41,6 +41,8 @@
 #include "FGConveyorChainActor.h"
 #include "FGConveyorItem.h"
 #include "Buildables/FGBuildablePipelineAttachment.h"
+#include "Buildables/FGBuildableFactory.h"
+#include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildableStorage.h"
 #include "Buildables/FGBuildableWidgetSign.h"
 #include "FGSignInterface.h"
@@ -2216,6 +2218,287 @@ AActor* FAIDAActionSeam::SpawnGhostRunHologram(UObject* WorldContext, const FStr
 		Quiesce(Child);
 	}
 	return Hologram;
+}
+
+bool FAIDAActionSeam::ResolveMutationTargets(UObject* WorldContext, EAIDAMutationKind Kind,
+	const FAIDADismantleSpec& Selector, const FString& TargetRecipePath,
+	TArray<FAIDAMutationTarget>& Out, FString& OutError)
+{
+	Out.Reset();
+	OutError.Reset();
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem)
+	{
+		OutError = TEXT("no buildables to search");
+		return false;
+	}
+
+	const FVector CenterCm = Selector.CenterM * AIDAMetersToCm;
+	const double RadiusSq = FMath::Square(Selector.RadiusM * AIDAMetersToCm);
+	const FString WantedName = NormalizeName(Selector.Buildable);
+	const auto MatchesName = [&WantedName](const FString& Name)
+	{
+		return WantedName.IsEmpty() || NormalizeName(Name).Contains(WantedName);
+	};
+	// Same display-name convention as the dismantle resolver: the built-with recipe's product.
+	const auto DisplayNameOf = [](AFGBuildable* Buildable)
+	{
+		const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
+		const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
+		return Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Buildable->GetClass());
+	};
+
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (Out.Num() >= Selector.MaxCount) { break; }
+		if (!IsValid(Buildable)) { continue; }
+		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+
+		FAIDAMutationTarget Target;
+		switch (Kind)
+		{
+		case EAIDAMutationKind::Clock:
+		{
+			AFGBuildableFactory* Factory = Cast<AFGBuildableFactory>(Buildable);
+			if (!Factory || !Factory->GetCanChangePotential()) { continue; }
+			break;
+		}
+		case EAIDAMutationKind::Recipe:
+		{
+			AFGBuildableManufacturer* Manufacturer = Cast<AFGBuildableManufacturer>(Buildable);
+			if (!Manufacturer) { continue; }
+			// Setting the recipe it already runs is a no-op — don't count it.
+			const TSubclassOf<UFGRecipe> Current = Manufacturer->GetCurrentRecipe();
+			if (Current && Current->GetPathName() == TargetRecipePath) { continue; }
+			const UFGInventoryComponent* InputInv = Manufacturer->GetInputInventory();
+			const UFGInventoryComponent* OutputInv = Manufacturer->GetOutputInventory();
+			Target.bHasContents = (InputInv && !InputInv->IsEmpty()) || (OutputInv && !OutputInv->IsEmpty());
+			break;
+		}
+		case EAIDAMutationKind::BeltMk:
+		{
+			AFGBuildableConveyorBelt* Belt = Cast<AFGBuildableConveyorBelt>(Buildable);
+			if (!Belt) { continue; }
+			const TSubclassOf<UFGRecipe> Current = Belt->GetBuiltWithRecipe();
+			if (Current && Current->GetPathName() == TargetRecipePath) { continue; } // already that mark
+			break;
+		}
+		default:
+			OutError = TEXT("unknown mutation kind");
+			return false;
+		}
+
+		if (!MatchesName(DisplayNameOf(Buildable))) { continue; }
+		Target.Actor = Buildable;
+		Target.Detail = DisplayNameOf(Buildable);
+		Out.Add(MoveTemp(Target));
+	}
+	return true;
+}
+
+bool FAIDAActionSeam::ApplyClockMutation(AActor* Target, double Pct, double& OutBeforePct)
+{
+	AFGBuildableFactory* Factory = Cast<AFGBuildableFactory>(Target);
+	if (!Factory || !Factory->GetCanChangePotential()) { return false; }
+	OutBeforePct = static_cast<double>(Factory->GetPendingPotential()) * 100.0;
+	Factory->SetPendingPotential(static_cast<float>(Pct / 100.0));
+	return true;
+}
+
+bool FAIDAActionSeam::ApplyRecipeMutation(UObject* WorldContext, AActor* Target, const FString& RecipePath,
+	bool bForce, FString& OutBeforePath, FString& OutError)
+{
+	OutError.Reset();
+	AFGBuildableManufacturer* Manufacturer = Cast<AFGBuildableManufacturer>(Target);
+	if (!Manufacturer)
+	{
+		OutError = TEXT("not a manufacturer");
+		return false;
+	}
+	UFGInventoryComponent* InputInv = Manufacturer->GetInputInventory();
+	UFGInventoryComponent* OutputInv = Manufacturer->GetOutputInventory();
+	const bool bHasContents = (InputInv && !InputInv->IsEmpty()) || (OutputInv && !OutputInv->IsEmpty());
+	if (bHasContents && !bForce)
+	{
+		OutError = TEXT("items in flight (force destroys them)");
+		return false;
+	}
+
+	// Empty path = clear the recipe (undo of a machine that had none). SetRecipe handles null.
+	TSubclassOf<UFGRecipe> RecipeClass = nullptr;
+	if (!RecipePath.IsEmpty())
+	{
+		RecipeClass = FSoftClassPath(RecipePath).TryLoadClass<UFGRecipe>();
+		if (!RecipeClass)
+		{
+			OutError = TEXT("the recipe class no longer loads");
+			return false;
+		}
+	}
+	const TSubclassOf<UFGRecipe> Current = Manufacturer->GetCurrentRecipe();
+	OutBeforePath = Current ? Current->GetPathName() : FString();
+	if (bHasContents)
+	{
+		// The game's own recipe-change UI empties the machine; contents are destroyed (surfaced in
+		// the proposal summary before approval).
+		if (InputInv) { InputInv->Empty(); }
+		if (OutputInv) { OutputInv->Empty(); }
+	}
+	Manufacturer->SetRecipe(RecipeClass);
+	return true;
+}
+
+bool FAIDAActionSeam::ApplyBeltUpgrade(UObject* WorldContext, AActor* BeltActor, const FString& TargetRecipePath,
+	bool bChargeCost, const FString& PayerPlayerId, TArray<FAIDACostItem>& OutCharged,
+	FString& OutBeforePath, FString& OutNewEncodedId, FString& OutError)
+{
+	OutCharged.Reset();
+	OutError.Reset();
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableConveyorBelt* Belt = Cast<AFGBuildableConveyorBelt>(BeltActor);
+	if (!World || !Belt)
+	{
+		OutError = TEXT("the belt is gone");
+		return false;
+	}
+	const TSubclassOf<UFGRecipe> Current = Belt->GetBuiltWithRecipe();
+	OutBeforePath = Current ? Current->GetPathName() : FString();
+	if (OutBeforePath == TargetRecipePath)
+	{
+		OutError = TEXT("already that mark");
+		return false;
+	}
+	UClass* RecipeClass = FSoftClassPath(TargetRecipePath).TryLoadClass<UFGRecipe>();
+	if (!RecipeClass)
+	{
+		OutError = TEXT("the target belt recipe no longer loads");
+		return false;
+	}
+
+	// The game's own upgrade flow: spawn the target-mk belt hologram, hand it the existing belt via
+	// TryUpgrade (it copies the spline and marks the old belt as the upgrade target), construct.
+	AFGHologram* Hologram = AFGHologram::SpawnHologramFromRecipe(RecipeClass, World->GetWorldSettings(),
+		Belt->GetActorLocation(), /*hologramInstigator*/ nullptr,
+		[](AFGHologram* PreSpawn) { PreSpawn->SetReplicates(false); });
+	if (!Hologram)
+	{
+		OutError = TEXT("no hologram for the target belt");
+		return false;
+	}
+	FHitResult Hit(Belt, Cast<UPrimitiveComponent>(Belt->GetRootComponent()), Belt->GetActorLocation(), FVector::UpVector);
+	if (!Hologram->TryUpgrade(Hit) || Hologram->GetUpgradedActor() != Belt)
+	{
+		Hologram->Destroy();
+		OutError = TEXT("the game refused the upgrade for this belt");
+		return false;
+	}
+
+	// Length-scaled cost off the configured hologram, charged as built (mirrors run building).
+	for (const FItemAmount& Entry : Hologram->GetCost(/*includeChildren*/ true))
+	{
+		AddCost(OutCharged, Entry.ItemClass, Entry.Amount);
+	}
+	if (bChargeCost && !DeductCost(WorldContext, OutCharged, PayerPlayerId))
+	{
+		Hologram->Destroy();
+		OutCharged.Reset();
+		OutError = TEXT("central storage + the requester's inventory cannot afford this belt");
+		return false;
+	}
+
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	if (!Built)
+	{
+		OutError = TEXT("upgrade Construct() returned nothing");
+		return false;
+	}
+	FAIDAEntityId Entity;
+	Entity.Type = TEXT("actor");
+	Entity.ClassPath = Built->GetClass()->GetPathName();
+	Entity.RecipePath = TargetRecipePath;
+	Entity.Pos = Built->GetActorLocation();
+	Entity.YawDeg = FMath::RoundToInt32(Built->GetActorRotation().Yaw);
+	OutNewEncodedId = AIDAActionSpec::EncodeEntityId(Entity);
+	return true;
+}
+
+bool FAIDAActionSeam::ResolveProductionRecipe(UObject* WorldContext, const FString& DisplayName,
+	FString& OutRecipePath, FString& OutDisplayName, TArray<FString>& OutSuggestions)
+{
+	OutRecipePath.Reset();
+	OutDisplayName.Reset();
+	OutSuggestions.Reset();
+
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGRecipeManager* Recipes = World ? AFGRecipeManager::Get(World) : nullptr;
+	if (!Recipes) { return false; }
+	const FString Wanted = NormalizeName(DisplayName);
+	if (Wanted.IsEmpty()) { return false; }
+
+	TArray<TSubclassOf<UFGRecipe>> Available;
+	Recipes->GetAllAvailableRecipes(Available);
+
+	TSubclassOf<UFGRecipe> Exact = nullptr;
+	TArray<TSubclassOf<UFGRecipe>> Partial;
+	TArray<FString> PartialNames;
+	for (const TSubclassOf<UFGRecipe>& Recipe : Available)
+	{
+		if (!Recipe) { continue; }
+		bool bManufactured = false;
+		for (const TSubclassOf<UObject>& Producer : UFGRecipe::GetProducedIn(Recipe))
+		{
+			if (Producer && Producer->IsChildOf(AFGBuildableManufacturer::StaticClass()))
+			{
+				bManufactured = true;
+				break;
+			}
+		}
+		if (!bManufactured) { continue; }
+
+		const FString Name = UFGRecipe::GetRecipeName(Recipe).ToString();
+		const FString Candidate = NormalizeName(Name);
+		if (Candidate == Wanted)
+		{
+			Exact = Recipe;
+			break;
+		}
+		if (Candidate.Contains(Wanted))
+		{
+			Partial.Add(Recipe);
+			PartialNames.Add(Name);
+		}
+	}
+	const TSubclassOf<UFGRecipe> Chosen = Exact ? Exact : (Partial.Num() == 1 ? Partial[0] : nullptr);
+	if (!Chosen)
+	{
+		for (int32 i = 0; i < PartialNames.Num() && OutSuggestions.Num() < MaxSuggestions; ++i)
+		{
+			OutSuggestions.AddUnique(PartialNames[i]);
+		}
+		return false;
+	}
+	OutRecipePath = Chosen->GetPathName();
+	OutDisplayName = UFGRecipe::GetRecipeName(Chosen).ToString();
+	return true;
+}
+
+AActor* FAIDAActionSeam::ResolveMutationActor(UObject* WorldContext, const FAIDAEntityId& Entity)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* ActorClass = World ? FSoftClassPath(Entity.ClassPath).TryLoadClass<AActor>() : nullptr;
+	if (!ActorClass) { return nullptr; }
+	for (TActorIterator<AActor> It(World, ActorClass); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (IsValid(Actor) && Actor->GetActorLocation().Equals(Entity.Pos, 5.0))
+		{
+			return Actor;
+		}
+	}
+	return nullptr;
 }
 
 bool FAIDAActionSeam::UndoRemoveEntity(UObject* WorldContext, const FAIDAEntityId& Entity, AActor* CachedActor)
