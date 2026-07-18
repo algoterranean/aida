@@ -1925,7 +1925,11 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 					FAIDAGhostRun& Run = View.GhostRuns.AddDefaulted_GetRef();
 					Run.RecipeClassPath = FeedTransport;
 					Run.FromCm = Points[i];
-					Run.FromNormal = (Points[i + 1] - Points[i]).GetSafeNormal(UE_SMALL_NUMBER, Proposal->TapDirCm);
+					// The FIRST leg leaves through the tap/source PORT along its normal — that is
+					// how the real belt exits, so the ghost's curve matches the build exactly.
+					Run.FromNormal = i == 0 && !Proposal->TapDirCm.IsNearlyZero()
+						? Proposal->TapDirCm.GetSafeNormal()
+						: (Points[i + 1] - Points[i]).GetSafeNormal(UE_SMALL_NUMBER, Proposal->TapDirCm);
 					Run.ToCm = Points[i + 1];
 					Run.ToNormal = (i + 2 == Points.Num()) ? DestNormal : -Run.FromNormal;
 				}
