@@ -86,6 +86,15 @@ namespace AIDAActionSpec
 	 */
 	TArray<FString> WallRecipeCandidatesForFoundation(const FString& FoundationRecipePath);
 
+	/**
+	 * Orient a planned manifold row so its ITEMS move along FlowDirWorld (player-relative words
+	 * already resolved): splitter (in) trunks flow +RowAxis toward the far end, merger/junction
+	 * (out) trunks flow toward the index-0 open end (-RowAxis). When the row's movement opposes
+	 * the wish, every parallel array reverses and the axis negates — index 0 stays "the open end".
+	 */
+	void OrientManifoldFlow(TArray<FTransform>& Attachments, TArray<FAIDAManifoldPort>& Ports,
+		TArray<int32>* PortMachineIndex, FVector& RowAxis, bool bOutput, const FVector& FlowDirWorld);
+
 	/** Serialize a mutation journal payload (P8 Slice 2): {kind, changes:[{id, before, after}]}. */
 	FString BuildMutationJson(EAIDAMutationKind Kind, const TArray<FAIDAMutationChange>& Changes);
 

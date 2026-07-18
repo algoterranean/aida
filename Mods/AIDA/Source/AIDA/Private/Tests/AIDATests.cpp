@@ -3141,6 +3141,20 @@ bool FAIDAChatCommandsTest::RunTest(const FString&)
 	TestTrue(TEXT("task rm no index intercepts"), AIDAChatCommands::TryParse(TEXT("/aida task rm"), Cmd, Error));
 	TestTrue(TEXT("task rm no index -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);
 
+	// Bare aliases: whole-message clean commands work without the /aida prefix; anything that
+	// doesn't parse cleanly stays plain chat (never an intercepted usage error).
+	TestTrue(TEXT("bare undo"), AIDAChatCommands::TryParse(TEXT("undo"), Cmd, Error));
+	TestTrue(TEXT("bare undo kind"), Cmd.Kind == FAIDAChatCommand::EKind::Undo);
+	TestTrue(TEXT("bare undo 3"), AIDAChatCommands::TryParse(TEXT("Undo 3"), Cmd, Error));
+	TestEqual(TEXT("bare undo count"), Cmd.Count, 3);
+	TestTrue(TEXT("bare approve"), AIDAChatCommands::TryParse(TEXT("approve"), Cmd, Error));
+	TestTrue(TEXT("bare approve kind"), Cmd.Kind == FAIDAChatCommand::EKind::Approve);
+	TestTrue(TEXT("bare nudge"), AIDAChatCommands::TryParse(TEXT("nudge north 2"), Cmd, Error));
+	TestTrue(TEXT("bare nudge kind"), Cmd.Kind == FAIDAChatCommand::EKind::Nudge);
+	TestFalse(TEXT("bare sentence stays chat"), AIDAChatCommands::TryParse(TEXT("approve it when you're ready"), Cmd, Error));
+	TestFalse(TEXT("bare malformed stays chat"), AIDAChatCommands::TryParse(TEXT("undo everything please"), Cmd, Error));
+	TestFalse(TEXT("unrelated word stays chat"), AIDAChatCommands::TryParse(TEXT("understand this"), Cmd, Error));
+
 	// Malformed/unknown commands still short-circuit, carrying usage text.
 	TestTrue(TEXT("bad count intercepts"), AIDAChatCommands::TryParse(TEXT("/aida undo zero"), Cmd, Error));
 	TestTrue(TEXT("bad count -> None"), Cmd.Kind == FAIDAChatCommand::EKind::None);

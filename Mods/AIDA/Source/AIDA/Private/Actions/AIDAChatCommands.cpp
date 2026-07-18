@@ -17,16 +17,53 @@ namespace
 	}
 }
 
+namespace
+{
+	/** The full parse, assuming Trimmed starts with "/aida". Split out so bare aliases can reuse it. */
+	bool ParsePrefixed(const FString& Trimmed, FAIDAChatCommand& Out, FString& OutError);
+}
+
 bool AIDAChatCommands::TryParse(const FString& Text, FAIDAChatCommand& Out, FString& OutError)
 {
 	Out = FAIDAChatCommand();
 	OutError.Reset();
 
-	FString Trimmed = Text.TrimStartAndEnd();
-	if (!Trimmed.StartsWith(TEXT("/aida"), ESearchCase::IgnoreCase))
+	const FString Trimmed = Text.TrimStartAndEnd();
+	if (Trimmed.StartsWith(TEXT("/aida"), ESearchCase::IgnoreCase))
 	{
-		return false; // plain chat
+		return ParsePrefixed(Trimmed, Out, OutError);
 	}
+
+	// Bare command words work without the prefix ("undo", "approve", "nudge north 2") — but ONLY
+	// when the WHOLE message parses as a clean command. "approve it when you're ready" stays chat.
+	TArray<FString> Peek;
+	Trimmed.ParseIntoArrayWS(Peek);
+	if (Peek.Num() == 0)
+	{
+		return false;
+	}
+	const FString First = Peek[0].ToLower();
+	if (First != TEXT("undo") && First != TEXT("approve") && First != TEXT("reject")
+		&& First != TEXT("nudge") && First != TEXT("rotate") && First != TEXT("task"))
+	{
+		return false;
+	}
+	FAIDAChatCommand Parsed;
+	FString ParseError;
+	if (ParsePrefixed(TEXT("/aida ") + Trimmed, Parsed, ParseError) && Parsed.Kind != FAIDAChatCommand::EKind::None)
+	{
+		Out = Parsed;
+		return true;
+	}
+	return false; // malformed bare form = plain chat, never an intercepted usage error
+}
+
+namespace
+{
+bool ParsePrefixed(const FString& Trimmed, FAIDAChatCommand& Out, FString& OutError)
+{
+	Out = FAIDAChatCommand();
+	OutError.Reset();
 
 	TArray<FString> Tokens;
 	Trimmed.ParseIntoArrayWS(Tokens);
@@ -176,3 +213,4 @@ bool AIDAChatCommands::TryParse(const FString& Text, FAIDAChatCommand& Out, FStr
 	OutError = kUsage;
 	return true;
 }
+} // namespace

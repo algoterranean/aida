@@ -98,13 +98,19 @@ namespace
 		Widget->AddToViewport();
 		ShownChatWidgets().Add(World, Widget);
 
-		// Let the player click into the chat box while the game keeps running underneath.
-		PC->SetInputMode(FInputModeGameAndUI());
-		PC->bShowMouseCursor = true;
-
+		// Input mode follows FOCUS, not visibility (user rule: move and look freely with the
+		// window up). Focusing the input flips to GameAndUI + cursor; after this the widget's own
+		// tick swaps modes whenever focus changes (click in, ESC out, Ctrl+Enter back in).
 		if (bFocusInput)
 		{
+			PC->SetInputMode(FInputModeGameAndUI());
+			PC->bShowMouseCursor = true;
 			Widget->FocusInput();
+		}
+		else
+		{
+			PC->SetInputMode(FInputModeGameOnly());
+			PC->bShowMouseCursor = false;
 		}
 	}
 
@@ -189,10 +195,60 @@ namespace
 		virtual void Tick(const float, FSlateApplication&, TSharedRef<ICursor>) override {}
 		virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& KeyEvent) override
 		{
+			// Ctrl+Enter: SHOW + focus when hidden, (re)FOCUS the input when visible — it never
+			// hides (user rule; ESC is the way out).
 			if (KeyEvent.GetKey() == EKeys::Enter && KeyEvent.IsControlDown())
 			{
-				ToggleChatWidgets(/*bFocusInputOnShow=*/true);
+				bool bAnyVisible = false;
+				for (const auto& Pair : ShownChatWidgets())
+				{
+					if (UAIDAChatWidget* Widget = Pair.Value.Get(); Widget && Widget->IsInViewport())
+					{
+						Widget->FocusInput();
+						bAnyVisible = true;
+					}
+				}
+				if (!bAnyVisible)
+				{
+					ToggleChatWidgets(/*bFocusInputOnShow=*/true);
+				}
 				return true; // consume so the game doesn't also act on the chord
+			}
+
+			// ESC two-step while the window is up (user rule): first press drops focus back to the
+			// game (window stays as an overlay, movement returns); second press hides the window.
+			// Hidden window = ESC untouched, so the game menu works normally.
+			if (KeyEvent.GetKey() == EKeys::Escape)
+			{
+				bool bAnyVisible = false;
+				bool bAnyFocused = false;
+				for (const auto& Pair : ShownChatWidgets())
+				{
+					if (UAIDAChatWidget* Widget = Pair.Value.Get(); Widget && Widget->IsInViewport())
+					{
+						bAnyVisible = true;
+						bAnyFocused |= Widget->IsInputFocused();
+					}
+				}
+				if (!bAnyVisible)
+				{
+					return false;
+				}
+				if (bAnyFocused)
+				{
+					for (const auto& Pair : ShownChatWidgets())
+					{
+						if (UAIDAChatWidget* Widget = Pair.Value.Get(); Widget && Widget->IsInViewport())
+						{
+							Widget->UnfocusInput();
+						}
+					}
+				}
+				else
+				{
+					ToggleChatWidgets(/*bFocusInputOnShow=*/false); // any shown -> hides all
+				}
+				return true;
 			}
 			return false;
 		}

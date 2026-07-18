@@ -285,6 +285,8 @@ bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 M
 	Spec->TryGetBoolField(TEXT("power"), Parsed.bPower); // default true (docs/PHASE4-POWER.md)
 	Spec->TryGetStringField(TEXT("pole"), Parsed.Pole);
 	Parsed.Pole = Parsed.Pole.TrimStartAndEnd();
+	Spec->TryGetStringField(TEXT("rowDirection"), Parsed.RowDirection);
+	Parsed.RowDirection = Parsed.RowDirection.TrimStartAndEnd();
 
 	const TSharedPtr<FJsonObject>* Grid = nullptr;
 	if (Spec->TryGetObjectField(TEXT("grid"), Grid) && Grid)
@@ -567,6 +569,9 @@ bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int3
 				? MaxItems : FMath::Min(Parsed.Machines.MaxCount, MaxItems);
 		}
 	}
+
+	Spec->TryGetStringField(TEXT("flow"), Parsed.Flow);
+	Parsed.Flow = Parsed.Flow.TrimStartAndEnd();
 
 	if (Spec->TryGetNumberField(TEXT("standoffM"), Parsed.StandoffM) && (Parsed.StandoffM < 1.0 || Parsed.StandoffM > 20.0))
 	{
@@ -914,6 +919,28 @@ TArray<FString> AIDAActionSpec::WallRecipeCandidatesForFoundation(const FString&
 	}
 	Candidates.Add(TEXT("Recipe_Wall_8x4_01_C"));
 	return Candidates;
+}
+
+void AIDAActionSpec::OrientManifoldFlow(TArray<FTransform>& Attachments, TArray<FAIDAManifoldPort>& Ports,
+	TArray<int32>* PortMachineIndex, FVector& RowAxis, bool bOutput, const FVector& FlowDirWorld)
+{
+	const FVector Flow = bOutput ? -RowAxis : RowAxis; // where the items actually move
+	const FVector Want = FVector(FlowDirWorld.X, FlowDirWorld.Y, 0.0).GetSafeNormal();
+	if (Want.IsNearlyZero() || FVector::DotProduct(FVector(Flow.X, Flow.Y, 0.0), Want) >= 0.0)
+	{
+		return; // already moving the wished way (or no usable wish)
+	}
+	Algo::Reverse(Attachments);
+	Algo::Reverse(Ports);
+	if (PortMachineIndex) { Algo::Reverse(*PortMachineIndex); }
+	RowAxis = -RowAxis;
+	// The pass-through must follow the new axis too — a splitter whose input faces the far end
+	// would take its feed backwards. Side ports (the drops) exist on both sides, so a 180° spin
+	// is safe for them.
+	for (FTransform& Attachment : Attachments)
+	{
+		Attachment.SetRotation((Attachment.Rotator() + FRotator(0.0, 180.0, 0.0)).Quaternion());
+	}
 }
 
 FString AIDAActionSpec::BuildMutationJson(EAIDAMutationKind Kind, const TArray<FAIDAMutationChange>& Changes)

@@ -64,6 +64,9 @@ struct FAIDABuildSpec
 	bool bPower = true;
 	/** Optional pole display-name override; "" = the lowest unlocked mk. */
 	FString Pole;
+	/** Optional row/grid-X direction word ("left"/"right"/"forward"/"north"/…), resolved against
+	 *  the requester's facing server-side; overrides YawDeg. Empty = YawDeg as given. */
+	FString RowDirection;
 	/** v2 composite parts (empty = v1 single-buildable spec). */
 	TArray<FAIDABuildPart> Parts;
 };
@@ -101,6 +104,9 @@ struct FAIDAManifoldSpec
 	FAIDADismantleSpec Machines;           // selector reuse (buildable required, center optional = aim)
 	double StandoffM = 4.0;                // trunk-line distance in front of the ports
 	int32 PortIndex = 0;                   // which matching unconnected machine port (0 = first)
+	/** Optional item-movement direction ("left"/"right"/"forward"/"north"/…, player-relative words
+	 *  resolved against the requester's facing). Empty = whatever the row fit produced. */
+	FString Flow;
 };
 
 /** propose_label_containers spec v1 (P7 Slice 3 write side): put a sign with the dominant item name

@@ -25,6 +25,7 @@
 #include "Engine/Font.h"
 #include "Engine/World.h"
 #include "Styling/CoreStyle.h"
+#include "Framework/Application/SlateApplication.h"
 #include "TimerManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -447,9 +448,44 @@ void UAIDAChatWidget::FocusInput()
 	}
 }
 
+bool UAIDAChatWidget::IsInputFocused() const
+{
+	return InputBox && InputBox->HasKeyboardFocus();
+}
+
+void UAIDAChatWidget::UnfocusInput()
+{
+	if (FSlateApplication::IsInitialized())
+	{
+		FSlateApplication::Get().SetAllUserFocusToGameViewport();
+	}
+}
+
 void UAIDAChatWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
 	Super::NativeTick(MyGeometry, InDeltaTime);
+
+	// Focus drives the input mode (user rule): typing needs UI routing + the cursor; the rest of
+	// the time the window is a pure overlay and the player moves/looks with normal game input.
+	// Polling covers every way focus can change — clicks, ESC, Ctrl+Enter, Slate steals.
+	const bool bInputFocused = IsInputFocused();
+	if (bInputFocused != bLastInputFocused)
+	{
+		bLastInputFocused = bInputFocused;
+		if (APlayerController* PC = GetOwningPlayer())
+		{
+			if (bInputFocused)
+			{
+				PC->SetInputMode(FInputModeGameAndUI());
+				PC->bShowMouseCursor = true;
+			}
+			else
+			{
+				PC->SetInputMode(FInputModeGameOnly());
+				PC->bShowMouseCursor = false;
+			}
+		}
+	}
 
 	// Mirror the (click-through) scroll box onto the gutter slider: thumb at the TOP = offset 0
 	// (vertical sliders run bottom→top, so the value is inverted). Hidden while the text fits.
@@ -581,6 +617,11 @@ void UAIDAChatWidget::SendChat(const FString& Text)
 	{
 		R->SubmitChat(Text, CurrentConversationId);
 	}
+	// Typing always snaps the view to the tail (user rule) — the reply lands where you're looking.
+	if (TranscriptScroll)
+	{
+		TranscriptScroll->ScrollToEnd();
+	}
 }
 
 void UAIDAChatWidget::GetTranscript(TArray<FAIDATranscriptEntry>& OutEntries) const
@@ -632,7 +673,17 @@ void UAIDAChatWidget::HandleMsgBegin(const FAIDAMessageHeader& Header)
 		}
 		View.IndexById.Add(Header.Id, View.Messages.Add(MoveTemp(Msg)));
 	}
-	if (Header.ConversationId == CurrentConversationId) { RenderActiveConversation(); }
+	if (Header.ConversationId == CurrentConversationId)
+	{
+		RenderActiveConversation();
+		// A NEW message (the player's echo, AIDA's reply opening, a system line) always snaps to
+		// the tail (user rule: fresh text must be visible). Mid-stream deltas stay sticky-only so
+		// deliberately scrolling up during a long reply still works.
+		if (TranscriptScroll)
+		{
+			TranscriptScroll->ScrollToEnd();
+		}
+	}
 
 	OnMessageBegin(Header);
 }
@@ -830,6 +881,13 @@ bool UAIDAChatWidget::TryAdjustGhost(const FKey& Key, bool bFineStep)
 
 FReply UAIDAChatWidget::NativeOnPreviewKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
 {
+	// User rule: the window captures keys ONLY while the input box has focus — otherwise the
+	// player is walking around with the chat as an overlay and every key belongs to the game.
+	if (!IsInputFocused())
+	{
+		return Super::NativeOnPreviewKeyDown(InGeometry, InKeyEvent);
+	}
+
 	// Ctrl+Arrows / Ctrl+PgUp/PgDn move the pending proposal ghost (Shift for 1 m fine steps).
 	if (InKeyEvent.IsControlDown() && TryAdjustGhost(InKeyEvent.GetKey(), InKeyEvent.IsShiftDown()))
 	{

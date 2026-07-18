@@ -115,6 +115,13 @@ public:
 	/** Put keyboard focus into the input box (used when the window is opened via the Ctrl+Enter keybind). */
 	void FocusInput();
 
+	/** Is the input box holding keyboard focus? (Drives the ESC two-step and key-capture gating.) */
+	bool IsInputFocused() const;
+
+	/** Drop keyboard focus back to the game viewport (first ESC) — the window stays visible and
+	 *  NativeTick flips the input mode back to game-only so the player can move again. */
+	void UnfocusInput();
+
 	/** Scroll the transcript by a signed pixel delta, clamped to the content. Public: the module's
 	 *  global input preprocessor drives this for wheel-over-transcript (the transcript is
 	 *  click-through, so the widget itself never sees those wheel events). */
@@ -186,6 +193,10 @@ private:
 
 	/** True while the mouse holds the slider — tick must not fight the thumb mid-drag. */
 	bool bSliderDragging = false;
+
+	/** Last observed input-box focus (NativeTick swaps the input mode + cursor on change, so the
+	 *  player moves/looks freely whenever they are NOT typing — user rule). */
+	bool bLastInputFocused = false;
 
 	UFUNCTION()
 	void HandleSliderValueChanged(float Value);

@@ -824,13 +824,21 @@ bool FAIDAActionSeam::CensusFoundationSlab(UObject* WorldContext, const FString&
 	const FString Hint = DirectionHint.TrimStartAndEnd().ToLower();
 	if (!Hint.IsEmpty())
 	{
+		const FVector HintForward = FVector(ViewRot.Vector().X, ViewRot.Vector().Y, 0.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+		const FVector HintRight(-HintForward.Y, HintForward.X, 0.0);
 		if (Hint == TEXT("north")) { WantDir = FVector(0.0, -1.0, 0.0); }
 		else if (Hint == TEXT("south")) { WantDir = FVector(0.0, 1.0, 0.0); }
 		else if (Hint == TEXT("east")) { WantDir = FVector(1.0, 0.0, 0.0); }
 		else if (Hint == TEXT("west")) { WantDir = FVector(-1.0, 0.0, 0.0); }
+		// Player-relative words resolve against the requester's facing (live feedback: "extend it
+		// to my left" should just work).
+		else if (Hint == TEXT("forward") || Hint == TEXT("ahead") || Hint == TEXT("front")) { WantDir = HintForward; }
+		else if (Hint == TEXT("back") || Hint == TEXT("backward") || Hint == TEXT("backwards") || Hint == TEXT("behind")) { WantDir = -HintForward; }
+		else if (Hint == TEXT("left")) { WantDir = -HintRight; }
+		else if (Hint == TEXT("right")) { WantDir = HintRight; }
 		else
 		{
-			Out.Error = FString::Printf(TEXT("unknown direction '%s' — use north, south, east or west (or omit it to use the player's aim)"), *DirectionHint);
+			Out.Error = FString::Printf(TEXT("unknown direction '%s' — use north/south/east/west or left/right/forward/back (or omit it to use the player's aim)"), *DirectionHint);
 			return false;
 		}
 		Source = TEXT("as asked");
@@ -1184,6 +1192,51 @@ bool FAIDAActionSeam::FindFreePipeInputPort(UObject* WorldContext, const FVector
 			if (Products.Num() > 0) { OutPort.MachineName = DescriptorName(Products[0].ItemClass); }
 		}
 	}
+	return true;
+}
+
+bool FAIDAActionSeam::ResolveRelativeDirection(UObject* WorldContext, const FString& PlayerId,
+	const FString& Word, FVector& OutWorldDir)
+{
+	OutWorldDir = FVector::ZeroVector;
+	const FString Wanted = Word.TrimStartAndEnd().ToLower().Replace(TEXT(" "), TEXT("")).Replace(TEXT("-"), TEXT(""));
+	if (Wanted.IsEmpty()) { return false; }
+
+	// Absolute compass words need no view (game convention: north = -Y, east = +X).
+	if (Wanted == TEXT("north")) { OutWorldDir = FVector(0.0, -1.0, 0.0); return true; }
+	if (Wanted == TEXT("south")) { OutWorldDir = FVector(0.0, 1.0, 0.0); return true; }
+	if (Wanted == TEXT("east")) { OutWorldDir = FVector(1.0, 0.0, 0.0); return true; }
+	if (Wanted == TEXT("west")) { OutWorldDir = FVector(-1.0, 0.0, 0.0); return true; }
+
+	const bool bForward = Wanted == TEXT("forward") || Wanted == TEXT("ahead") || Wanted == TEXT("straightahead") || Wanted == TEXT("front");
+	const bool bBack = Wanted == TEXT("back") || Wanted == TEXT("backward") || Wanted == TEXT("backwards") || Wanted == TEXT("behind");
+	const bool bLeft = Wanted == TEXT("left");
+	const bool bRight = Wanted == TEXT("right");
+	if (!bForward && !bBack && !bLeft && !bRight) { return false; }
+
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World) { return false; }
+	APlayerController* Requester = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PC = It->Get();
+		APlayerState* PS = PC ? PC->PlayerState : nullptr;
+		if (!PS) { continue; }
+		const TSharedPtr<const FUniqueNetId> NetId = PS->GetUniqueId().GetUniqueNetId();
+		if ((NetId.IsValid() ? NetId->ToString() : FString()) == PlayerId)
+		{
+			Requester = PC;
+			break;
+		}
+	}
+	if (!Requester) { return false; }
+	FVector ViewLoc;
+	FRotator ViewRot;
+	Requester->GetPlayerViewPoint(ViewLoc, ViewRot);
+	const FVector Forward = FVector(ViewRot.Vector().X, ViewRot.Vector().Y, 0.0).GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+	const FVector Right(-Forward.Y, Forward.X, 0.0); // UE yaw convention: +90° from forward
+
+	OutWorldDir = bForward ? Forward : (bBack ? -Forward : (bLeft ? -Right : Right));
 	return true;
 }
 

@@ -113,6 +113,15 @@ public:
 		AActor*& OutActor, FString& OutName, FVector& OutHitCm);
 
 	/**
+	 * Resolve a direction WORD to a world-space unit direction (XY): compass words are absolute
+	 * (game convention north = -Y), and player-relative words — left/right/forward/ahead/
+	 * back/backward(s)/behind — resolve against the REQUESTER's current view yaw. False = the
+	 * word is unknown or the player's view couldn't be found.
+	 */
+	static bool ResolveRelativeDirection(UObject* WorldContext, const FString& PlayerId,
+		const FString& Word, FVector& OutWorldDir);
+
+	/**
 	 * Validate-only twin of BuildConnectingRun: drive the spline hologram through the two-step
 	 * flow between the EXPLICIT ports given, collect the game's own disqualifiers, destroy — no
 	 * cost, no construct. False = the game would refuse this exact run (OutReason = its text, e.g.

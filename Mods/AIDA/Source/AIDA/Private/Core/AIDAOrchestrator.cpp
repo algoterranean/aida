@@ -168,6 +168,12 @@ namespace
 		"gives NO location at all, call the tool immediately WITHOUT coordinates. NEVER ask the player "
 		"for coordinates and NEVER refuse a request for lack of a location — omitting the field IS the "
 		"correct way to say 'where I'm looking'.\n\n"
+		"DIRECTION WORDS: every direction/flow/rowDirection field accepts BOTH compass words "
+		"(north/south/east/west) and PLAYER-RELATIVE words — left, right, forward/ahead, back/behind — "
+		"resolved server-side against where the player is facing. Pass the player's own word "
+		"('extend it to my left' = direction 'left'; 'a row left to right' = rowDirection 'right'; "
+		"'manifolds flowing left to right' = flow 'right', i.e. the direction items MOVE). Never "
+		"translate relative words into compass guesses yourself.\n\n"
 		"World-modifying proposal tools (only registered when the server enables them):\n"
 		"FABRICATION RULE (absolute): NEVER write 'proposal ready', a cost list, or 'awaiting approval' "
 		"unless a propose_* TOOL RESULT in THIS very reply returned a proposalId. Describing a proposal "
@@ -2200,7 +2206,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool} — ALWAYS the form for a row/line/grid of IDENTICAL buildables ('three refineries in a line' = v1 with grid countX 3), never a composite. v2 COMPOSITE — the form for MULTI-PART structures with DIFFERENT parts (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY ALWAYS unless the player EXPLICITLY asked for spacing ('every 15 m', 'leave a gap') — omitted steps pack machines edge to edge, which is what 'in a row/line/next to each other' means; the SERVER knows every buildable's true footprint and you do not, so a guessed step just scatters the row (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, rowDirection?:'left'|'right'|'forward'|'back'|compass (the row/grid-X axis, resolved against the player's FACING — 'a row left to right' = rowDirection 'right'; overrides yawDeg), followTerrain?:bool} — ALWAYS the form for a row/line/grid of IDENTICAL buildables ('three refineries in a line' = v1 with grid countX 3), never a composite. v2 COMPOSITE — the form for MULTI-PART structures with DIFFERENT parts (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY ALWAYS unless the player EXPLICITLY asked for spacing ('every 15 m', 'leave a gap') — omitted steps pack machines edge to edge, which is what 'in a row/line/next to each other' means; the SERVER knows every buildable's true footprint and you do not, so a guessed step just scatters the row (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically. Use when the player asks to change a proposed build (get its spec from get_proposal_status, merge the change, re-propose here)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -2215,6 +2221,18 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (!AIDAActionSpec::ParseBuildSpec(SpecObj ? *SpecObj : nullptr, Config.Actions.MaxProposalItems, Spec, Error))
 			{
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			// spec.rowDirection: "a row left to right" = the grid's X axis runs along a direction
+			// word resolved against the player's facing (or a compass word). Overrides yawDeg.
+			if (!Spec.RowDirection.IsEmpty())
+			{
+				FVector RowDir;
+				if (!FAIDAActionSeam::ResolveRelativeDirection(this, Ctx.PlayerId, Spec.RowDirection, RowDir))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("unknown rowDirection '%s' — use left/right/forward/back or north/south/east/west"), *Spec.RowDirection), {}));
+				}
+				Spec.YawDeg = FMath::RoundToInt32(FMath::RadiansToDegrees(FMath::Atan2(RowDir.Y, RowDir.X)));
 			}
 
 			// Revision (revise-by-prompt): the new proposal replaces a pending one on SUCCESS —
@@ -2593,8 +2611,8 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// composite-style proposal (per-class placement runs) through the standard approval flow.
 	Tools.Register({
 		TEXT("propose_extend_foundations"),
-		TEXT("PROPOSE extending the foundation slab the player is standing on or aiming at. The server finds the CONTIGUOUS slab (its foundation types, lattice, and height steps), then extends EVERY lane of the slab's full width by spec.count tiles from that lane's own edge — same foundation class, height and rotation as the edge it grows from, so ragged edges, mixed types and terrain-following steps all extend correctly. Direction: spec.direction ('north'|'south'|'east'|'west') ONLY when the player names one; otherwise the server uses their LOOK direction when standing on the slab, or the aimed edge's outward face when they aim at the slab from beside it — never ask for a direction. Spec: {version:1, count: tiles to extend (default 1), direction?}. ALWAYS use this when the player says to extend/continue/grow existing foundations, a floor, or a platform — NEVER assemble an extension with propose_build (it cannot find the existing slab's lattice). Returns the dry-run (count, cost, validity) + proposalId; same approval flow as propose_build (ghost preview, nudge, /aida approve). REVISING: pass replaceProposalId to swap a pending extension ('make it 20' = call again with count 20)."),
-		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, count?: tiles to extend (default 1), direction?: 'north'|'south'|'east'|'west' (omit = the player's stance/aim decides)}"},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically."}},"required":["spec"]})"),
+		TEXT("PROPOSE extending the foundation slab the player is standing on or aiming at. The server finds the CONTIGUOUS slab (its foundation types, lattice, and height steps), then extends EVERY lane of the slab's full width by spec.count tiles from that lane's own edge — same foundation class, height and rotation as the edge it grows from, so ragged edges, mixed types and terrain-following steps all extend correctly. Direction: spec.direction ('north'|'south'|'east'|'west', or player-relative 'left'|'right'|'forward'|'back' resolved against their facing) ONLY when the player names one; otherwise the server uses their LOOK direction when standing on the slab, or the aimed edge's outward face when they aim at the slab from beside it — never ask for a direction. Spec: {version:1, count: tiles to extend (default 1), direction?}. ALWAYS use this when the player says to extend/continue/grow existing foundations, a floor, or a platform — NEVER assemble an extension with propose_build (it cannot find the existing slab's lattice). Returns the dry-run (count, cost, validity) + proposalId; same approval flow as propose_build (ghost preview, nudge, /aida approve). REVISING: pass replaceProposalId to swap a pending extension ('make it 20' = call again with count 20)."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, count?: tiles to extend (default 1), direction?: 'north'|'south'|'east'|'west'|'left'|'right'|'forward'|'back' (omit = the player's stance/aim decides)}"},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
 		{
@@ -3429,7 +3447,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
 	Tools.Register({
 		TEXT("propose_manifold"),
-		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). This works for v1 grids AND v2 composites (a composite's ports come from its machine parts; foundations/walls contribute none) — NEVER tell the player a pending proposal must be approved or built before manifolds can be added. Call again with the NEW id to add more manifolds (both sides = one call per side)."),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, flow?:'left'|'right'|'forward'|'back'|compass (the direction ITEMS MOVE along the trunk, resolved against the player's facing — 'flowing left to right' = flow 'right': feed end lands on the left for in-rows, exit on the right for out-rows), standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). This works for v1 grids AND v2 composites (a composite's ports come from its machine parts; foundations/walls contribute none) — NEVER tell the player a pending proposal must be approved or built before manifolds can be added. Call again with the NEW id to add more manifolds (both sides = one call per side)."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."},"forProposalId":{"type":"string","description":"Optional: a PENDING machine-build proposal to manifold — the machines do NOT need to exist yet. The pending proposal is replaced by ONE combined proposal (machines + manifold, ghosts for both, one approval). Omit spec.machines when using this."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -3747,6 +3765,17 @@ void UAIDAOrchestrator::RegisterActionTools()
 				NewSet.Attachments = MoveTemp(Plan.Attachments);
 				NewSet.RowAxis = Plan.RowAxis;
 				NewSet.DropDir = Plan.DropDir;
+				if (!Spec.Flow.IsEmpty())
+				{
+					FVector FlowDir;
+					if (!FAIDAActionSeam::ResolveRelativeDirection(this, Ctx.PlayerId, Spec.Flow, FlowDir))
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+							TEXT("unknown flow direction '%s' — use left/right/forward/back or north/south/east/west"), *Spec.Flow), {}));
+					}
+					AIDAActionSpec::OrientManifoldFlow(NewSet.Attachments, NewSet.Ports, &NewSet.PortMachineIndex,
+						NewSet.RowAxis, NewSet.bOutput, FlowDir);
+				}
 				const int32 SetCount = NewSet.Attachments.Num();
 				const int32 RunCount = 2 * SetCount - 1;
 
@@ -4046,8 +4075,22 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.Ports = MoveTemp(SortedPorts);
 			Proposal.RowAxis = Plan.RowAxis;
 			Proposal.DropDir = Plan.DropDir;
+			// spec.flow: make the items MOVE the way the player said ("left to right" = flow:
+			// 'right'), resolved against their facing. Unknown words fail loudly — a silently
+			// ignored direction builds the row backwards.
+			if (!Spec.Flow.IsEmpty())
+			{
+				FVector FlowDir;
+				if (!FAIDAActionSeam::ResolveRelativeDirection(this, Ctx.PlayerId, Spec.Flow, FlowDir))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("unknown flow direction '%s' — use left/right/forward/back or north/south/east/west"), *Spec.Flow), {}));
+				}
+				AIDAActionSpec::OrientManifoldFlow(Proposal.Placements, Proposal.Ports, nullptr,
+					Proposal.RowAxis, Spec.bOutput, FlowDir);
+			}
 			Proposal.Summary = AIDAActionSpec::SummarizeManifold(Spec, Attachment.DisplayName, Transport.DisplayName,
-				Proposal.Ports.Num(), RunCount, AIDAActionSpec::CompassName(-Plan.RowAxis));
+				Proposal.Ports.Num(), RunCount, AIDAActionSpec::CompassName(-Proposal.RowAxis));
 			if (SkippedConnected > 0)
 			{
 				Proposal.Summary += FString::Printf(TEXT(" [%d machine(s) already connected, skipped]"), SkippedConnected);
