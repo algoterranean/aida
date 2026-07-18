@@ -2212,14 +2212,25 @@ bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDA
 		return WantedName.IsEmpty() || NormalizeName(Name).Contains(WantedName);
 	};
 
+	// Nearest-first: the count cap keeps the CLOSEST matches, not whichever entries the subsystem
+	// arrays happen to list first — with the generous default radius that difference decides
+	// whether "dismantle the smelters over there" grabs the right machines.
+	struct FCandidate
+	{
+		double DistSq = 0.0;
+		AFGBuildable* Actor = nullptr;   // full actor…
+		TSubclassOf<UFGRecipe> Recipe;   // …or a lightweight's recipe (Actor null)
+	};
+	TArray<FCandidate> Candidates;
+
 	// Full-actor buildables — live walk, never a cached FactoryIndex snapshot.
 	if (AFGBuildableSubsystem* Subsystem = AFGBuildableSubsystem::Get(World))
 	{
 		for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
 		{
-			if (Out.Count >= Selector.MaxCount) { break; }
 			if (!IsValid(Buildable)) { continue; }
-			if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+			const double DistSq = FVector::DistSquared(Buildable->GetActorLocation(), CenterCm);
+			if (DistSq > RadiusSq) { continue; }
 
 			const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
 			const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
@@ -2227,13 +2238,7 @@ bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDA
 			if (!MatchesName(Name)) { continue; }
 			if (!IFGDismantleInterface::Execute_CanDismantle(Buildable)) { continue; }
 
-			TArray<FInventoryStack> Refund;
-			IFGDismantleInterface::Execute_GetDismantleRefund(Buildable, Refund, /*noBuildCostEnabled*/ false);
-			for (const FInventoryStack& Stack : Refund)
-			{
-				AddCost(Out.Refund, Stack.Item.GetItemClass(), Stack.NumItems);
-			}
-			++Out.Count;
+			Candidates.Add({ DistSq, Buildable, Recipe });
 		}
 	}
 
@@ -2242,8 +2247,6 @@ bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDA
 	{
 		for (const auto& Pair : Lightweights->GetAllLightweightBuildableInstances())
 		{
-			if (Out.Count >= Selector.MaxCount) { break; }
-
 			const TSubclassOf<UFGRecipe> Recipe = Lightweights->GetBuiltWithRecipeForBuildableClass(Pair.Key);
 			const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
 			const FString Name = Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Pair.Key.Get());
@@ -2251,21 +2254,37 @@ bool FAIDAActionSeam::ResolveDismantleTargets(UObject* WorldContext, const FAIDA
 
 			for (const FRuntimeBuildableInstanceData& Instance : Pair.Value)
 			{
-				if (Out.Count >= Selector.MaxCount) { break; }
 				if (!Instance.IsValid()) { continue; } // removed slots linger in the array
-				if (FVector::DistSquared(Instance.Transform.GetLocation(), CenterCm) > RadiusSq) { continue; }
-
-				// Refund = build cost (the game refunds ingredients in full).
-				if (Recipe)
-				{
-					for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(World, Recipe))
-					{
-						AddCost(Out.Refund, Ingredient.ItemClass, Ingredient.Amount);
-					}
-				}
-				++Out.Count;
+				const double DistSq = FVector::DistSquared(Instance.Transform.GetLocation(), CenterCm);
+				if (DistSq > RadiusSq) { continue; }
+				Candidates.Add({ DistSq, nullptr, Recipe });
 			}
 		}
+	}
+
+	Candidates.Sort([](const FCandidate& A, const FCandidate& B) { return A.DistSq < B.DistSq; });
+	const int32 Take = FMath::Min(Candidates.Num(), Selector.MaxCount);
+	for (int32 i = 0; i < Take; ++i)
+	{
+		const FCandidate& C = Candidates[i];
+		if (C.Actor)
+		{
+			TArray<FInventoryStack> Refund;
+			IFGDismantleInterface::Execute_GetDismantleRefund(C.Actor, Refund, /*noBuildCostEnabled*/ false);
+			for (const FInventoryStack& Stack : Refund)
+			{
+				AddCost(Out.Refund, Stack.Item.GetItemClass(), Stack.NumItems);
+			}
+		}
+		else if (C.Recipe)
+		{
+			// Refund = build cost (the game refunds ingredients in full).
+			for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(World, C.Recipe))
+			{
+				AddCost(Out.Refund, Ingredient.ItemClass, Ingredient.Amount);
+			}
+		}
+		++Out.Count;
 	}
 
 	return true;
@@ -2498,13 +2517,22 @@ bool FAIDAActionSeam::ResolveDismantleHandles(UObject* WorldContext, const FAIDA
 		return WantedName.IsEmpty() || NormalizeName(Name).Contains(WantedName);
 	};
 
+	// Nearest-first, mirroring ResolveDismantleTargets — the approval-time cap must land on the
+	// SAME buildables the dry-run counted, not on subsystem-array order.
+	struct FScored
+	{
+		double DistSq = 0.0;
+		FAIDADismantleHandle Handle;
+	};
+	TArray<FScored> Scored;
+
 	if (AFGBuildableSubsystem* Subsystem = AFGBuildableSubsystem::Get(World))
 	{
 		for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
 		{
-			if (OutHandles.Num() >= Selector.MaxCount) { break; }
 			if (!IsValid(Buildable)) { continue; }
-			if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+			const double DistSq = FVector::DistSquared(Buildable->GetActorLocation(), CenterCm);
+			if (DistSq > RadiusSq) { continue; }
 
 			const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
 			const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
@@ -2519,10 +2547,11 @@ bool FAIDAActionSeam::ResolveDismantleHandles(UObject* WorldContext, const FAIDA
 			Entity.Pos = Buildable->GetActorLocation();
 			Entity.YawDeg = FMath::RoundToInt32(Buildable->GetActorRotation().Yaw);
 
-			FAIDADismantleHandle Handle;
-			Handle.Actor = Buildable;
-			Handle.EncodedId = AIDAActionSpec::EncodeEntityId(Entity);
-			OutHandles.Add(MoveTemp(Handle));
+			FScored Entry;
+			Entry.DistSq = DistSq;
+			Entry.Handle.Actor = Buildable;
+			Entry.Handle.EncodedId = AIDAActionSpec::EncodeEntityId(Entity);
+			Scored.Add(MoveTemp(Entry));
 		}
 	}
 
@@ -2530,8 +2559,6 @@ bool FAIDAActionSeam::ResolveDismantleHandles(UObject* WorldContext, const FAIDA
 	{
 		for (const auto& Pair : Lightweights->GetAllLightweightBuildableInstances())
 		{
-			if (OutHandles.Num() >= Selector.MaxCount) { break; }
-
 			const TSubclassOf<UFGRecipe> Recipe = Lightweights->GetBuiltWithRecipeForBuildableClass(Pair.Key);
 			const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
 			const FString Name = Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Pair.Key.Get());
@@ -2539,10 +2566,10 @@ bool FAIDAActionSeam::ResolveDismantleHandles(UObject* WorldContext, const FAIDA
 
 			for (int32 Index = 0; Index < Pair.Value.Num(); ++Index)
 			{
-				if (OutHandles.Num() >= Selector.MaxCount) { break; }
 				const FRuntimeBuildableInstanceData& Instance = Pair.Value[Index];
 				if (!Instance.IsValid()) { continue; }
-				if (FVector::DistSquared(Instance.Transform.GetLocation(), CenterCm) > RadiusSq) { continue; }
+				const double DistSq = FVector::DistSquared(Instance.Transform.GetLocation(), CenterCm);
+				if (DistSq > RadiusSq) { continue; }
 
 				FAIDAEntityId Entity;
 				Entity.Type = TEXT("lw");
@@ -2551,11 +2578,20 @@ bool FAIDAActionSeam::ResolveDismantleHandles(UObject* WorldContext, const FAIDA
 				Entity.Pos = Instance.Transform.GetLocation();
 				Entity.YawDeg = FMath::RoundToInt32(Instance.Transform.Rotator().Yaw);
 
-				FAIDADismantleHandle Handle;
-				Handle.EncodedId = AIDAActionSpec::EncodeEntityId(Entity);
-				OutHandles.Add(MoveTemp(Handle));
+				FScored Entry;
+				Entry.DistSq = DistSq;
+				Entry.Handle.EncodedId = AIDAActionSpec::EncodeEntityId(Entity);
+				Scored.Add(MoveTemp(Entry));
 			}
 		}
+	}
+
+	Scored.Sort([](const FScored& A, const FScored& B) { return A.DistSq < B.DistSq; });
+	const int32 Take = FMath::Min(Scored.Num(), Selector.MaxCount);
+	OutHandles.Reserve(Take);
+	for (int32 i = 0; i < Take; ++i)
+	{
+		OutHandles.Add(MoveTemp(Scored[i].Handle));
 	}
 
 	return true;

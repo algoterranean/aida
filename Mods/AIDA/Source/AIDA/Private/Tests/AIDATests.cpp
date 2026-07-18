@@ -2152,15 +2152,19 @@ bool FAIDAActionsSpecParseTest::RunTest(const FString&)
 		TestFalse(TEXT("omitted center flagged"), Sel.bHasCenter);
 	}
 
-	// Dismantle selector: valid, maxCount clamped to the cap, radius required.
+	// Dismantle selector: valid, maxCount clamped to the cap, radius optional (defaults 200 m).
 	{
 		FAIDADismantleSpec Sel;
 		TestTrue(TEXT("selector parses"), AIDAActionSpec::ParseDismantleSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "buildable": "Smelter", "center": { "x": 1, "y": 2 },
 			                            "radiusM": 50, "maxCount": 500 })")), 200, Sel, Error));
 		TestEqual(TEXT("maxCount clamped"), Sel.MaxCount, 200);
-		TestFalse(TEXT("rejects missing radius"), AIDAActionSpec::ParseDismantleSpec(
+		TestEqual(TEXT("explicit radius kept"), Sel.RadiusM, 50.0);
+		TestTrue(TEXT("omitted radius parses"), AIDAActionSpec::ParseDismantleSpec(
 			AIDATestParseJson(TEXT(R"({ "version": 1, "center": { "x": 1, "y": 2 } })")), 200, Sel, Error));
+		TestEqual(TEXT("omitted radius defaults to 200 m"), Sel.RadiusM, 200.0);
+		TestFalse(TEXT("rejects non-positive radius"), AIDAActionSpec::ParseDismantleSpec(
+			AIDATestParseJson(TEXT(R"({ "version": 1, "radiusM": 0 })")), 200, Sel, Error));
 	}
 
 	// Power spec (propose_power): everything optional but the version; planner chunks rows.

@@ -340,10 +340,15 @@ bool AIDAActionSpec::ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int
 		}
 		Parsed.bHasCenter = true;
 	}
-	if (!Spec->TryGetNumberField(TEXT("radiusM"), Parsed.RadiusM) || Parsed.RadiusM <= 0.0)
+	// radiusM is optional (default 200 m) — the resolvers take targets NEAREST-FIRST, so a
+	// generous reach never means "grab arbitrary far-away matches".
+	if (Spec->HasField(TEXT("radiusM")))
 	{
-		OutError = TEXT("'radiusM' must be a positive number");
-		return false;
+		if (!Spec->TryGetNumberField(TEXT("radiusM"), Parsed.RadiusM) || Parsed.RadiusM <= 0.0)
+		{
+			OutError = TEXT("'radiusM' must be a positive number");
+			return false;
+		}
 	}
 
 	int32 MaxCount = 0;

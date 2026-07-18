@@ -91,7 +91,7 @@ struct FAIDADismantleSpec
 	FString Buildable;                     // display-name match; "" = anything
 	FVector CenterM = FVector::ZeroVector; // metres
 	bool bHasCenter = false;               // omitted center = at the requesting player (Ctx.Location)
-	double RadiusM = 0.0;
+	double RadiusM = 200.0;                // omitted radius = 200 m (targets are taken nearest-first)
 	int32 MaxCount = 20;
 };
 

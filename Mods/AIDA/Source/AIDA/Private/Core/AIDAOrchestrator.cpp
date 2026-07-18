@@ -3367,7 +3367,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// re-resolved at execute time (Slice 2) — never trusted from this dry-run.
 	Tools.Register({
 		TEXT("propose_dismantle"),
-		TEXT("PROPOSE removing buildables near a point. Nothing is dismantled until a player with act permission approves. Returns the matched count + refund tally and a proposalId. Selector: {version:1, buildable:'display name or empty for any', center?:{x,y,z in metres}, radiusM, maxCount?}. OMIT center to search around the requesting player — never ask the player for coordinates."),
+		TEXT("PROPOSE removing buildables near a point. Nothing is dismantled until a player with act permission approves. Returns the matched count + refund tally and a proposalId. Selector: {version:1, buildable:'display name or empty for any', center?:{x,y,z in metres}, radiusM?:200, maxCount?}. OMIT center to search around the requesting player — never ask the player for coordinates. OMIT radiusM unless the player names an area — the default reaches 200 m and targets are taken NEAREST-FIRST, so distance is never a reason to refuse."),
 		TEXT(R"({"type":"object","properties":{"selector":{"type":"object","description":"The versioned dismantle selector (see tool description)."}},"required":["selector"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult

@@ -22,7 +22,7 @@ namespace AIDAActionSpec
 	 */
 	bool ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDABuildSpec& Out, FString& OutError);
 
-	/** Parse + validate a propose_dismantle selector: version 1, radius > 0, maxCount clamped to MaxItems. */
+	/** Parse + validate a propose_dismantle selector: version 1, radius optional (default 200 m, must be > 0 when given), maxCount clamped to MaxItems. */
 	bool ParseDismantleSpec(const TSharedPtr<FJsonObject>& Spec, int32 MaxItems, FAIDADismantleSpec& Out, FString& OutError);
 
 	/**
