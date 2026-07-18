@@ -72,6 +72,14 @@ plus "underclock what you recommended" round-trip.
 
 ### Slice 3 — Tap symmetry & buffers
 
+> **Status (2026-07-18): `propose_pipe_tap` SHIPPED (81e3bf6)** — free-end or junction splice +
+> ONE feed run (≤56 m; chains stay belt-only until the belt chain live-verifies), both target
+> modes. **`propose_storage` deferred by decision:** the revise-by-prompt chain already collapses
+> the buffer to one approval (`propose_build` containers → `propose_manifold {direction in,
+> forProposalId}` → `propose_belt_tap {forProposalId}`), so a dedicated tool would duplicate the
+> manifold planner for sugar. Revisit only if the model proves bad at the 3-call chain in live use.
+> Slices 1 (f487585) and 2 (9a62735) shipped the same day.
+
 - **`propose_pipe_tap`** — the belt-tap flow for fluids. Source census over `AFGBuildablePipeline`
   (contents via fluid descriptor + `FindOffsetClosestToLocation` equivalents), splice via
   `AFGPipelineAttachmentHologram` (junction-on-pipe is the same native splice family as
