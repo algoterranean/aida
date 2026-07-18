@@ -30,6 +30,8 @@
 #include "FGSchematicManager.h"
 #include "FGSchematic.h"
 #include "FGRecipe.h"
+#include "Hologram/FGHologram.h"
+#include "Equipment/FGBuildGun.h"
 #include "ItemAmount.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Engine/World.h"
@@ -410,6 +412,11 @@ void UAIDAOrchestrator::Deinitialize()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(UndoCommand);
 		UndoCommand = nullptr;
+	}
+	if (CleanGhostsCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(CleanGhostsCommand);
+		CleanGhostsCommand = nullptr;
 	}
 	if (PostLoginHandle.IsValid())
 	{
@@ -6051,6 +6058,12 @@ void UAIDAOrchestrator::RegisterConsoleCommands()
 		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::Nodes),
 		ECVF_Default);
 
+	CleanGhostsCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("AIDA.CleanGhosts"),
+		TEXT("Destroy stray hologram actors (leaked AIDA ghost previews — undismantlable, collision-off debris). Skips any hologram a player's build gun is actively using. Usage: AIDA.CleanGhosts"),
+		FConsoleCommandWithArgsDelegate::CreateUObject(this, &UAIDAOrchestrator::CleanGhosts),
+		ECVF_Default);
+
 	RecipesCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("AIDA.Recipes"),
 		TEXT("Log the static recipe + building catalog for a filter (checks Slice 3b lookup tools without the LLM). Run on server/host. Usage: AIDA.Recipes [item/name filter...]"),
@@ -6301,6 +6314,48 @@ void UAIDAOrchestrator::Nodes(const TArray<FString>& /*Args*/)
 	const double Now = World ? World->GetTimeSeconds() : 0.0;
 	const FString Json = AIDAMapTools::BuildResourceNodesJson(MapService.GetNodes(World, Now), FString(), /*bUntappedOnly=*/false);
 	UE_LOG(LogAIDA, Log, TEXT("AIDA.Nodes summary: %s"), *Json);
+}
+
+void UAIDAOrchestrator::CleanGhosts(const TArray<FString>& /*Args*/)
+{
+	UWorld* World = GetWorld();
+	if (!World || World->GetNetMode() == NM_Client)
+	{
+		UE_LOG(LogAIDA, Warning, TEXT("AIDA.CleanGhosts runs only on the server/host (this is a client)."));
+		return;
+	}
+
+	// Any hologram not in a player's build gun's hands is stray in a running game — real holograms
+	// exist only while someone is actively placing. Our leaked ghost previews (and their orphaned
+	// child holograms) are exactly that: ownerless, quiesced, undismantlable.
+	int32 Destroyed = 0;
+	TArray<AFGHologram*> Strays;
+	for (TActorIterator<AFGHologram> It(World); It; ++It)
+	{
+		AFGHologram* Hologram = *It;
+		if (!IsValid(Hologram)) { continue; }
+		if (Cast<AFGBuildGun>(Hologram->GetOwner())) { continue; } // a player is holding this one
+		Strays.Add(Hologram);
+	}
+	for (AFGHologram* Stray : Strays)
+	{
+		if (!IsValid(Stray)) { continue; } // an earlier destroy may have taken children with it
+		TArray<AActor*> Attached;
+		Stray->GetAttachedActors(Attached, /*bResetArray*/ true, /*bRecursivelyIncludeAttachedActors*/ true);
+		for (AActor* Child : Attached)
+		{
+			if (IsValid(Child) && Child->Destroy()) { ++Destroyed; }
+		}
+		if (Stray->Destroy()) { ++Destroyed; }
+	}
+	UE_LOG(LogAIDA, Log, TEXT("AIDA.CleanGhosts: destroyed %d stray hologram actor(s)."), Destroyed);
+	AnnounceSystem(FString::Printf(TEXT("Cleaned up %d stray ghost piece(s)."), Destroyed));
+
+	// Rebuild legitimate previews for anything still pending so live proposals keep their ghosts.
+	if (AAIDAProposalRelay* R = GetProposalRelay())
+	{
+		R->RefreshGhosts();
+	}
 }
 
 void UAIDAOrchestrator::Recipes(const TArray<FString>& Args)

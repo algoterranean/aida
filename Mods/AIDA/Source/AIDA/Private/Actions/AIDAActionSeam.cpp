@@ -3004,7 +3004,11 @@ bool FAIDAActionSeam::UndoRemoveEntity(UObject* WorldContext, const FAIDAEntityI
 			IFGDismantleInterface::Execute_Dismantle(CachedActor);
 			return true;
 		}
-		return false;
+		// OUR actor refusing the dismantle interface must still go — leaving it strands debris
+		// the player can't remove either (live-verify: unremovable pieces after a pipe undo).
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] undo: %s refused dismantle — destroying directly."), *GetNameSafe(CachedActor));
+		CachedActor->Destroy();
+		return true;
 	}
 
 	if (Entity.Type == TEXT("lw"))

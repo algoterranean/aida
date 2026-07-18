@@ -190,6 +190,9 @@ private:
 	/** `AIDA.Nodes` — dump the resource-node summary to the log (map-scan check, no LLM). */
 	void Nodes(const TArray<FString>& Args);
 
+	/** `AIDA.CleanGhosts` — destroy stray hologram actors (leaked ghost previews) in the world. */
+	void CleanGhosts(const TArray<FString>& Args);
+
 	/** `AIDA.Recipes` — dump the recipe/building catalog for a filter (static-catalog check, no LLM). */
 	void Recipes(const TArray<FString>& Args);
 
@@ -272,6 +275,7 @@ private:
 	IConsoleCommand* ApproveCommand = nullptr;
 	IConsoleCommand* RejectCommand = nullptr;
 	IConsoleCommand* UndoCommand = nullptr;
+	IConsoleCommand* CleanGhostsCommand = nullptr;
 
 	//~ Periodic history snapshots (Phase 3). Defaults; config wiring lands in Slice 3.
 	UFUNCTION()

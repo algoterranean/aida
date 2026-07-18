@@ -35,7 +35,16 @@ void AAIDAProposalRelay::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		for (const TWeakObjectPtr<AActor>& Ghost : Pair.Value)
 		{
-			if (AActor* Actor = Ghost.Get()) { Actor->Destroy(); }
+			if (AActor* Actor = Ghost.Get())
+			{
+				TArray<AActor*> Attached;
+				Actor->GetAttachedActors(Attached, /*bResetArray*/ true, /*bRecursivelyIncludeAttachedActors*/ true);
+				for (AActor* Child : Attached)
+				{
+					if (IsValid(Child)) { Child->Destroy(); }
+				}
+				Actor->Destroy();
+			}
 		}
 	}
 	Ghosts.Reset();
@@ -48,7 +57,20 @@ void AAIDAProposalRelay::ClearGhosts(const FGuid& Id)
 	{
 		for (const TWeakObjectPtr<AActor>& Ghost : *Existing)
 		{
-			if (AActor* Actor = Ghost.Get()) { Actor->Destroy(); }
+			if (AActor* Actor = Ghost.Get())
+			{
+				// Spline ghosts (pipe/belt runs) spawn ATTACHED child actors — support and
+				// connector holograms. Destroy() does NOT cascade to attached actors, and the
+				// orphans are quiesced (collision off) so players can't even dismantle them
+				// (live-verify: undismantlable pipe-connector barrels littering the floor).
+				TArray<AActor*> Attached;
+				Actor->GetAttachedActors(Attached, /*bResetArray*/ true, /*bRecursivelyIncludeAttachedActors*/ true);
+				for (AActor* Child : Attached)
+				{
+					if (IsValid(Child)) { Child->Destroy(); }
+				}
+				Actor->Destroy();
+			}
 		}
 		Ghosts.Remove(Id);
 	}

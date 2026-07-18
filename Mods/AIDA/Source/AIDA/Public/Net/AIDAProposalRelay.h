@@ -64,6 +64,10 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "AIDA")
 	FAIDAOnProposalsChangedDelegate OnProposalsChanged;
 
+	/** Rebuild the ghost previews from the current list (public for AIDA.CleanGhosts, which nukes
+	 *  stray holograms world-wide and must then restore the legitimate ones). */
+	void RefreshGhosts();
+
 private:
 	UFUNCTION()
 	void OnRep_Proposals();
@@ -80,6 +84,5 @@ private:
 	 * Rendering-side only; a dedicated server spawns none.
 	 */
 	TMap<FGuid, TArray<TWeakObjectPtr<AActor>>> Ghosts;
-	void RefreshGhosts();
 	void ClearGhosts(const FGuid& Id);
 };
