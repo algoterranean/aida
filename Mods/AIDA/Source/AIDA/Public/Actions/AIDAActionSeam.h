@@ -75,6 +75,34 @@ public:
 		TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError);
 
 	/**
+	 * P8 Slice 3 — the pipe mirror of FindTapSource: the nearest AFGBuildablePipeline whose fluid
+	 * matches FluidFilter (substring; empty = any pipe), preferring a FREE pipe end (pipes are
+	 * direction-agnostic, so either unconnected end taps without a cut) over a mid-pipe junction
+	 * splice. Out reuses FAIDATapSource: Belt = the pipeline, ItemNote = the fluid.
+	 */
+	static bool FindPipeTapSource(UObject* WorldContext, const FString& FluidFilter,
+		const FVector& FeedPointCm, double MaxDistanceCm, FAIDATapSource& Out);
+
+	/**
+	 * P8 Slice 3 — the pipe mirror of FindFreeBeltInputPort: the nearest FREE pipe port
+	 * (PCT_CONSUMER or PCT_ANY) on BUILT non-pipeline structures near a point; junction/pump
+	 * attachments beat machine ports at equal distance.
+	 */
+	static bool FindFreePipeInputPort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+		FAIDAManifoldPort& OutPort, FString& OutError);
+
+	/**
+	 * P8 Slice 3 — the pipe mirror of ExecuteTapSplice: drive the junction hologram onto the LIVE
+	 * pipeline at OffsetCm (the game's attachment-on-pipe snap splits the pipe and wires both
+	 * halves through the junction), Construct, then verify ≥2 connected pipe ports — an unspliced
+	 * junction is torn down and the pipe stays whole. NOTE: same splice family as the belt tap,
+	 * and the same live-verify status (the snap-latch is the untested assumption).
+	 */
+	static bool ExecutePipeTapSplice(UObject* WorldContext, AActor* PipeActor, double OffsetCm,
+		const FString& JunctionRecipePath, TArray<FString>& OutEntityIds,
+		TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError);
+
+	/**
 	 * The nearest FREE belt-input port on BUILT structures near a point (standalone belt taps —
 	 * the machines/manifold already exist). Conveyor attachments (a built manifold row's open
 	 * trunk end) win over machine inputs; belts themselves are excluded. OutPort carries the

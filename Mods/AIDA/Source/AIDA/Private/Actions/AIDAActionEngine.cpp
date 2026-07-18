@@ -645,16 +645,19 @@ bool FAIDAActionEngine::PrepareTapSource(UObject* WorldContext, const FAIDAActio
 	FString Error;
 	if (!SourceBelt)
 	{
-		Error = TEXT("the source belt no longer exists");
+		Error = Proposal.bTapPipe ? TEXT("the source pipeline no longer exists") : TEXT("the source belt no longer exists");
 	}
 	else if (Proposal.bTapDangling)
 	{
 		TapSourceActor = SourceBelt;
 	}
-	else if (!FAIDAActionSeam::ExecuteTapSplice(WorldContext, SourceBelt, Proposal.TapOffsetCm,
-		Proposal.TapSplitterRecipePath, Proposal.AffectedEntityIds, BuiltActors, TapSourceActor, Error))
+	else if (Proposal.bTapPipe
+		? !FAIDAActionSeam::ExecutePipeTapSplice(WorldContext, SourceBelt, Proposal.TapOffsetCm,
+			Proposal.TapSplitterRecipePath, Proposal.AffectedEntityIds, BuiltActors, TapSourceActor, Error)
+		: !FAIDAActionSeam::ExecuteTapSplice(WorldContext, SourceBelt, Proposal.TapOffsetCm,
+			Proposal.TapSplitterRecipePath, Proposal.AffectedEntityIds, BuiltActors, TapSourceActor, Error))
 	{
-		AccrueSkippedCost(WorldContext, Config, Proposal.TapSplitterRecipePath, 1); // refund the unbuilt splitter
+		AccrueSkippedCost(WorldContext, Config, Proposal.TapSplitterRecipePath, 1); // refund the unbuilt splitter/junction
 	}
 	if (!TapSourceActor.IsValid())
 	{
@@ -711,7 +714,7 @@ bool FAIDAActionEngine::TickFeedHop(UObject* WorldContext, const FAIDAActionsCon
 			Fail(TEXT("destination missing (attachment skipped or machine gone)"));
 			return false;
 		}
-		bOk = FAIDAActionSeam::BuildConnectingRun(WorldContext, TransportPath, /*bPipe*/ false,
+		bOk = FAIDAActionSeam::BuildConnectingRun(WorldContext, TransportPath, Proposal.bTapPipe,
 			From, FromDir, DestActor, DestWantDir, Config.CostMode == TEXT("central"), Cost,
 			Proposal.AffectedEntityIds, BuiltActors, Error, Proposal.RequesterId);
 	}

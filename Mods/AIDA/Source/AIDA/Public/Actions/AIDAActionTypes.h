@@ -436,7 +436,11 @@ struct FAIDAProposal
 	//  trunk's open end (index-0 attachment). Cut variant relies on the game's native
 	//  attachment-on-belt splice (the splitter hologram snapped onto the belt splits + rewires it).
 	bool bTap = false;
-	TWeakObjectPtr<AActor> TapBelt;        // source conveyor; a dead weak ptr = tap fails loudly
+	/** P8 Slice 3: the tap source/feed are PIPES (junction splice + pipe run). v1 pipe taps are
+	 *  single-run (no chain waypoints) — pipe hops must end engine-snapped, which chains can't
+	 *  guarantee headlessly yet. */
+	bool bTapPipe = false;
+	TWeakObjectPtr<AActor> TapBelt;        // source conveyor/pipeline; a dead weak ptr = tap fails loudly
 	FString TapBeltName;
 	bool bTapDangling = false;             // free end — no cut, no splitter
 	double TapOffsetCm = 0.0;              // cut offset along the source belt

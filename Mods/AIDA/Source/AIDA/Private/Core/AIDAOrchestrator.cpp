@@ -182,6 +182,11 @@ namespace
 		"- propose_upgrade_belts(selector?, targetMk): upgrade (or downgrade) conveyor belts to a mark, "
 		"preserving connections and items. Use for 'upgrade these belts / all belts within X m to Mk.N'. "
 		"Each new belt's cost is charged as built.\n"
+		"- propose_pipe_tap(spec, forProposalId?): feed a machine from an EXISTING pipeline — splice a "
+		"junction in (or use a free pipe end) + one pipe run to the destination (~56 m max, no chaining "
+		"yet). Use for 'hook this up to the water line / tap the oil pipe'. Same two modes as "
+		"propose_belt_tap: forProposalId feeds a pending pipe-in manifold; omit it to feed the nearest "
+		"free pipe input where the player is aiming.\n"
 		"- propose_power(spec): wire EXISTING machines to electricity — poles beside them, power lines, "
 		"and a tie to the nearest powered grid. Use when the player asks to power/wire up machines that "
 		"are already built ('connect to power', 'wire it up'). Omit spec.center to wire what they're "
@@ -4409,6 +4414,266 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (!Combined.bTapDangling)
 			{
 				Announce += TEXT(" NOTE: approving cuts the source belt to splice the tap in (undo removes the tap but the cut stays).");
+			}
+			AnnounceSystem(Announce);
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds, true, 0.0));
+		}
+	});
+
+	// P8 Slice 3: propose_pipe_tap — the belt-tap flow for fluids. Junction-on-pipe is the same
+	// native splice family as splitter-on-belt; pipes are direction-agnostic at the junction, and
+	// v1 feeds are SINGLE runs (chain hops must end engine-snapped — belt-only until proven).
+	Tools.Register({
+		TEXT("propose_pipe_tap"),
+		TEXT("Feed a machine from an EXISTING pipeline: the server finds the nearest pipeline whose fluid matches spec.fluid (omit = the nearest pipe of any kind), taps it — by SPLICING a Pipeline Junction into it mid-pipe (the source keeps flowing; the tap takes a share) or by using a FREE pipe end — and routes ONE pipe run from the tap to the destination (v1 pipe feeds are single runs, up to ~56 m — no chaining; belts chain, pipes don't yet). TWO TARGET MODES, like propose_belt_tap. (1) forProposalId = a PENDING proposal with a pipe-INPUT manifold (propose_manifold {kind pipe, direction in}): the tap merges into it, ONE approval builds everything. (2) OMIT forProposalId when the machines are ALREADY BUILT: the server finds the nearest FREE pipe input near where the player is aiming (a junction row's open end, or a machine's fluid input) and feeds that. Spec: {version:1, fluid?: fluid name ('Water'), maxDistanceM?: source search radius (default 250), transport?: pipeline display name (default: best unlocked)}. Typical: 'hook the coal generators to the water line' = aim at them and call with {fluid:'Water'}. NOTE: /aida undo removes the junction and feed pipe but the source pipe stays cut."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, fluid?: fluid in the source pipe, maxDistanceM?: default 250, transport?: feed pipeline display name}"},"forProposalId":{"type":"string","description":"Optional: a PENDING pipe-in manifold proposal to feed — replaced by ONE combined proposal. OMIT when the destination is already built; the nearest free pipe input near the player's aim is used."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+			FString Fluid;
+			FString TransportName;
+			double MaxDistanceM = 250.0;
+			if (SpecObj && SpecObj->IsValid())
+			{
+				(*SpecObj)->TryGetStringField(TEXT("fluid"), Fluid);
+				(*SpecObj)->TryGetStringField(TEXT("transport"), TransportName);
+				(*SpecObj)->TryGetNumberField(TEXT("maxDistanceM"), MaxDistanceM);
+			}
+			MaxDistanceM = FMath::Clamp(MaxDistanceM, 5.0, 2000.0);
+
+			FString ForIdStr;
+			Args->TryGetStringField(TEXT("forProposalId"), ForIdStr);
+			ForIdStr = ForIdStr.TrimStartAndEnd();
+			FGuid ForId;
+			const FAIDAProposal* Target = nullptr;
+			if (!ForIdStr.IsEmpty())
+			{
+				Target = FGuid::Parse(ForIdStr, ForId) ? Actions.Store().Find(ForId) : nullptr;
+				if (!Target || Target->State != EAIDAProposalState::Pending)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("forProposalId doesn't match a pending proposal (it may have been decided or expired) — for machines that are ALREADY BUILT, call again WITHOUT forProposalId while aiming at them"), {}));
+				}
+				if (Target->bTap)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("that proposal already has a tap — approve it, or revise the manifold first"), {}));
+				}
+			}
+
+			// The destination: a pending proposal's open pipe-in end, or — standalone — the nearest
+			// FREE pipe input on BUILT structures near the player's aim.
+			FVector FeedPointCm = FVector::ZeroVector;
+			int32 TapSetIndex = INDEX_NONE;
+			FAIDAManifoldPort DestPort;
+			if (Target)
+			{
+				if (Target->bManifold && Target->bManifoldPipe && !Target->bManifoldOutput
+					&& Target->Placements.Num() > 0)
+				{
+					FeedPointCm = Target->Placements[0].GetLocation();
+				}
+				else
+				{
+					for (int32 i = 0; i < Target->ManifoldSets.Num(); ++i)
+					{
+						const FAIDAManifoldSet& Set = Target->ManifoldSets[i];
+						if (Set.bPipe && !Set.bOutput && Set.Attachments.Num() > 0)
+						{
+							TapSetIndex = i;
+							FeedPointCm = Set.Attachments[0].GetLocation();
+							break;
+						}
+					}
+					if (TapSetIndex == INDEX_NONE)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("forProposalId must reference a pending proposal with a pipe-INPUT manifold — call propose_manifold {kind pipe, direction in} first, then tap that proposal"), {}));
+					}
+				}
+			}
+			else
+			{
+				FVector Center = Ctx.Location;
+				FVector Aim;
+				if (FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, Aim))
+				{
+					Center = Aim;
+				}
+				else if (!Ctx.bHasLocation)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("could not resolve where the player is aiming — have them aim at the machine that needs the fluid"), {}));
+				}
+				FString PortError;
+				if (!FAIDAActionSeam::FindFreePipeInputPort(this, Center, 3000.0, DestPort, PortError))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(PortError, {}));
+				}
+				FeedPointCm = DestPort.PosCm;
+			}
+
+			FAIDATapSource Source;
+			if (!FAIDAActionSeam::FindPipeTapSource(this, Fluid, FeedPointCm, MaxDistanceM * AIDAMetersToCm, Source))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Source.Error, {}));
+			}
+
+			// v1 pipe feeds are ONE run — a pipe hop must end engine-snapped, which the chain
+			// machinery can't guarantee headlessly yet (docs/PHASE8.md Slice 3).
+			const double FeedGapM = FVector::Dist(Source.PointCm, FeedPointCm) / AIDAMetersToCm;
+			if (FeedGapM > 56.0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+					TEXT("the nearest matching pipeline (%s carrying %s) is %.0f m from the destination — pipe taps reach ~56 m in v1 (one run, no chaining); build the gap with propose_build pipes or move the tap closer"),
+					*Source.BeltName, *Source.ItemNote, FeedGapM), {}));
+			}
+
+			// The tap junction (cut variant): resolved + costed upfront like any placement.
+			FAIDARecipeResolution Junction;
+			TArray<FAIDACostItem> JunctionCost;
+			if (!Source.bDangling)
+			{
+				if (!FAIDAActionSeam::ResolveBuildRecipe(this, TEXT("Pipeline Junction Cross"), Junction))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("no unlocked buildable matches 'Pipeline Junction Cross' — cannot splice a tap into the pipe"), {}));
+				}
+				FAIDAActionSeam::TallyRecipeCost(this, Junction.RecipeClassPath, 1, JunctionCost);
+			}
+
+			// Standalone taps carry their own feed pipe; combined taps reuse the manifold's.
+			FAIDARecipeResolution Transport;
+			if (!Target)
+			{
+				TArray<FString> Candidates;
+				if (!TransportName.IsEmpty())
+				{
+					Candidates.Add(TransportName);
+				}
+				else
+				{
+					Candidates = { TEXT("Pipeline Mk.2"), TEXT("Pipeline") };
+				}
+				bool bResolved = false;
+				for (const FString& Candidate : Candidates)
+				{
+					if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Transport))
+					{
+						bResolved = true;
+						break;
+					}
+				}
+				if (!bResolved)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("no unlocked pipeline matches '%s' for the feed"),
+						TransportName.IsEmpty() ? TEXT("any pipeline") : *TransportName), {}));
+				}
+			}
+
+			FAIDAProposal Combined = Target ? *Target : FAIDAProposal();
+			Combined.Id = FGuid::NewGuid();
+			Combined.RequesterId = Ctx.PlayerId;
+			Combined.RequesterName = Ctx.Author;
+			Combined.bTap = true;
+			Combined.bTapPipe = true;
+			Combined.TapBelt = Source.Belt;
+			Combined.TapBeltName = Source.BeltName;
+			Combined.bTapDangling = Source.bDangling;
+			Combined.TapOffsetCm = Source.OffsetCm;
+			Combined.TapPointCm = Source.PointCm;
+			Combined.TapDirCm = Source.DirCm;
+			Combined.TapSplitterRecipePath = Source.bDangling ? FString() : Junction.RecipeClassPath;
+			Combined.TapSplitterName = Source.bDangling ? FString() : Junction.DisplayName;
+			Combined.TapSetIndex = TapSetIndex;
+			Combined.TapChainPointsCm.Reset(); // single run — never chained
+			if (!Target)
+			{
+				Combined.Ports.Add(DestPort);
+				Combined.TransportRecipePath = Transport.RecipeClassPath;
+				Combined.TransportName = Transport.DisplayName;
+			}
+			for (const FAIDACostItem& CostItem : JunctionCost)
+			{
+				bool bMerged = false;
+				for (FAIDACostItem& Existing : Combined.Cost)
+				{
+					if (Existing.Item == CostItem.Item)
+					{
+						Existing.Amount += CostItem.Amount;
+						bMerged = true;
+						break;
+					}
+				}
+				if (!bMerged) { Combined.Cost.Add(CostItem); }
+			}
+			if (Config.Actions.CostMode == TEXT("central") && Combined.Cost.Num() > 0
+				&& !FAIDAActionSeam::CheckAffordable(this, Combined.Cost, Ctx.PlayerId))
+			{
+				FString Msg = TEXT("not affordable from central storage + your inventory with the tap included: needs ");
+				for (int32 i = 0; i < Combined.Cost.Num(); ++i)
+				{
+					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), Combined.Cost[i].Amount, *Combined.Cost[i].Item);
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+			const FString TapPhrase = Source.bDangling
+				? FString::Printf(TEXT("tap the free end of %s carrying %s, %.0f m away (one pipe run, charged as built)"),
+					*Source.BeltName, *Source.ItemNote, Source.DistanceM)
+				: FString::Printf(TEXT("tap %s carrying %s, %.0f m away (splice a %s in + one pipe run, charged as built)"),
+					*Source.BeltName, *Source.ItemNote, Source.DistanceM, *Junction.DisplayName);
+			Combined.Summary = Target
+				? Combined.Summary + TEXT(" + ") + TapPhrase
+				: FString::Printf(TEXT("%s to feed %s"), *TapPhrase, *DestPort.MachineName);
+
+			{
+				TSharedPtr<FJsonObject> StoredSpec;
+				if (Target)
+				{
+					const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Target->SpecJson);
+					FJsonSerializer::Deserialize(Reader, StoredSpec);
+				}
+				if (!StoredSpec.IsValid())
+				{
+					StoredSpec = MakeShared<FJsonObject>();
+					StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_pipe_tap"));
+				}
+				TSharedRef<FJsonObject> Tap = MakeShared<FJsonObject>();
+				if (!Fluid.IsEmpty()) { Tap->SetStringField(TEXT("fluid"), Fluid); }
+				Tap->SetStringField(TEXT("pipe"), Source.BeltName);
+				Tap->SetStringField(TEXT("mode"), Source.bDangling ? TEXT("freeEnd") : TEXT("splice"));
+				Tap->SetNumberField(TEXT("distanceM"), Source.DistanceM);
+				StoredSpec->SetObjectField(TEXT("pipeTap"), Tap);
+				Combined.SpecJson = AIDAToCompactJson(StoredSpec.ToSharedRef());
+			}
+
+			if (Target)
+			{
+				SupersedeProposal(ForId);
+				Target = nullptr;
+			}
+
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Combined, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (pipe tap): %s (by %s)"),
+				*Combined.Id.ToString(EGuidFormats::DigitsWithHyphens), *Combined.Summary, *Ctx.Author);
+			PublishProposal(Combined.Id);
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, ForIdStr.IsEmpty() ? TEXT("") : TEXT(", revised"),
+				*Combined.Summary, *AIDACostSummaryString(Combined.Cost));
+			if (!Combined.bTapDangling)
+			{
+				Announce += TEXT(" NOTE: approving cuts the source pipe to splice the junction in (undo removes the tap but the cut stays).");
 			}
 			AnnounceSystem(Announce);
 

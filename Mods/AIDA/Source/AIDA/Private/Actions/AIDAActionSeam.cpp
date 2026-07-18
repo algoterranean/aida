@@ -41,6 +41,8 @@
 #include "FGConveyorChainActor.h"
 #include "FGConveyorItem.h"
 #include "Buildables/FGBuildablePipelineAttachment.h"
+#include "Buildables/FGBuildablePipeBase.h"
+#include "Buildables/FGBuildablePipeline.h"
 #include "Buildables/FGBuildableFactory.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildableStorage.h"
@@ -986,6 +988,302 @@ bool FAIDAActionSeam::FindTapSource(UObject* WorldContext, const FString& ItemFi
 	UE_LOG(LogAIDA, Log, TEXT("[actions] tap source: %s carrying %s, %s at %s (%.0f m from the feed end)"),
 		*Out.BeltName, *Out.ItemNote, Out.bDangling ? TEXT("free end") : TEXT("cut"),
 		*Out.PointCm.ToCompactString(), Out.DistanceM);
+	return true;
+}
+
+bool FAIDAActionSeam::FindPipeTapSource(UObject* WorldContext, const FString& FluidFilter,
+	const FVector& FeedPointCm, double MaxDistanceCm, FAIDATapSource& Out)
+{
+	Out = FAIDATapSource();
+	UWorld* World = ResolveWorld(WorldContext);
+	if (!World)
+	{
+		Out.Error = TEXT("no world to search");
+		return false;
+	}
+
+	const FString Filter = FluidFilter.TrimStartAndEnd();
+	// Splicing a junction needs clear pipe on both sides of the cut, like the belt splitter.
+	constexpr double MinCutEndClearanceCm = 250.0;
+	constexpr double MinCuttableLengthCm = 2.0 * MinCutEndClearanceCm + 10.0;
+
+	struct FCandidate
+	{
+		AFGBuildablePipeline* Pipe = nullptr;
+		bool bDangling = false;
+		double OffsetCm = 0.0;
+		FVector PointCm = FVector::ZeroVector;
+		FVector DirCm = FVector::XAxisVector;
+		double DistCm = 0.0;
+		FString FluidNote;
+	};
+	FCandidate Best;
+	bool bHave = false;
+	int32 Scanned = 0;
+
+	for (TActorIterator<AFGBuildablePipeline> It(World); It; ++It)
+	{
+		AFGBuildablePipeline* Pipe = *It;
+		if (!IsValid(Pipe)) { continue; }
+		++Scanned;
+
+		const TSubclassOf<UFGItemDescriptor> Fluid = Pipe->GetFluidDescriptor();
+		const FString FluidName = Fluid ? DescriptorName(Fluid) : FString();
+		if (!Filter.IsEmpty() && !FluidName.Contains(Filter, ESearchCase::IgnoreCase)) { continue; }
+
+		// Pipes have no flow direction at rest — EITHER unconnected end taps without a cut.
+		UFGPipeConnectionComponent* FreeEnd = nullptr;
+		if (UFGPipeConnectionComponent* End0 = Pipe->GetPipeConnection0())
+		{
+			if (!End0->IsConnected()) { FreeEnd = End0; }
+		}
+		if (!FreeEnd)
+		{
+			if (UFGPipeConnectionComponent* End1 = Pipe->GetPipeConnection1())
+			{
+				if (!End1->IsConnected()) { FreeEnd = End1; }
+			}
+		}
+
+		FCandidate Candidate;
+		Candidate.Pipe = Pipe;
+		Candidate.FluidNote = FluidName.IsEmpty() ? TEXT("empty") : FluidName;
+		if (FreeEnd)
+		{
+			Candidate.bDangling = true;
+			Candidate.PointCm = FreeEnd->GetConnectorLocation();
+			Candidate.DirCm = FreeEnd->GetConnectorNormal();
+			Candidate.DistCm = FVector::Dist(Candidate.PointCm, FeedPointCm);
+		}
+		else
+		{
+			const double Length = Pipe->GetLength();
+			if (Length < MinCuttableLengthCm) { continue; } // too short to splice a junction into
+			const double Offset = FMath::Clamp<double>(Pipe->FindOffsetClosestToLocation(FeedPointCm),
+				MinCutEndClearanceCm, Length - MinCutEndClearanceCm);
+			FVector PointCm, DirCm;
+			Pipe->GetLocationAndDirectionAtOffset(Offset, PointCm, DirCm);
+			Candidate.OffsetCm = Offset;
+			Candidate.PointCm = PointCm;
+			Candidate.DirCm = DirCm.GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+			Candidate.DistCm = FVector::Dist(PointCm, FeedPointCm);
+		}
+		if (Candidate.DistCm > MaxDistanceCm) { continue; }
+
+		// Free ends beat cuts; within a class, nearest wins (same rule as the belt tap).
+		const bool bBetter = !bHave
+			|| (Candidate.bDangling && !Best.bDangling)
+			|| (Candidate.bDangling == Best.bDangling && Candidate.DistCm < Best.DistCm);
+		if (bBetter)
+		{
+			Best = Candidate;
+			bHave = true;
+		}
+	}
+
+	if (!bHave)
+	{
+		Out.Error = Filter.IsEmpty()
+			? FString::Printf(TEXT("no pipeline within %.0f m of the destination"), MaxDistanceCm / AIDAMetersToCm)
+			: FString::Printf(TEXT("no pipeline carrying '%s' within %.0f m of the destination (%d pipe(s) checked)"),
+				*Filter, MaxDistanceCm / AIDAMetersToCm, Scanned);
+		return false;
+	}
+
+	FString PipeName = GetNameSafe(Best.Pipe->GetClass());
+	if (const TSubclassOf<UFGRecipe> Recipe = Best.Pipe->GetBuiltWithRecipe())
+	{
+		const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
+		if (Products.Num() > 0) { PipeName = DescriptorName(Products[0].ItemClass); }
+	}
+
+	Out.Belt = Best.Pipe;
+	Out.BeltName = PipeName;
+	Out.ItemNote = Best.FluidNote;
+	Out.bDangling = Best.bDangling;
+	Out.OffsetCm = Best.OffsetCm;
+	Out.PointCm = Best.PointCm;
+	Out.DirCm = Best.DirCm;
+	Out.DistanceM = Best.DistCm / AIDAMetersToCm;
+	UE_LOG(LogAIDA, Log, TEXT("[actions] pipe tap source: %s carrying %s, %s at %s (%.0f m from the destination)"),
+		*Out.BeltName, *Out.ItemNote, Out.bDangling ? TEXT("free end") : TEXT("cut"),
+		*Out.PointCm.ToCompactString(), Out.DistanceM);
+	return true;
+}
+
+bool FAIDAActionSeam::FindFreePipeInputPort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+	FAIDAManifoldPort& OutPort, FString& OutError)
+{
+	OutPort = FAIDAManifoldPort();
+	OutError.Reset();
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem)
+	{
+		OutError = TEXT("no buildables to search");
+		return false;
+	}
+
+	const double RadiusSq = RadiusCm * RadiusCm;
+	AActor* BestActor = nullptr;
+	UFGPipeConnectionComponent* BestConn = nullptr;
+	int32 BestTier = MAX_int32; // junctions/pumps (built manifold rows) beat machine ports
+	double BestDistSq = TNumericLimits<double>::Max();
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (!IsValid(Buildable)) { continue; }
+		if (Buildable->IsA<AFGBuildablePipeBase>()) { continue; } // pipe ends are sources, not destinations
+		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+		const int32 Tier = Buildable->IsA<AFGBuildablePipelineAttachment>() ? 0 : 1;
+
+		TInlineComponentArray<UFGPipeConnectionComponent*> Connections;
+		Buildable->GetComponents(Connections);
+		for (UFGPipeConnectionComponent* Conn : Connections)
+		{
+			if (!Conn || Conn->IsConnected()) { continue; }
+			const EPipeConnectionType Kind = Conn->GetPipeConnectionType();
+			if (Kind != EPipeConnectionType::PCT_CONSUMER && Kind != EPipeConnectionType::PCT_ANY)
+			{
+				continue;
+			}
+			const double DistSq = FVector::DistSquared(Conn->GetConnectorLocation(), CenterCm);
+			if (Tier < BestTier || (Tier == BestTier && DistSq < BestDistSq))
+			{
+				BestTier = Tier;
+				BestDistSq = DistSq;
+				BestActor = Buildable;
+				BestConn = Conn;
+			}
+		}
+	}
+	if (!BestConn)
+	{
+		OutError = TEXT("no free pipe input within ~30 m of where the player is aiming — aim at the machine (or junction) the fluid should reach");
+		return false;
+	}
+
+	OutPort.Machine = BestActor;
+	OutPort.PosCm = BestConn->GetConnectorLocation();
+	OutPort.NormalCm = BestConn->GetConnectorNormal();
+	OutPort.MachineName = GetNameSafe(BestActor->GetClass());
+	if (const AFGBuildable* Buildable = Cast<AFGBuildable>(BestActor))
+	{
+		if (const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe())
+		{
+			const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
+			if (Products.Num() > 0) { OutPort.MachineName = DescriptorName(Products[0].ItemClass); }
+		}
+	}
+	return true;
+}
+
+bool FAIDAActionSeam::ExecutePipeTapSplice(UObject* WorldContext, AActor* PipeActor, double OffsetCm,
+	const FString& JunctionRecipePath, TArray<FString>& OutEntityIds,
+	TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError)
+{
+	OutError.Reset();
+	OutTapActor = nullptr;
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildablePipeBase* Pipe = Cast<AFGBuildablePipeBase>(PipeActor);
+	UClass* RecipeClass = World ? FSoftClassPath(JunctionRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!Pipe)
+	{
+		OutError = TEXT("the source pipeline no longer exists");
+		return false;
+	}
+	if (!RecipeClass)
+	{
+		OutError = TEXT("the tap junction recipe is no longer resolvable");
+		return false;
+	}
+
+	FVector PointCm, DirCm;
+	Pipe->GetLocationAndDirectionAtOffset(OffsetCm, PointCm, DirCm);
+	UE_LOG(LogAIDA, Log, TEXT("[actions][tap] splicing junction into %s at offset %.0f (%s)"),
+		*GetNameSafe(Pipe), OffsetCm, *PointCm.ToCompactString());
+	GLog->Flush();
+
+	// The player flow of dropping a junction onto a pipe: a rich hit ON the pipeline lets the
+	// attachment hologram's snap latch and enter splice mode; Construct splits the pipe and wires
+	// both halves through the junction (the same native splice family as the belt splitter).
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, PointCm);
+	if (!Hologram)
+	{
+		OutError = TEXT("could not spawn the tap junction hologram");
+		return false;
+	}
+	FHitResult Hit(ForceInit);
+	Hit.bBlockingHit = true;
+	Hit.HitObjectHandle = FActorInstanceHandle(Pipe);
+	UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Pipe->GetRootComponent());
+	if (!Prim) { Prim = Pipe->FindComponentByClass<UPrimitiveComponent>(); }
+	if (Prim) { Hit.Component = Prim; }
+	Hit.Location = PointCm;
+	Hit.ImpactPoint = PointCm;
+	Hit.Normal = FVector::UpVector;
+	Hit.ImpactNormal = FVector::UpVector;
+	Hit.TraceStart = PointCm + FVector(0.0, 0.0, 300.0);
+	Hit.TraceEnd = PointCm - FVector(0.0, 0.0, 100.0);
+	Hit.Distance = 300.0;
+
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(Hit);
+	Hologram->ValidatePlacementAndCost(FindValidationInventory(World));
+	TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
+	Hologram->GetConstructDisqualifiers(Disqualifiers);
+	for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+	{
+		if (IsBlockingDisqualifier(Disqualifier))
+		{
+			OutError = FString::Printf(TEXT("the tap junction can't place on the pipe: %s"),
+				*UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString());
+			Hologram->Destroy();
+			return false;
+		}
+	}
+
+	TArray<AActor*> Children;
+	AActor* Built = Hologram->Construct(Children, FNetConstructionID());
+	Hologram->Destroy();
+	if (!Built)
+	{
+		OutError = TEXT("tap junction Construct() returned nothing");
+		return false;
+	}
+
+	// Verify the splice took: a spliced junction comes out with both pipe halves connected. An
+	// unspliced (floating) junction is torn down again — the pipe stays whole.
+	int32 Connected = 0;
+	TInlineComponentArray<UFGPipeConnectionComponent*> Connections;
+	Built->GetComponents(Connections);
+	for (UFGPipeConnectionComponent* Conn : Connections)
+	{
+		if (Conn && Conn->IsConnected()) { ++Connected; }
+	}
+	if (Connected < 2)
+	{
+		OutError = TEXT("the junction did not splice into the pipe (snap did not latch) — the pipe was left whole");
+		if (IFGDismantleInterface::Execute_CanDismantle(Built))
+		{
+			IFGDismantleInterface::Execute_Dismantle(Built);
+		}
+		else
+		{
+			Built->Destroy();
+		}
+		return false;
+	}
+
+	FAIDAEntityId Entity;
+	Entity.Type = TEXT("actor");
+	Entity.ClassPath = Built->GetClass()->GetPathName();
+	Entity.RecipePath = JunctionRecipePath;
+	Entity.Pos = Built->GetActorLocation();
+	Entity.YawDeg = FMath::RoundToInt32(Built->GetActorRotation().Yaw);
+	OutEntityIds.Add(AIDAActionSpec::EncodeEntityId(Entity));
+	OutActors.Add(Built);
+	OutTapActor = Built;
+	UE_LOG(LogAIDA, Log, TEXT("[actions][tap] junction spliced in (%d connected pipe port(s))."), Connected);
 	return true;
 }
 
