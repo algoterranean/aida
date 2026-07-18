@@ -4950,24 +4950,6 @@ void UAIDAOrchestrator::RegisterActionTools()
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
 					TEXT("the endpoints are %.0f m apart — beyond the 2 km chained-belt limit"), GapM), {}));
 			}
-			// Long belts chain hops through ground-probed waypoints, exactly like the belt tap.
-			TArray<FVector> ChainPoints;
-			if (!bPipe)
-			{
-				constexpr double HopCm = 5000.0;
-				const int32 Hops = FMath::CeilToInt32(GapCm / HopCm);
-				for (int32 i = 1; i < Hops; ++i)
-				{
-					FVector Point = FMath::Lerp(FromPort.PosCm, ToPort.PosCm, static_cast<double>(i) / Hops);
-					double GroundZ;
-					if (FAIDAActionSeam::ProbeGroundZ(this, Point, GroundZ))
-					{
-						Point.Z = GroundZ + 150.0;
-					}
-					ChainPoints.Add(Point);
-				}
-			}
-
 			FAIDARecipeResolution Transport;
 			{
 				TArray<FString> Candidates;
@@ -5001,6 +4983,84 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 			}
 
+			// ROUTE PLANNING (live-verify: a direct run from a west-facing port back east died at
+			// execute with "Invalid Conveyor Belt shape!"). Validate the DIRECT run with the game's
+			// own hologram FIRST; an illegal shape re-routes through gentle waypoint legs — lead
+			// straight out of the source port, then bends of ≤ ~90° toward an approach point in
+			// front of the destination port. Belts bend 90° happily; they just can't U-turn in one
+			// spline. Pipes can't chain, so an invalid direct pipe is an honest propose-time error
+			// instead of a doomed ghost.
+			TArray<FVector> ChainPoints;
+			FString RouteNote;
+			{
+				FString DirectReason;
+				const bool bDirectOk = FAIDAActionSeam::ValidateConnectingRun(this, Transport.RecipeClassPath, bPipe,
+					FromPort.Machine.Get(), FromPort.PosCm, FromPort.NormalCm,
+					ToPort.Machine.Get(), ToPort.PosCm, ToPort.NormalCm, DirectReason);
+				if (bPipe && !bDirectOk)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("the game refuses a direct pipe between those ports (%s) — pipes can't bend around obstacles yet; re-place the machines or bridge with propose_build pipes"),
+						*DirectReason), {}));
+				}
+				const bool bNeedHops = !bPipe && GapM > 50.0; // one belt tops out ~56 m
+				if (!bPipe && (!bDirectOk || bNeedHops))
+				{
+					const FVector FromN = FVector(FromPort.NormalCm.X, FromPort.NormalCm.Y, 0.0)
+						.GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+					const FVector ToN = FVector(ToPort.NormalCm.X, ToPort.NormalCm.Y, 0.0)
+						.GetSafeNormal(UE_SMALL_NUMBER, FVector::XAxisVector);
+					constexpr double LeadCm = 800.0;
+					const double LegZ = FMath::Max(FromPort.PosCm.Z, ToPort.PosCm.Z);
+					if (!bDirectOk)
+					{
+						const FVector Approach = ToPort.PosCm + ToN * LeadCm;
+						FVector Cursor = FromPort.PosCm + FromN * LeadCm;
+						FVector Travel = FromN;
+						ChainPoints.Add(FVector(Cursor.X, Cursor.Y, LegZ));
+						for (int32 Guard = 0; Guard < 3; ++Guard)
+						{
+							FVector ToGo = Approach - Cursor;
+							ToGo.Z = 0.0;
+							const FVector Dir = ToGo.GetSafeNormal(UE_SMALL_NUMBER, Travel);
+							if (FVector::DotProduct(Travel, Dir) >= -0.1) { break; } // next leg bends ≤ ~96°
+							FVector Perp = Dir - Travel * FVector::DotProduct(Dir, Travel);
+							Perp.Z = 0.0;
+							Perp = Perp.GetSafeNormal(UE_SMALL_NUMBER, FVector(-Travel.Y, Travel.X, 0.0));
+							Cursor += Perp * 1000.0;
+							ChainPoints.Add(FVector(Cursor.X, Cursor.Y, LegZ));
+							Travel = Perp;
+						}
+						ChainPoints.Add(FVector(Approach.X, Approach.Y, LegZ));
+						RouteNote = FString::Printf(TEXT(" — routed with %d bend(s); the game refused the direct shape (%s)"),
+							ChainPoints.Num(), *DirectReason.TrimEnd());
+					}
+					// Long legs still split every ~50 m, ground-following, whatever the bend plan.
+					TArray<FVector> Subdivided;
+					TArray<FVector> Targets = ChainPoints;
+					Targets.Add(ToPort.PosCm);
+					FVector Prev = FromPort.PosCm;
+					for (int32 T = 0; T < Targets.Num(); ++T)
+					{
+						const FVector& Target = Targets[T];
+						const int32 Pieces = FMath::CeilToInt32(FVector::Dist(Prev, Target) / 5000.0);
+						for (int32 i = 1; i < Pieces; ++i)
+						{
+							FVector Mid = FMath::Lerp(Prev, Target, static_cast<double>(i) / Pieces);
+							double GroundZ;
+							if (FAIDAActionSeam::ProbeGroundZ(this, Mid, GroundZ))
+							{
+								Mid.Z = FMath::Max(GroundZ + 150.0, FMath::Min(Prev.Z, Target.Z));
+							}
+							Subdivided.Add(Mid);
+						}
+						if (T < Targets.Num() - 1) { Subdivided.Add(Target); } // the true destination is never a waypoint
+						Prev = Target;
+					}
+					ChainPoints = MoveTemp(Subdivided);
+				}
+			}
+
 			// A standalone DANGLING tap: source = the from-actor itself (no cut, no splitter);
 			// the executor's feed hops + BuildConnectingRun do the rest, runs charged as built.
 			FAIDAProposal Proposal;
@@ -5019,9 +5079,10 @@ void UAIDAOrchestrator::RegisterActionTools()
 			Proposal.TransportRecipePath = Transport.RecipeClassPath;
 			Proposal.TransportName = Transport.DisplayName;
 			const int32 Runs = Proposal.TapChainPointsCm.Num() + 1;
-			Proposal.Summary = FString::Printf(TEXT("connect %s's free output to %s's input — %d x %s run(s), %.0f m, charged as built%s"),
+			Proposal.Summary = FString::Printf(TEXT("connect %s's free output to %s's input — %d x %s run(s), %.0f m, charged as built%s%s"),
 				*FromPort.MachineName, *ToPort.MachineName, Runs, *Transport.DisplayName, GapM,
-				bFlipped ? TEXT(" (direction flipped — items can only flow output to input)") : TEXT(""));
+				bFlipped ? TEXT(" (direction flipped — items can only flow output to input)") : TEXT(""),
+				*RouteNote);
 			{
 				TSharedRef<FJsonObject> StoredSpec = MakeShared<FJsonObject>();
 				StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_connect"));

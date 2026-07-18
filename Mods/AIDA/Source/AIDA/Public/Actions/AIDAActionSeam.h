@@ -103,6 +103,17 @@ public:
 		FAIDAManifoldPort& OutPort, FString& OutError);
 
 	/**
+	 * Validate-only twin of BuildConnectingRun: drive the spline hologram through the two-step
+	 * flow between the EXPLICIT ports given, collect the game's own disqualifiers, destroy — no
+	 * cost, no construct. False = the game would refuse this exact run (OutReason = its text, e.g.
+	 * "Invalid Conveyor Belt shape!"), which is propose-time knowledge: plan a bend route instead
+	 * of showing the player a ghost that cannot build.
+	 */
+	static bool ValidateConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
+		AActor* FromActor, const FVector& FromPosCm, const FVector& FromNormalCm,
+		AActor* ToActor, const FVector& ToPosCm, const FVector& ToNormalCm, FString& OutReason);
+
+	/**
 	 * P8 Slice 3 — the pipe mirror of ExecuteTapSplice: drive the junction hologram onto the LIVE
 	 * pipeline at OffsetCm (the game's attachment-on-pipe snap splits the pipe and wires both
 	 * halves through the junction), Construct, then verify ≥2 connected pipe ports — an unspliced

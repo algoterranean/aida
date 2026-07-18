@@ -1644,8 +1644,16 @@ bool FAIDAActionSeam::FindFreeBeltInputPort(UObject* WorldContext, const FVector
 namespace
 {
 	// Defined further down (the manifold-run helper block); declared here for BuildChainSegment.
-	UFGFactoryConnectionComponent* FindFactoryPort(AActor* Actor, bool bWantOutput, const FVector& WantDir);
+	UFGFactoryConnectionComponent* FindFactoryPort(AActor* Actor, bool bWantOutput, const FVector& WantDir,
+		double MinDot = 0.5);
 	FHitResult MakePortHit(AActor* Actor, const FVector& ConnectorLoc, const FVector& ConnectorNormal);
+
+	/** A belt's free end is unambiguous — the 60° facing gate only makes sense on multi-port
+	 *  actors, and it broke 90° bend legs leaving a chain belt's end. */
+	double PortMinDotFor(AActor* Actor)
+	{
+		return Actor && Actor->IsA<AFGBuildableConveyorBase>() ? -1.1 : 0.5;
+	}
 }
 
 bool FAIDAActionSeam::BuildChainSegment(UObject* WorldContext, const FString& TransportRecipePath,
@@ -1665,7 +1673,8 @@ bool FAIDAActionSeam::BuildChainSegment(UObject* WorldContext, const FString& Tr
 	UFGInventoryComponent* Inventory = FindValidationInventory(World);
 	if (!Inventory) { OutError = TEXT("no player inventory available to validate against"); return false; }
 
-	UFGFactoryConnectionComponent* FromConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
+	UFGFactoryConnectionComponent* FromConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir,
+		PortMinDotFor(FromActor));
 	if (!FromConn)
 	{
 		OutError = FString::Printf(TEXT("no free output port on %s facing the run"), *GetNameSafe(FromActor));
@@ -3086,12 +3095,14 @@ namespace
 	}
 
 	/** Best unconnected factory (belt) port on a live actor: direction + best normal-dot with
-	 *  WantDir, at least 60° aligned — a run must never leave from the far side of an attachment. */
-	UFGFactoryConnectionComponent* FindFactoryPort(AActor* Actor, bool bWantOutput, const FVector& WantDir)
+	 *  WantDir, at least 60° aligned by default — a run must never leave from the far side of an
+	 *  attachment. MinDot < -1 disables the gate (belt free ends are unambiguous). */
+	UFGFactoryConnectionComponent* FindFactoryPort(AActor* Actor, bool bWantOutput, const FVector& WantDir,
+		double MinDot)
 	{
 		const FVector Wanted = FVector(WantDir.X, WantDir.Y, 0.0).GetSafeNormal();
 		UFGFactoryConnectionComponent* Best = nullptr;
-		double BestDot = 0.5;
+		double BestDot = MinDot;
 		TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
 		Actor->GetComponents(Connections);
 		for (UFGFactoryConnectionComponent* Conn : Connections)
@@ -3459,6 +3470,46 @@ bool FAIDAActionSeam::ResolvePlannedPorts(UObject* WorldContext, const FString& 
 	return true;
 }
 
+bool FAIDAActionSeam::ValidateConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
+	AActor* FromActor, const FVector& FromPosCm, const FVector& FromNormalCm,
+	AActor* ToActor, const FVector& ToPosCm, const FVector& ToNormalCm, FString& OutReason)
+{
+	OutReason.Reset();
+	UWorld* World = ResolveWorld(WorldContext);
+	UClass* RecipeClass = World ? FSoftClassPath(TransportRecipePath).TryLoadClass<UFGRecipe>() : nullptr;
+	if (!RecipeClass) { OutReason = TEXT("transport recipe no longer resolvable"); return false; }
+	if (!IsValid(FromActor) || !IsValid(ToActor)) { OutReason = TEXT("endpoint no longer exists"); return false; }
+	UFGInventoryComponent* Inventory = FindValidationInventory(World);
+	if (!Inventory) { OutReason = TEXT("no player inventory available to validate against"); return false; }
+
+	AFGHologram* Hologram = SpawnValidationHologram(World, RecipeClass, FromPosCm);
+	if (!Hologram) { OutReason = TEXT("could not spawn a run hologram"); return false; }
+	if (!Cast<AFGSplineHologram>(Hologram))
+	{
+		OutReason = TEXT("the transport recipe is not a belt or pipe");
+		Hologram->Destroy();
+		return false;
+	}
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(MakePortHit(FromActor, FromPosCm, FromNormalCm));
+	Hologram->DoMultiStepPlacement(/*isInputFromARelease*/ false);
+	Hologram->ResetConstructDisqualifiers();
+	Hologram->UpdateHologramPlacement(MakePortHit(ToActor, ToPosCm, ToNormalCm));
+	Hologram->ValidatePlacementAndCost(Inventory);
+	TArray<TSubclassOf<UFGConstructDisqualifier>> Disqualifiers;
+	Hologram->GetConstructDisqualifiers(Disqualifiers);
+	for (const TSubclassOf<UFGConstructDisqualifier>& Disqualifier : Disqualifiers)
+	{
+		if (IsBlockingDisqualifier(Disqualifier))
+		{
+			OutReason = UFGConstructDisqualifier::GetDisqualifyingText(Disqualifier).ToString();
+			break;
+		}
+	}
+	Hologram->Destroy();
+	return OutReason.IsEmpty();
+}
+
 bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& TransportRecipePath, bool bPipe,
 	AActor* FromActor, const FVector& FromWantDir, AActor* ToActor, const FVector& ToWantDir,
 	bool bChargeCost, TArray<FAIDACostItem>& OutCost,
@@ -3483,8 +3534,8 @@ bool FAIDAActionSeam::BuildConnectingRun(UObject* WorldContext, const FString& T
 	UFGFactoryConnectionComponent* ToFactoryConn = nullptr;
 	if (!bPipe)
 	{
-		FromFactoryConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir);
-		ToFactoryConn = FindFactoryPort(ToActor, /*bWantOutput*/ false, ToWantDir);
+		FromFactoryConn = FindFactoryPort(FromActor, /*bWantOutput*/ true, FromWantDir, PortMinDotFor(FromActor));
+		ToFactoryConn = FindFactoryPort(ToActor, /*bWantOutput*/ false, ToWantDir, PortMinDotFor(ToActor));
 		if (!FromFactoryConn) { OutError = FString::Printf(TEXT("no free output port on %s facing the run"), *GetNameSafe(FromActor)); return false; }
 		if (!ToFactoryConn) { OutError = FString::Printf(TEXT("no free input port on %s facing the run"), *GetNameSafe(ToActor)); return false; }
 		FromLoc = FromFactoryConn->GetConnectorLocation();
