@@ -1491,12 +1491,15 @@ void UAIDAOrchestrator::PublishProposal(const FGuid& ProposalId)
 		for (int32 i = 0; i < Proposal->Placements.Num(); ++i)
 		{
 			const int32 Part = bComposite ? Proposal->PlacementPartIndex[i] : 0;
-			if (!Current || Part != CurrentPart)
+			// A yaw change also breaks the run — a ghost part carries ONE yaw, and perimeter walls
+			// mix all four facings under a single part index.
+			const float Yaw = static_cast<float>(Proposal->Placements[i].Rotator().Yaw);
+			if (!Current || Part != CurrentPart || !FMath::IsNearlyEqual(Current->YawDeg, Yaw, 0.1f))
 			{
 				Current = &View.GhostParts.AddDefaulted_GetRef();
 				Current->RecipeClassPath = bComposite && Proposal->PartRecipePaths.IsValidIndex(Part)
 					? Proposal->PartRecipePaths[Part] : Proposal->RecipeClassPath;
-				Current->YawDeg = static_cast<float>(Proposal->Placements[i].Rotator().Yaw);
+				Current->YawDeg = Yaw;
 				CurrentPart = Part;
 			}
 			Current->TileCenters.Add(Proposal->Placements[i].GetLocation());
@@ -2287,6 +2290,282 @@ void UAIDAOrchestrator::RegisterActionTools()
 			if (Proposal.InvalidCount > 0)
 			{
 				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving (approving as-is builds only the valid ones and refunds the rest)."),
+					Proposal.InvalidCount, Proposal.Placements.Num());
+			}
+			AnnounceSystem(Announce);
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds,
+				DryRun.bAffordable, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
+		}
+	});
+
+	// propose_add_walls: census the slab underfoot/at-aim -> perimeter walls per floor (+ decks
+	// between floors) -> composite-style proposal through the standard approval flow.
+	Tools.Register({
+		TEXT("propose_add_walls"),
+		TEXT("PROPOSE walling in the foundation slab the player is standing on, hovering over, or aiming at — walls go up around the ENTIRE contiguous slab's perimeter (courtyard holes included), material-matched to the foundations (concrete foundations get concrete walls, grip metal gets steel; fallback is the basic FICSIT wall). FLOORS: spec.floors is an array, one entry per floor bottom-up; each floor's walls are stacked 4 m courses, tall enough to contain {contains:'buildable display name'} (its clearance height decides) and/or at least {heightM: metres} — an empty entry means one 4 m course. Between consecutive floors a DECK of foundations (mirroring the slab cell for cell, same foundation types) is added so the next floor has something to stand on; the top stays OPEN (no roof). Examples: 'add walls' -> {floors:[{}]}; 'walls 12 m tall' -> {floors:[{heightM:12}]}; '2 floors, refineries below, foundries above' -> {floors:[{contains:'Refinery'},{contains:'Foundry'}]}. ALWAYS use this when the player says to add walls / wall in / enclose / build floors on existing foundations — NEVER assemble walls with propose_build (it cannot find the slab's lattice), and never ask which foundations or for a location (their stance/aim decides). Returns the dry-run (count, cost, validity) + proposalId; same approval flow as propose_build (ghost preview, nudge, /aida approve). Blocked placements (e.g. where a belt crosses the perimeter) are advisory — approving builds the valid ones and refunds the rest, leaving a natural gap. REVISING: pass replaceProposalId to swap a pending walls proposal ('make it 2 floors' = call again with both floors)."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, floors?: [{contains?: 'buildable display name this floor must be tall enough to contain', heightM?: metres}] — one entry per floor bottom-up; omit floors for a single 4 m wall course}"},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			// Per floor: courses = enough 4 m walls for the named machine's clearance height
+			// and/or the explicit metres; an empty entry is one course.
+			struct FFloorSpec { int32 Courses = 1; FString Contains; };
+			TArray<FFloorSpec> Floors;
+			{
+				const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+				Args->TryGetObjectField(TEXT("spec"), SpecObj);
+				const TArray<TSharedPtr<FJsonValue>>* FloorsArr = nullptr;
+				if (SpecObj && SpecObj->IsValid())
+				{
+					(*SpecObj)->TryGetArrayField(TEXT("floors"), FloorsArr);
+				}
+				if (FloorsArr)
+				{
+					if (FloorsArr->Num() > 8)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("at most 8 floors per proposal"), {}));
+					}
+					for (const TSharedPtr<FJsonValue>& Value : *FloorsArr)
+					{
+						const TSharedPtr<FJsonObject>* FloorObj = nullptr;
+						FFloorSpec Floor;
+						double NeedM = 0.0;
+						if (Value.IsValid() && Value->TryGetObject(FloorObj) && FloorObj->IsValid())
+						{
+							(*FloorObj)->TryGetNumberField(TEXT("heightM"), NeedM);
+							FString Contains;
+							if ((*FloorObj)->TryGetStringField(TEXT("contains"), Contains) && !Contains.TrimStartAndEnd().IsEmpty())
+							{
+								FAIDARecipeResolution Machine;
+								if (!FAIDAActionSeam::ResolveBuildRecipe(this, Contains, Machine))
+								{
+									FString Msg = FString::Printf(TEXT("floors[%d]: no unlocked buildable matches '%s'"), Floors.Num(), *Contains);
+									if (Machine.Suggestions.Num() > 0)
+									{
+										Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Machine.Suggestions, TEXT(", ")));
+									}
+									return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+								}
+								Floor.Contains = Machine.DisplayName;
+								NeedM = FMath::Max(NeedM, Machine.FootprintZM);
+							}
+						}
+						Floor.Courses = FMath::Max(1, FMath::CeilToInt32(NeedM / 4.0 - UE_KINDA_SMALL_NUMBER));
+						if (Floor.Courses > 50)
+						{
+							return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+								TEXT("floors[%d] would be %d m tall — that can't be right"), Floors.Num(), Floor.Courses * 4), {}));
+						}
+						Floors.Add(Floor);
+					}
+				}
+				if (Floors.Num() == 0) { Floors.Add(FFloorSpec()); }
+			}
+
+			// Revision id validated up front (mirrors propose_build).
+			FGuid ReplaceId;
+			{
+				FString ReplaceIdStr;
+				Args->TryGetStringField(TEXT("replaceProposalId"), ReplaceIdStr);
+				if (!ReplaceIdStr.TrimStartAndEnd().IsEmpty())
+				{
+					const FAIDAProposal* Replaced = FGuid::Parse(ReplaceIdStr.TrimStartAndEnd(), ReplaceId)
+						? Actions.Store().Find(ReplaceId) : nullptr;
+					if (!Replaced || Replaced->State != EAIDAProposalState::Pending)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("replaceProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
+					}
+				}
+			}
+
+			// Walls have no direction — the whole perimeter is the target, so the census only
+			// needs the stance/aim anchor (the direction hint stays empty).
+			FAIDASlabCensus Census;
+			if (!FAIDAActionSeam::CensusFoundationSlab(this, Ctx.PlayerId, FString(), Census))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Census.Error, {}));
+			}
+			TArray<int32> FloorCourses;
+			for (const FFloorSpec& Floor : Floors) { FloorCourses.Add(Floor.Courses); }
+			const FAIDAWallPlan Plan = AIDAActionSpec::PlanPerimeterWalls(Census.Cells, FloorCourses,
+				Config.Actions.MaxProposalItems);
+			if (!Plan.Error.IsEmpty())
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+			}
+
+			// Proposal part table: one material-matched wall recipe per foundation class, plus the
+			// decks' own foundation recipes — deduped by path (several foundation classes can share
+			// one wall recipe).
+			TArray<FString> PartRecipePaths;
+			TArray<FString> PartNamesUsed;
+			TMap<FString, int32> PartIndexByPath;
+			const auto PartFor = [&PartRecipePaths, &PartNamesUsed, &PartIndexByPath](const FString& Path, const FString& Name) -> int32
+			{
+				if (const int32* Existing = PartIndexByPath.Find(Path)) { return *Existing; }
+				const int32 Index = PartRecipePaths.Num();
+				PartRecipePaths.Add(Path);
+				PartNamesUsed.Add(Name);
+				PartIndexByPath.Add(Path, Index);
+				return Index;
+			};
+			TMap<int32, int32> WallPartByFoundationPart;
+			for (const FAIDAWallSegment& Segment : Plan.Walls)
+			{
+				if (WallPartByFoundationPart.Contains(Segment.Part)) { continue; }
+				const FString FoundationPath = Census.PartRecipePaths.IsValidIndex(Segment.Part)
+					? Census.PartRecipePaths[Segment.Part] : FString();
+				FString WallPath, WallName;
+				if (!FAIDAActionSeam::ResolveWallRecipe(this, FoundationPath, WallPath, WallName))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("no wall recipe is unlocked yet — walls need at least the basic 4 m wall"), {}));
+				}
+				WallPartByFoundationPart.Add(Segment.Part, PartFor(WallPath, WallName));
+			}
+
+			// World placements, all per cell so terrain steps and mixed thicknesses stay coherent
+			// per column: wall base = the cell's TOP face (pivot + half thickness), each floor adds
+			// its courses, each deck below adds the cell's own thickness. Wall yaw faces its open
+			// side (local +X outward); the deck keeps the slab's yaw.
+			const double WallCourseCm = 400.0; // walls stack in 4 m courses
+			TArray<double> FloorBaseOffsetCm;  // per floor: wall-height offset above the cell top
+			{
+				double Offset = 0.0;
+				for (const FFloorSpec& Floor : Floors)
+				{
+					FloorBaseOffsetCm.Add(Offset);
+					Offset += Floor.Courses * WallCourseCm;
+				}
+			}
+			const auto CellCenter = [&Census](const FIntPoint& Coord)
+			{
+				return Census.OriginCm
+					+ Census.AxisU * (Coord.X * Census.StepCm)
+					+ Census.AxisV * (Coord.Y * Census.StepCm);
+			};
+			const auto PartHeight = [&Census](int32 Part)
+			{
+				return Census.PartHeightCm.IsValidIndex(Part) ? Census.PartHeightCm[Part] : 100.0;
+			};
+			struct FItem { int32 Part; FTransform T; };
+			TArray<FItem> Items;
+			Items.Reserve(Plan.Walls.Num() + Plan.Decks.Num());
+			for (const FAIDAWallSegment& Segment : Plan.Walls)
+			{
+				const FVector WorldOut = Census.AxisU * Segment.OutDir.X + Census.AxisV * Segment.OutDir.Y;
+				const double H = PartHeight(Segment.Part);
+				FVector Loc = CellCenter(Segment.Cell) + WorldOut * (Census.StepCm * 0.5);
+				Loc.Z = Segment.ZCm + H * 0.5
+					+ FloorBaseOffsetCm[Segment.Floor] + Segment.Floor * H
+					+ Segment.Course * WallCourseCm;
+				const double YawDeg = FMath::RadiansToDegrees(FMath::Atan2(WorldOut.Y, WorldOut.X));
+				Items.Add({ WallPartByFoundationPart.FindChecked(Segment.Part), FTransform(FRotator(0.0, YawDeg, 0.0), Loc) });
+			}
+			for (const FAIDAWallDeckCell& Deck : Plan.Decks)
+			{
+				const double H = PartHeight(Deck.Part);
+				FVector Loc = CellCenter(Deck.Cell);
+				Loc.Z = Deck.ZCm + H * 0.5
+					+ FloorBaseOffsetCm[Deck.Floor] + Deck.Floor * H
+					+ Floors[Deck.Floor].Courses * WallCourseCm
+					+ H * 0.5;
+				const int32 DeckPart = PartFor(
+					Census.PartRecipePaths.IsValidIndex(Deck.Part) ? Census.PartRecipePaths[Deck.Part] : FString(),
+					Census.PartNames.IsValidIndex(Deck.Part) ? Census.PartNames[Deck.Part] : TEXT("Foundation"));
+				Items.Add({ DeckPart, FTransform(FRotator(0.0, Census.YawDeg, 0.0), Loc) });
+			}
+
+			// Placements grouped by part (contiguous runs) — the composite machinery (dry-run,
+			// ghost preview, batched execute) handles mixed recipes for free.
+			TArray<FTransform> Placements;
+			TArray<int32> PlacementPartIndex;
+			TArray<int32> PartCounts;
+			PartCounts.SetNumZeroed(PartRecipePaths.Num());
+			Placements.Reserve(Items.Num());
+			PlacementPartIndex.Reserve(Items.Num());
+			for (int32 Part = 0; Part < PartRecipePaths.Num(); ++Part)
+			{
+				for (const FItem& Item : Items)
+				{
+					if (Item.Part != Part) { continue; }
+					Placements.Add(Item.T);
+					PlacementPartIndex.Add(Part);
+					++PartCounts[Part];
+				}
+			}
+
+			FAIDADryRunResult DryRun;
+			if (!FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, PlacementPartIndex, Placements, DryRun, Ctx.PlayerId))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+			}
+
+			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid();
+			{
+				// The stored spec is descriptive (revisions re-census live, like extend_foundations).
+				TSharedRef<FJsonObject> StoredSpec = MakeShared<FJsonObject>();
+				StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_add_walls"));
+				TArray<TSharedPtr<FJsonValue>> FloorsJson;
+				for (const FFloorSpec& Floor : Floors)
+				{
+					TSharedRef<FJsonObject> FloorJson = MakeShared<FJsonObject>();
+					FloorJson->SetNumberField(TEXT("courses"), Floor.Courses);
+					if (!Floor.Contains.IsEmpty()) { FloorJson->SetStringField(TEXT("contains"), Floor.Contains); }
+					FloorsJson.Add(MakeShared<FJsonValueObject>(FloorJson));
+				}
+				StoredSpec->SetArrayField(TEXT("floors"), FloorsJson);
+				Proposal.SpecJson = AIDAToCompactJson(StoredSpec);
+			}
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = Placements;
+			Proposal.RecipeClassPath = PartRecipePaths[0];
+			Proposal.PartRecipePaths = PartRecipePaths;
+			Proposal.PlacementPartIndex = MoveTemp(PlacementPartIndex);
+			Proposal.Cost = DryRun.Cost;
+			{
+				FString FloorsDesc;
+				for (int32 i = 0; i < Floors.Num(); ++i)
+				{
+					FloorsDesc += FString::Printf(TEXT("%s%d m%s"), i > 0 ? TEXT(" + ") : TEXT(""), Floors[i].Courses * 4,
+						Floors[i].Contains.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" (fits %s)"), *Floors[i].Contains));
+				}
+				FString Kinds;
+				for (int32 i = 0; i < PartNamesUsed.Num(); ++i)
+				{
+					Kinds += FString::Printf(TEXT("%s%d x %s"), i > 0 ? TEXT(", ") : TEXT(""), PartCounts[i], *PartNamesUsed[i]);
+				}
+				Proposal.Summary = FString::Printf(TEXT("wall in the foundation slab — %d floor(s): %s (%s)"),
+					Floors.Num(), *FloorsDesc, *Kinds);
+			}
+			Proposal.InvalidCount = DryRun.Failures.Num(); // advisory — never blocks the ghost
+
+			if (ReplaceId.IsValid())
+			{
+				SupersedeProposal(ReplaceId);
+			}
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s, %d blocked placement(s))"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author, Proposal.InvalidCount);
+			PublishProposal(Proposal.Id);
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""),
+				*Proposal.Summary, *AIDACostSummaryString(Proposal.Cost));
+			if (Proposal.InvalidCount > 0)
+			{
+				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — approving as-is builds only the valid ones and refunds the rest (a belt crossing the perimeter keeps its gap)."),
 					Proposal.InvalidCount, Proposal.Placements.Num());
 			}
 			AnnounceSystem(Announce);

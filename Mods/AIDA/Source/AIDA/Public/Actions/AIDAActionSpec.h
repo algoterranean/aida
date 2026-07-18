@@ -66,6 +66,27 @@ namespace AIDAActionSpec
 		int32 Count, int32 MaxItems);
 
 	/**
+	 * Perimeter walls for a foundation slab (pure lattice): every edge between an occupied cell and
+	 * a missing neighbor gets one wall per 4 m course, for every floor in FloorCourses (floor 0
+	 * first); between consecutive floors every slab cell gets one deck foundation (same part as the
+	 * cell it mirrors) so the next floor has something to stand on. The top stays open — no roof.
+	 * Wall Z/Part copy the edge's own cell, so terrain-following steps and mixed classes wall
+	 * correctly; the caller stacks courses, floors and deck thicknesses into world Z. Fails
+	 * (Out.Error) when the slab or FloorCourses is empty, a floor has no courses, or the plan
+	 * exceeds MaxItems (0 = unlimited).
+	 */
+	FAIDAWallPlan PlanPerimeterWalls(const TArray<FAIDASlabCell>& Slab, const TArray<int32>& FloorCourses,
+		int32 MaxItems);
+
+	/**
+	 * Material-matched wall recipe CLASS names for a foundation recipe path, best first ("Concrete
+	 * Foundation" slabs get concrete walls), always ending at the plain FICSIT wall. Display names
+	 * can't disambiguate — "Basic Wall (4 m)" is five recipes across materials — so matching is by
+	 * recipe class name; the seam resolves the first candidate that is actually unlocked.
+	 */
+	TArray<FString> WallRecipeCandidatesForFoundation(const FString& FoundationRecipePath);
+
+	/**
 	 * Parse + validate a propose_power spec: version 1, everything optional — buildable filter,
 	 * pole override, center (omitted = requester's aim), radiusM (default 30), maxCount (0 = all,
 	 * clamped to MaxItems).

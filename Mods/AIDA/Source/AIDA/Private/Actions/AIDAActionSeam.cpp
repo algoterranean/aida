@@ -199,11 +199,14 @@ namespace
 		}
 	}
 
-	/** Footprint (metres) from the buildable CDO's clearance boxes; falls back to a foundation's 8 m. */
-	void ResolveFootprint(TSubclassOf<UFGBuildingDescriptor> Descriptor, double& OutXM, double& OutYM)
+	/** Footprint (metres) from the buildable CDO's clearance boxes; falls back to a foundation's 8 m.
+	 *  OutZM (optional) gets the clearance height — what a "tall enough to contain it" floor needs. */
+	void ResolveFootprint(TSubclassOf<UFGBuildingDescriptor> Descriptor, double& OutXM, double& OutYM,
+		double* OutZM = nullptr)
 	{
 		OutXM = 8.0;
 		OutYM = 8.0;
+		if (OutZM) { *OutZM = 4.0; }
 		const TSubclassOf<AFGBuildable> BuildableClass = UFGBuildingDescriptor::GetBuildableClass(Descriptor);
 		const AFGBuildable* CDO = BuildableClass ? BuildableClass->GetDefaultObject<AFGBuildable>() : nullptr;
 		if (!CDO) { return; }
@@ -221,6 +224,7 @@ namespace
 			const FVector Size = Union.GetSize();
 			if (Size.X > 1.0) { OutXM = Size.X / AIDAMetersToCm; }
 			if (Size.Y > 1.0) { OutYM = Size.Y / AIDAMetersToCm; }
+			if (OutZM && Size.Z > 1.0) { *OutZM = Size.Z / AIDAMetersToCm; }
 		}
 	}
 
@@ -524,8 +528,38 @@ bool FAIDAActionSeam::ResolveBuildRecipe(UObject* WorldContext, const FString& D
 
 	Out.RecipeClassPath = Chosen->Recipe->GetPathName();
 	Out.DisplayName = Chosen->Name;
-	ResolveFootprint(Chosen->Descriptor, Out.FootprintXM, Out.FootprintYM);
+	ResolveFootprint(Chosen->Descriptor, Out.FootprintXM, Out.FootprintYM, &Out.FootprintZM);
 	return true;
+}
+
+bool FAIDAActionSeam::ResolveWallRecipe(UObject* WorldContext, const FString& FoundationRecipePath,
+	FString& OutRecipePath, FString& OutDisplayName)
+{
+	UWorld* World = ResolveWorld(WorldContext);
+	TArray<FBuildRecipeEntry> Entries;
+	CollectBuildRecipes(World, Entries);
+
+	for (const FString& Candidate : AIDAActionSpec::WallRecipeCandidatesForFoundation(FoundationRecipePath))
+	{
+		for (const FBuildRecipeEntry& Entry : Entries)
+		{
+			if (Entry.Recipe && Entry.Recipe->GetName() == Candidate)
+			{
+				OutRecipePath = Entry.Recipe->GetPathName();
+				OutDisplayName = Entry.Name;
+				return true;
+			}
+		}
+	}
+	// Class names drift across game updates and mods — any unlocked basic wall beats failing.
+	FAIDARecipeResolution Fallback;
+	if (ResolveBuildRecipe(WorldContext, TEXT("Basic Wall (4 m)"), Fallback))
+	{
+		OutRecipePath = Fallback.RecipeClassPath;
+		OutDisplayName = Fallback.DisplayName;
+		return true;
+	}
+	return false;
 }
 
 namespace
@@ -668,6 +702,10 @@ bool FAIDAActionSeam::CensusFoundationSlab(UObject* WorldContext, const FString&
 				Out.PartRecipePaths.Add(Recipe->GetPathName());
 				const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
 				Out.PartNames.Add(Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(BuildableClass));
+				// Thickness from the CDO (pivot is documented mid-height) — walls and decks stack
+				// from the TOP face, ZCm + half of this.
+				const AFGBuildableFoundation* FoundationCDO = BuildableClass->GetDefaultObject<AFGBuildableFoundation>();
+				Out.PartHeightCm.Add(FoundationCDO ? static_cast<double>(FoundationCDO->mHeight) : 100.0);
 			}
 			Instances.Add({ Loc, Instance.Transform.Rotator().Yaw, Part });
 		}

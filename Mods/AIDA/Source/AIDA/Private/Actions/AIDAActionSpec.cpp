@@ -792,6 +792,130 @@ FAIDASlabExtensionPlan AIDAActionSpec::PlanSlabExtension(const TArray<FAIDASlabC
 	return Out;
 }
 
+FAIDAWallPlan AIDAActionSpec::PlanPerimeterWalls(const TArray<FAIDASlabCell>& Slab,
+	const TArray<int32>& FloorCourses, int32 MaxItems)
+{
+	FAIDAWallPlan Out;
+	if (Slab.Num() == 0)
+	{
+		Out.Error = TEXT("the slab census is empty — nothing to wall in");
+		return Out;
+	}
+	if (FloorCourses.Num() == 0)
+	{
+		Out.Error = TEXT("at least one floor is required");
+		return Out;
+	}
+	int32 TotalCourses = 0;
+	for (const int32 Courses : FloorCourses)
+	{
+		if (Courses < 1)
+		{
+			Out.Error = TEXT("every floor needs at least one 4 m wall course");
+			return Out;
+		}
+		TotalCourses += Courses;
+	}
+
+	TSet<FIntPoint> Occupied;
+	for (const FAIDASlabCell& Cell : Slab) { Occupied.Add(Cell.Coord); }
+
+	// An occupied neighbor is interior even across a terrain step — walls trace the slab's true
+	// outline, and courtyard holes count as outline too (they get walled like any other edge).
+	static const FIntPoint Dirs[4] = { FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1) };
+	int32 Perimeter = 0;
+	for (const FAIDASlabCell& Cell : Slab)
+	{
+		for (const FIntPoint& D : Dirs)
+		{
+			if (!Occupied.Contains(Cell.Coord + D)) { ++Perimeter; }
+		}
+	}
+
+	const int64 Total = static_cast<int64>(Perimeter) * TotalCourses
+		+ static_cast<int64>(Slab.Num()) * (FloorCourses.Num() - 1);
+	if (MaxItems > 0 && Total > MaxItems) // 0 = unlimited (repo-wide convention)
+	{
+		Out.Error = FString::Printf(
+			TEXT("walling the %d-tile slab into %d floor(s) needs %lld placement(s) — more than %d; use fewer or shorter floors"),
+			Slab.Num(), FloorCourses.Num(), Total, MaxItems);
+		return Out;
+	}
+
+	// Bottom-up, slab order within a course — deterministic for tests, and execute builds the way
+	// a player would (each floor's walls, then its deck, then the next floor).
+	for (int32 Floor = 0; Floor < FloorCourses.Num(); ++Floor)
+	{
+		for (int32 Course = 0; Course < FloorCourses[Floor]; ++Course)
+		{
+			for (const FAIDASlabCell& Cell : Slab)
+			{
+				for (const FIntPoint& D : Dirs)
+				{
+					if (Occupied.Contains(Cell.Coord + D)) { continue; }
+					FAIDAWallSegment Segment;
+					Segment.Cell = Cell.Coord;
+					Segment.OutDir = D;
+					Segment.ZCm = Cell.ZCm;
+					Segment.Part = Cell.Part;
+					Segment.Floor = Floor;
+					Segment.Course = Course;
+					Out.Walls.Add(Segment);
+				}
+			}
+		}
+		if (Floor + 1 < FloorCourses.Num())
+		{
+			for (const FAIDASlabCell& Cell : Slab)
+			{
+				FAIDAWallDeckCell Deck;
+				Deck.Cell = Cell.Coord;
+				Deck.ZCm = Cell.ZCm;
+				Deck.Part = Cell.Part;
+				Deck.Floor = Floor;
+				Out.Decks.Add(Deck);
+			}
+		}
+	}
+	return Out;
+}
+
+TArray<FString> AIDAActionSpec::WallRecipeCandidatesForFoundation(const FString& FoundationRecipePath)
+{
+	// Path -> object name -> material token: "Recipe_Foundation_<Material>_8xN_C"; FICSIT variants
+	// are "Recipe_Foundation_8xN_01_C" (no token — the first segment is a digit).
+	FString Name = FoundationRecipePath;
+	int32 Dot = INDEX_NONE;
+	if (Name.FindLastChar(TEXT('.'), Dot)) { Name = Name.Mid(Dot + 1); }
+
+	FString Token;
+	const FString Prefix(TEXT("Recipe_Foundation_"));
+	if (Name.StartsWith(Prefix))
+	{
+		const FString Rest = Name.Mid(Prefix.Len());
+		int32 Underscore = INDEX_NONE;
+		if (Rest.FindChar(TEXT('_'), Underscore))
+		{
+			const FString Lead = Rest.Left(Underscore);
+			if (!Lead.IsEmpty() && !FChar::IsDigit(Lead[0])) { Token = Lead; }
+		}
+	}
+
+	// Not every foundation material has a wall twin — polished concrete and asphalt read closest
+	// to concrete, grip metal to steel. Unknown/modded tokens fall straight through to FICSIT.
+	TArray<FString> Candidates;
+	if (Token == TEXT("Concrete") || Token == TEXT("ConcretePolished") || Token == TEXT("Asphalt"))
+	{
+		Candidates.Add(TEXT("Recipe_Wall_Concrete_8x4_C"));
+	}
+	else if (Token == TEXT("Metal"))
+	{
+		Candidates.Add(TEXT("Recipe_SteelWall_8x4_C"));
+	}
+	Candidates.Add(TEXT("Recipe_Wall_8x4_01_C"));
+	return Candidates;
+}
+
 FString AIDAActionSpec::CompassName(const FVector& Dir)
 {
 	// Game convention (AIDAChatCommands): north = -Y, east = +X. 8-way, 45° sectors.

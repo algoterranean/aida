@@ -25,6 +25,15 @@ public:
 	static bool ResolveBuildRecipe(UObject* WorldContext, const FString& DisplayName, FAIDARecipeResolution& Out);
 
 	/**
+	 * The unlocked wall recipe to pair with a foundation class: material-matched by recipe class
+	 * name (AIDAActionSpec::WallRecipeCandidatesForFoundation — display names can't disambiguate
+	 * material variants), falling back to any unlocked "Basic Wall (4 m)". False = the players
+	 * have no wall recipe unlocked at all.
+	 */
+	static bool ResolveWallRecipe(UObject* WorldContext, const FString& FoundationRecipePath,
+		FString& OutRecipePath, FString& OutDisplayName);
+
+	/**
 	 * Where the requesting player is AIMING: their viewpoint traced along the camera direction on
 	 * the game's own build-gun channel (TC_BuildGun). The default origin/center for specs that omit
 	 * one — matches how players think ("build it there", not "at my feet"). World units (cm).

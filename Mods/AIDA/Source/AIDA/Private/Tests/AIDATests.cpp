@@ -2461,6 +2461,155 @@ bool FAIDAActionsSlabExtensionTest::RunTest(const FString&)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsWallPlanTest, "AIDA.Actions.WallPlan",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsWallPlanTest::RunTest(const FString&)
+{
+	const auto Cell = [](int32 U, int32 V, double ZCm = 0.0, int32 Part = 0)
+	{
+		FAIDASlabCell C;
+		C.Coord = FIntPoint(U, V);
+		C.ZCm = ZCm;
+		C.Part = Part;
+		return C;
+	};
+	const auto CountEdge = [](const FAIDAWallPlan& Plan, const FIntPoint& At, const FIntPoint& Out)
+	{
+		int32 N = 0;
+		for (const FAIDAWallSegment& S : Plan.Walls)
+		{
+			if (S.Cell == At && S.OutDir == Out) { ++N; }
+		}
+		return N;
+	};
+
+	// Single tile, one floor of one course: all four sides, no decks.
+	{
+		const FAIDAWallPlan Plan = AIDAActionSpec::PlanPerimeterWalls({ Cell(0,0, 250.0, 3) }, { 1 }, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		TestEqual(TEXT("four walls"), Plan.Walls.Num(), 4);
+		TestEqual(TEXT("no decks"), Plan.Decks.Num(), 0);
+		TestEqual(TEXT("east side once"), CountEdge(Plan, FIntPoint(0,0), FIntPoint(1,0)), 1);
+		TestEqual(TEXT("west side once"), CountEdge(Plan, FIntPoint(0,0), FIntPoint(-1,0)), 1);
+		for (const FAIDAWallSegment& S : Plan.Walls)
+		{
+			TestEqual(TEXT("keeps the cell Z"), S.ZCm, 250.0);
+			TestEqual(TEXT("keeps the cell part"), S.Part, 3);
+		}
+	}
+
+	// 3x2 rectangle: perimeter is 10 edges — interior edges never get walls.
+	{
+		const TArray<FAIDASlabCell> Slab = { Cell(0,0), Cell(1,0), Cell(2,0), Cell(0,1), Cell(1,1), Cell(2,1) };
+		const FAIDAWallPlan Plan = AIDAActionSpec::PlanPerimeterWalls(Slab, { 1 }, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		TestEqual(TEXT("ten walls"), Plan.Walls.Num(), 10);
+		TestEqual(TEXT("no wall between (0,0) and (1,0)"), CountEdge(Plan, FIntPoint(0,0), FIntPoint(1,0)), 0);
+		TestEqual(TEXT("no wall between (1,0) and (1,1)"), CountEdge(Plan, FIntPoint(1,0), FIntPoint(0,1)), 0);
+	}
+
+	// Courtyard: 3x3 ring (center missing) walls the hole too — 12 outer + 4 inner edges.
+	{
+		TArray<FAIDASlabCell> Ring;
+		for (int32 U = 0; U < 3; ++U)
+		{
+			for (int32 V = 0; V < 3; ++V)
+			{
+				if (U != 1 || V != 1) { Ring.Add(Cell(U, V)); }
+			}
+		}
+		const FAIDAWallPlan Plan = AIDAActionSpec::PlanPerimeterWalls(Ring, { 1 }, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		TestEqual(TEXT("sixteen walls"), Plan.Walls.Num(), 16);
+		TestEqual(TEXT("hole gets a wall"), CountEdge(Plan, FIntPoint(1,0), FIntPoint(0,1)), 1);
+	}
+
+	// Floors: [2,1] courses on a 1x2 slab (perimeter 6) → 6*3 walls + one deck per cell, with
+	// floor/course labels intact and decks under floor 1 only.
+	{
+		const TArray<FAIDASlabCell> Slab = { Cell(0,0, 100.0, 1), Cell(0,1, 100.0, 1) };
+		const FAIDAWallPlan Plan = AIDAActionSpec::PlanPerimeterWalls(Slab, { 2, 1 }, 400);
+		TestTrue(FString::Printf(TEXT("plans (%s)"), *Plan.Error), Plan.Error.IsEmpty());
+		TestEqual(TEXT("18 walls"), Plan.Walls.Num(), 18);
+		if (!TestEqual(TEXT("2 deck tiles"), Plan.Decks.Num(), 2)) { return false; }
+		int32 Floor0 = 0, Floor0Course1 = 0, Floor1 = 0;
+		for (const FAIDAWallSegment& S : Plan.Walls)
+		{
+			if (S.Floor == 0) { ++Floor0; if (S.Course == 1) { ++Floor0Course1; } }
+			else if (S.Floor == 1) { ++Floor1; TestEqual(TEXT("floor 1 is single-course"), S.Course, 0); }
+		}
+		TestEqual(TEXT("floor 0 has two courses"), Floor0, 12);
+		TestEqual(TEXT("floor 0 course 1 count"), Floor0Course1, 6);
+		TestEqual(TEXT("floor 1 has one course"), Floor1, 6);
+		for (const FAIDAWallDeckCell& D : Plan.Decks)
+		{
+			TestEqual(TEXT("deck sits on floor 0"), D.Floor, 0);
+			TestEqual(TEXT("deck copies the cell part"), D.Part, 1);
+			TestEqual(TEXT("deck copies the cell Z"), D.ZCm, 100.0);
+		}
+	}
+
+	// Caps and degenerate inputs are loud, not silent.
+	{
+		TestTrue(TEXT("empty slab errors"),
+			!AIDAActionSpec::PlanPerimeterWalls({}, { 1 }, 400).Error.IsEmpty());
+		TestTrue(TEXT("no floors errors"),
+			!AIDAActionSpec::PlanPerimeterWalls({ Cell(0,0) }, {}, 400).Error.IsEmpty());
+		TestTrue(TEXT("zero-course floor errors"),
+			!AIDAActionSpec::PlanPerimeterWalls({ Cell(0,0) }, { 1, 0 }, 400).Error.IsEmpty());
+		TestTrue(TEXT("over-cap errors"),
+			!AIDAActionSpec::PlanPerimeterWalls({ Cell(0,0) }, { 1 }, 3).Error.IsEmpty());
+		TestTrue(TEXT("cap 0 is unlimited"),
+			AIDAActionSpec::PlanPerimeterWalls({ Cell(0,0) }, { 1 }, 0).Error.IsEmpty());
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsWallRecipeCandidatesTest, "AIDA.Actions.WallRecipeCandidates",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAActionsWallRecipeCandidatesTest::RunTest(const FString&)
+{
+	const auto First = [](const FString& Path)
+	{
+		const TArray<FString> C = AIDAActionSpec::WallRecipeCandidatesForFoundation(Path);
+		return C.Num() > 0 ? C[0] : FString();
+	};
+
+	// FICSIT foundations (no material token) go straight to the plain wall — and only that.
+	{
+		const TArray<FString> C = AIDAActionSpec::WallRecipeCandidatesForFoundation(
+			TEXT("/Game/FactoryGame/Recipes/Buildings/Foundations/Recipe_Foundation_8x4_01.Recipe_Foundation_8x4_01_C"));
+		TestEqual(TEXT("single candidate"), C.Num(), 1);
+		TestEqual(TEXT("plain wall"), C[0], TEXT("Recipe_Wall_8x4_01_C"));
+	}
+
+	// Material variants lead with their matching wall and keep the FICSIT fallback last.
+	{
+		const TArray<FString> C = AIDAActionSpec::WallRecipeCandidatesForFoundation(
+			TEXT("/Game/FactoryGame/Recipes/Buildings/Foundations/Recipe_Foundation_Concrete_8x2.Recipe_Foundation_Concrete_8x2_C"));
+		if (TestEqual(TEXT("two candidates"), C.Num(), 2))
+		{
+			TestEqual(TEXT("concrete wall first"), C[0], TEXT("Recipe_Wall_Concrete_8x4_C"));
+			TestEqual(TEXT("plain wall fallback"), C[1], TEXT("Recipe_Wall_8x4_01_C"));
+		}
+	}
+	TestEqual(TEXT("polished concrete maps to concrete"),
+		First(TEXT("/x/Recipe_Foundation_ConcretePolished_8x1.Recipe_Foundation_ConcretePolished_8x1_C")),
+		TEXT("Recipe_Wall_Concrete_8x4_C"));
+	TestEqual(TEXT("asphalt maps to concrete"),
+		First(TEXT("/x/Recipe_Foundation_Asphalt_8x4.Recipe_Foundation_Asphalt_8x4_C")),
+		TEXT("Recipe_Wall_Concrete_8x4_C"));
+	TestEqual(TEXT("grip metal maps to steel"),
+		First(TEXT("/x/Recipe_Foundation_Metal_8x2.Recipe_Foundation_Metal_8x2_C")),
+		TEXT("Recipe_SteelWall_8x4_C"));
+
+	// Unknown shapes (ramps, mods, empty) fall through to the plain wall, never nothing.
+	TestEqual(TEXT("non-foundation recipe falls back"),
+		First(TEXT("/x/Recipe_Ramp_8x4_Inverted.Recipe_Ramp_8x4_Inverted_C")), TEXT("Recipe_Wall_8x4_01_C"));
+	TestEqual(TEXT("empty path falls back"), First(FString()), TEXT("Recipe_Wall_8x4_01_C"));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAActionsPowerPlanTest, "AIDA.Actions.PowerPlan",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAActionsPowerPlanTest::RunTest(const FString&)

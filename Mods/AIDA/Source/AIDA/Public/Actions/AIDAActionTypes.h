@@ -226,6 +226,37 @@ struct FAIDASlabExtensionPlan
 	FString Error;                          // non-empty = nothing to plan (model-facing reason)
 };
 
+/** One perimeter wall of a walls plan (pure lattice space; propose_add_walls): the slab cell it
+ *  stands on, the lattice step toward the missing neighbor it faces, and which floor/course of
+ *  the stack it belongs to. ZCm\Part copy the cell — the caller turns them into world Z. */
+struct FAIDAWallSegment
+{
+	FIntPoint Cell = FIntPoint::ZeroValue;
+	FIntPoint OutDir = FIntPoint(1, 0);     // unit lattice step toward the open side
+	double ZCm = 0.0;                       // the cell's foundation Z (pivot, mid-height)
+	int32 Part = 0;                         // the cell's foundation part (drives wall material)
+	int32 Floor = 0;                        // 0-based floor
+	int32 Course = 0;                       // 0-based 4 m course within the floor
+};
+
+/** One deck tile between floors: a foundation mirroring a slab cell (same part) laid on top of
+ *  the walls of the floor below, so the next floor has something to stand on. */
+struct FAIDAWallDeckCell
+{
+	FIntPoint Cell = FIntPoint::ZeroValue;
+	double ZCm = 0.0;                       // source cell's foundation Z (pivot)
+	int32 Part = 0;
+	int32 Floor = 0;                        // the floor BELOW this deck
+};
+
+/** PlanPerimeterWalls output: every open edge walled per floor/course + the decks between floors. */
+struct FAIDAWallPlan
+{
+	TArray<FAIDAWallSegment> Walls;
+	TArray<FAIDAWallDeckCell> Decks;
+	FString Error;                          // non-empty = nothing to plan (model-facing reason)
+};
+
 /**
  * CensusFoundationSlab output (seam): the CONTIGUOUS foundation slab under the player's feet (or
  * aim) resolved onto its own lattice, plus the direction the player means by "extend". Cells carry
@@ -241,6 +272,7 @@ struct FAIDASlabCensus
 	double YawDeg = 0.0;                    // rotation for new cells (the anchor's)
 	TArray<FString> PartRecipePaths;        // per part: build recipe class path
 	TArray<FString> PartNames;              // per part: display name for summaries
+	TArray<double> PartHeightCm;            // per part: foundation thickness (pivot is mid-height)
 	TArray<FAIDASlabCell> Cells;            // the flood-filled slab
 	FIntPoint ExtendDir = FIntPoint(1, 0);  // resolved lattice step to extend along
 	FString DirectionNote;                  // human-readable ("west — your look direction")
@@ -287,6 +319,7 @@ struct FAIDARecipeResolution
 	FString DisplayName;                   // canonical building name (for summaries)
 	double FootprintXM = 8.0;              // clearance-box size, metres — the default grid step
 	double FootprintYM = 8.0;
+	double FootprintZM = 4.0;              // clearance-box height, metres — sizes "contains" floors
 	TArray<FString> Suggestions;           // close matches when resolution failed
 };
 
