@@ -136,6 +136,15 @@ public:
 	 *  window's few hit-testable parts (live-verify: rotate "did nothing"). */
 	bool TryRotatePendingProposal(int32 YawDeltaDeg);
 
+	/**
+	 * Ghost-adjust keybinds: translate a Ctrl+key gesture (arrows / PgUp/PgDn, Shift = 1 m fine
+	 * steps) into a proposal adjustment and send it via the relay. Arrow directions are
+	 * camera-relative, snapped to the world lattice. Returns false when there is no pending
+	 * proposal. Public: the module's global preprocessor drives this from ANYWHERE — ghosts must
+	 * be adjustable with the chat window hidden or unfocused (user rule).
+	 */
+	bool TryAdjustGhost(const FKey& Key, bool bFineStep);
+
 	/** The whole transcript rendered to a single display string ("Author: body" blocks). */
 	UPROPERTY(BlueprintReadOnly, Category = "AIDA")
 	FString RenderedTranscript;
@@ -240,13 +249,6 @@ private:
 
 	/** Refocus the input box now AND next tick — Slate steals focus after commits/button clicks. */
 	void RefocusInput();
-
-	/**
-	 * Ghost-adjust keybinds: translate a Ctrl+key/wheel gesture into a proposal adjustment and send
-	 * it via the relay. Arrow directions are camera-relative, snapped to the world lattice. Returns
-	 * false when there is no pending proposal (the input falls through to its normal meaning).
-	 */
-	bool TryAdjustGhost(const FKey& Key, bool bFineStep);
 
 	//~ Per-conversation transcript state (one per tab). Each conversation is independent.
 	struct FRenderedMessage

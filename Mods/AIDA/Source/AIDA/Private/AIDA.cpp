@@ -56,47 +56,61 @@ namespace
 		return Map;
 	}
 
-	/** Hide + forget any widget currently shown for World. Returns true if one was removed. */
+	/** Is this tracked widget currently VISIBLE? (Widgets persist collapsed when "hidden", so the
+	 *  ghost-adjust keybinds keep working with the window down — user rule.) */
+	bool IsChatVisible(const UAIDAChatWidget* Widget)
+	{
+		return Widget && Widget->IsInViewport() && Widget->GetVisibility() != ESlateVisibility::Collapsed;
+	}
+
+	/** Hide (collapse, NOT destroy) any widget currently shown for World. Returns true if one hid.
+	 *  The widget persists so transcript state survives toggles and the module preprocessor can
+	 *  still drive ghost adjustments while the window is down. */
 	bool HideChatForWorld(UWorld* World)
 	{
-		TWeakObjectPtr<UAIDAChatWidget> Tracked;
-		if (!ShownChatWidgets().RemoveAndCopyValue(World, Tracked))
+		const TWeakObjectPtr<UAIDAChatWidget>* Tracked = ShownChatWidgets().Find(World);
+		UAIDAChatWidget* Existing = Tracked ? Tracked->Get() : nullptr;
+		if (!Existing)
 		{
 			return false;
 		}
-		if (UAIDAChatWidget* Existing = Tracked.Get())
+		const bool bWasVisible = IsChatVisible(Existing);
+		Existing->UnfocusInput();
+		Existing->SetVisibility(ESlateVisibility::Collapsed);
+		if (APlayerController* PC = Existing->GetOwningPlayer())
 		{
-			APlayerController* PC = Existing->GetOwningPlayer();
-			Existing->RemoveFromParent();
-			if (PC)
-			{
-				PC->SetInputMode(FInputModeGameOnly());
-				PC->bShowMouseCursor = false;
-			}
-			return true;
+			PC->SetInputMode(FInputModeGameOnly());
+			PC->bShowMouseCursor = false;
 		}
-		return false; // entry was stale (widget already GC'd)
+		return bWasVisible;
 	}
 
-	/** Create + show the chat widget in PC's viewport, tracked under World. */
+	/** Show the chat widget in PC's viewport (reusing a persisted collapsed one), tracked under World. */
 	void ShowChatForWorld(UWorld* World, APlayerController* PC, bool bFocusInput)
 	{
-		UClass* WidgetClass = LoadClass<UAIDAChatWidget>(nullptr, GAIDAChatWidgetClassPath);
-		if (!WidgetClass)
+		UAIDAChatWidget* Widget = nullptr;
+		if (const TWeakObjectPtr<UAIDAChatWidget>* Tracked = ShownChatWidgets().Find(World))
 		{
-			UE_LOG(LogAIDA, Error, TEXT("AIDA.ShowChat: could not load widget class '%s'. Is WBP_AIDAChat authored under /AIDA/UI?"), GAIDAChatWidgetClassPath);
-			return;
+			Widget = Tracked->Get(); // persisted from an earlier toggle — just un-collapse it
 		}
-
-		UAIDAChatWidget* Widget = CreateWidget<UAIDAChatWidget>(PC, WidgetClass);
 		if (!Widget)
 		{
-			UE_LOG(LogAIDA, Error, TEXT("AIDA.ShowChat: CreateWidget failed."));
-			return;
+			UClass* WidgetClass = LoadClass<UAIDAChatWidget>(nullptr, GAIDAChatWidgetClassPath);
+			if (!WidgetClass)
+			{
+				UE_LOG(LogAIDA, Error, TEXT("AIDA.ShowChat: could not load widget class '%s'. Is WBP_AIDAChat authored under /AIDA/UI?"), GAIDAChatWidgetClassPath);
+				return;
+			}
+			Widget = CreateWidget<UAIDAChatWidget>(PC, WidgetClass);
+			if (!Widget)
+			{
+				UE_LOG(LogAIDA, Error, TEXT("AIDA.ShowChat: CreateWidget failed."));
+				return;
+			}
+			Widget->AddToViewport();
+			ShownChatWidgets().Add(World, Widget);
 		}
-
-		Widget->AddToViewport();
-		ShownChatWidgets().Add(World, Widget);
+		Widget->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 
 		// Input mode follows FOCUS, not visibility (user rule: move and look freely with the
 		// window up). Focusing the input flips to GameAndUI + cursor; after this the widget's own
@@ -158,7 +172,7 @@ namespace
 		bool bAnyShown = false;
 		for (const TPair<UWorld*, APlayerController*>& T : Targets)
 		{
-			if (const TWeakObjectPtr<UAIDAChatWidget>* W = ShownChatWidgets().Find(T.Key); W && W->IsValid())
+			if (const TWeakObjectPtr<UAIDAChatWidget>* W = ShownChatWidgets().Find(T.Key); W && IsChatVisible(W->Get()))
 			{
 				bAnyShown = true;
 				break;
@@ -202,7 +216,7 @@ namespace
 				bool bAnyVisible = false;
 				for (const auto& Pair : ShownChatWidgets())
 				{
-					if (UAIDAChatWidget* Widget = Pair.Value.Get(); Widget && Widget->IsInViewport())
+					if (UAIDAChatWidget* Widget = Pair.Value.Get(); IsChatVisible(Widget))
 					{
 						Widget->FocusInput();
 						bAnyVisible = true;
@@ -215,6 +229,26 @@ namespace
 				return true; // consume so the game doesn't also act on the chord
 			}
 
+			// Ctrl+Arrows / Ctrl+PgUp/PgDn nudge a pending ghost from ANYWHERE — chat visible,
+			// collapsed, focused or not (user rule: holograms stay adjustable without the window).
+			// Consumed only when a pending proposal actually took the adjustment.
+			if (KeyEvent.IsControlDown())
+			{
+				const FKey Key = KeyEvent.GetKey();
+				if (Key == EKeys::Up || Key == EKeys::Down || Key == EKeys::Left || Key == EKeys::Right
+					|| Key == EKeys::PageUp || Key == EKeys::PageDown)
+				{
+					for (const auto& Pair : ShownChatWidgets())
+					{
+						UAIDAChatWidget* Widget = Pair.Value.Get();
+						if (Widget && Widget->TryAdjustGhost(Key, KeyEvent.IsShiftDown()))
+						{
+							return true;
+						}
+					}
+				}
+			}
+
 			// ESC two-step while the window is up (user rule): first press drops focus back to the
 			// game (window stays as an overlay, movement returns); second press hides the window.
 			// Hidden window = ESC untouched, so the game menu works normally.
@@ -224,7 +258,7 @@ namespace
 				bool bAnyFocused = false;
 				for (const auto& Pair : ShownChatWidgets())
 				{
-					if (UAIDAChatWidget* Widget = Pair.Value.Get(); Widget && Widget->IsInViewport())
+					if (UAIDAChatWidget* Widget = Pair.Value.Get(); IsChatVisible(Widget))
 					{
 						bAnyVisible = true;
 						bAnyFocused |= Widget->IsInputFocused();
@@ -238,7 +272,7 @@ namespace
 				{
 					for (const auto& Pair : ShownChatWidgets())
 					{
-						if (UAIDAChatWidget* Widget = Pair.Value.Get(); Widget && Widget->IsInViewport())
+						if (UAIDAChatWidget* Widget = Pair.Value.Get(); IsChatVisible(Widget))
 						{
 							Widget->UnfocusInput();
 						}
@@ -271,9 +305,10 @@ namespace
 				const int32 Step = WheelEvent.IsAltDown() ? 1 : (WheelEvent.IsShiftDown() ? 15 : 90);
 				for (const auto& Pair : ShownChatWidgets())
 				{
+					// Deliberately NOT visibility-gated: ghosts stay rotatable with the chat
+					// window collapsed (user rule) — the widget persists for exactly this.
 					UAIDAChatWidget* Widget = Pair.Value.Get();
-					if (Widget && Widget->IsInViewport() &&
-						Widget->TryRotatePendingProposal(WheelEvent.GetWheelDelta() > 0.f ? Step : -Step))
+					if (Widget && Widget->TryRotatePendingProposal(WheelEvent.GetWheelDelta() > 0.f ? Step : -Step))
 					{
 						return true; // consume — the hotbar must not also spin
 					}
@@ -283,7 +318,7 @@ namespace
 			for (const auto& Pair : ShownChatWidgets())
 			{
 				UAIDAChatWidget* Widget = Pair.Value.Get();
-				if (Widget && Widget->IsInViewport() &&
+				if (IsChatVisible(Widget) &&
 					Widget->IsScreenPositionOverTranscript(WheelEvent.GetScreenSpacePosition()))
 				{
 					Widget->ScrollTranscriptBy(WheelEvent.GetWheelDelta() * -60.f);
