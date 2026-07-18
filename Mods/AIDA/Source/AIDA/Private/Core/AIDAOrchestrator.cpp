@@ -29,6 +29,7 @@
 #include "FGPowerCircuit.h"
 #include "FGSchematicManager.h"
 #include "FGSchematic.h"
+#include "FGRecipe.h"
 #include "ItemAmount.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Engine/World.h"
@@ -187,6 +188,12 @@ namespace
 		"yet). Use for 'hook this up to the water line / tap the oil pipe'. Same two modes as "
 		"propose_belt_tap: forProposalId feeds a pending pipe-in manifold; omit it to feed the nearest "
 		"free pipe input where the player is aiming.\n"
+		"- propose_factory(spec): a WHOLE production line from the plan_factory math in ONE proposal — "
+		"foundations, a machine row per step with recipes + exact clocks assigned, manifold rows on every "
+		"step's inputs/outputs, runs linking step outputs into the next step's feed, and power. Use when "
+		"the player asks to BUILD N/min of something ('build me 30 iron plates a minute right here'); "
+		"afterwards offer belt/pipe taps (forProposalId) for the raw inputs the result lists. For numbers "
+		"only use plan_factory; for one machine group use propose_build.\n"
 		"- propose_power(spec): wire EXISTING machines to electricity — poles beside them, power lines, "
 		"and a tie to the nearest powered grid. Use when the player asks to power/wire up machines that "
 		"are already built ('connect to power', 'wire it up'). Omit spec.center to wire what they're "
@@ -4699,6 +4706,527 @@ void UAIDAOrchestrator::RegisterActionTools()
 			AnnounceSystem(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds, true, 0.0));
+		}
+	});
+
+	// P8 Slice 4 flagship: propose_factory — plan_factory's numbers turned into ONE connected
+	// proposal: foundations + machine rows + per-row manifold sets + inter-step links + power kit,
+	// with per-machine recipe/clock applied at execute. One approval builds the line.
+	Tools.Register({
+		TEXT("propose_factory"),
+		TEXT("PROPOSE a whole production line: runs the plan_factory math for spec.item at spec.ratePerMin, then lays out ONE connected proposal — a foundation slab, one machine row per recipe step (raw-most step nearest the player, product row last), belt/pipe manifold rows on each step's inputs and outputs, runs linking each step's collected output into the next step's feed row, an auto-power kit, and each machine's recipe + exact clock assigned as it builds. ONE approval builds everything; /aida undo removes it all. RAW INPUTS (ore, water) are NOT magically fed: the result lists them — offer to follow up with propose_belt_tap / propose_pipe_tap (forProposalId works on the pending factory) or leave the feed rows' open ends for manual hookup. Spec: {version:1, item, ratePerMin, origin?: {x,y,z metres — omit to build where the player is aiming}, yawDeg?}. Use when the player asks to BUILD production of something ('build me 30 iron plates a minute right here') — for just the numbers, plan_factory; for a single machine group, propose_build. The ghost previews machines, manifolds and runs — tell the player to check it before approving. REVISING: pass replaceProposalId."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, item: product display name, ratePerMin: target rate (fluids m3/min), origin?: {x,y,z metres — omit = player's aim}, yawDeg?: row direction (default 0)}"},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+			FString Item;
+			double RatePerMin = 0.0;
+			double YawDegIn = 0.0;
+			FVector OriginM = FVector::ZeroVector;
+			bool bHasOrigin = false;
+			if (SpecObj && SpecObj->IsValid())
+			{
+				(*SpecObj)->TryGetStringField(TEXT("item"), Item);
+				(*SpecObj)->TryGetNumberField(TEXT("ratePerMin"), RatePerMin);
+				(*SpecObj)->TryGetNumberField(TEXT("yawDeg"), YawDegIn);
+				const TSharedPtr<FJsonObject>* OriginObj = nullptr;
+				if ((*SpecObj)->TryGetObjectField(TEXT("origin"), OriginObj) && OriginObj->IsValid())
+				{
+					(*OriginObj)->TryGetNumberField(TEXT("x"), OriginM.X);
+					(*OriginObj)->TryGetNumberField(TEXT("y"), OriginM.Y);
+					(*OriginObj)->TryGetNumberField(TEXT("z"), OriginM.Z);
+					bHasOrigin = true;
+				}
+			}
+			if (Item.TrimStartAndEnd().IsEmpty() || RatePerMin <= 0.0 || RatePerMin > 10000.0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("spec needs item and a ratePerMin between 0 and 10000"), {}));
+			}
+
+			// Revision id validated up front (mirrors propose_build).
+			FGuid ReplaceId;
+			{
+				FString ReplaceIdStr;
+				Args->TryGetStringField(TEXT("replaceProposalId"), ReplaceIdStr);
+				if (!ReplaceIdStr.TrimStartAndEnd().IsEmpty())
+				{
+					const FAIDAProposal* Replaced = FGuid::Parse(ReplaceIdStr.TrimStartAndEnd(), ReplaceId)
+						? Actions.Store().Find(ReplaceId) : nullptr;
+					if (!Replaced || Replaced->State != EAIDAProposalState::Pending)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("replaceProposalId doesn't match a pending proposal (it may have been decided or expired) — call get_proposal_status"), {}));
+					}
+				}
+			}
+
+			// The math half — same planner plan_factory exposes.
+			UWorld* World = GetWorld();
+			const double NowSeconds = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactoryPlan Plan = FAIDAFactoryPlanner::Plan(Item, RatePerMin,
+				RecipeCatalog.GetRecipes(World, NowSeconds), RecipeCatalog.GetBuildings(World, NowSeconds));
+			if (!Plan.Error.IsEmpty())
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Plan.Error, {}));
+			}
+			if (Plan.Steps.Num() == 0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					FString::Printf(TEXT("the plan for %s has no buildable steps"), *Item), {}));
+			}
+
+			// Build order: raw-most step first (row 0 nearest the origin), the product row last —
+			// items flow along +Y away from the player.
+			struct FRow
+			{
+				const FAIDAPlanStep* Step = nullptr;
+				FString BuildRecipePath;         // the machine buildable
+				FString BuildName;
+				FString ProductionRecipePath;    // what it runs
+				double FootXM = 8.0, FootYM = 8.0;
+				double StepXM = 10.0;
+				double RowYM = 0.0;              // row centerline, metres from origin along +Y
+				int32 PlacementStart = 0;        // global placement index of the row's first machine
+			};
+			TArray<FRow> Rows;
+			for (int32 i = Plan.Steps.Num() - 1; i >= 0; --i)
+			{
+				FRow Row;
+				Row.Step = &Plan.Steps[i];
+				FAIDARecipeResolution Machine;
+				if (!FAIDAActionSeam::ResolveBuildRecipe(this, Row.Step->Building, Machine))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("the plan needs a %s but no unlocked buildable matches that name"), *Row.Step->Building), {}));
+				}
+				Row.BuildRecipePath = Machine.RecipeClassPath;
+				Row.BuildName = Machine.DisplayName;
+				Row.FootXM = FMath::Max(4.0, Row.Step->FootprintXM > 0.0 ? Row.Step->FootprintXM : Machine.FootprintXM);
+				Row.FootYM = FMath::Max(4.0, Row.Step->FootprintYM > 0.0 ? Row.Step->FootprintYM : Machine.FootprintYM);
+				Row.StepXM = Row.FootXM + 2.0;
+				FString ProductionName;
+				TArray<FString> Suggestions;
+				if (!FAIDAActionSeam::ResolveProductionRecipe(this, Row.Step->Recipe, Row.ProductionRecipePath, ProductionName, Suggestions))
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("the plan's recipe '%s' did not resolve to a production recipe"), *Row.Step->Recipe), {}));
+				}
+				Rows.Add(MoveTemp(Row));
+			}
+
+			// Row lines: half of this row + half of the previous + a manifold corridor between.
+			constexpr double RowGapM = 13.0; // out-row (4 m) + in-row (4 m) + belt clearance
+			double CursorYM = 0.0;
+			for (int32 i = 0; i < Rows.Num(); ++i)
+			{
+				if (i > 0) { CursorYM += Rows[i - 1].FootYM * 0.5 + RowGapM + Rows[i].FootYM * 0.5; }
+				Rows[i].RowYM = CursorYM;
+			}
+
+			// Origin: spec > aim > player position, ground-probed for the slab base.
+			FVector OriginCm;
+			if (bHasOrigin)
+			{
+				OriginCm = OriginM * 100.0;
+			}
+			else if (!FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, OriginCm))
+			{
+				if (!Ctx.bHasLocation)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+						TEXT("could not resolve where the player is aiming — pass spec.origin {x,y,z in metres}"), {}));
+				}
+				OriginCm = Ctx.Location;
+			}
+			double GroundZ = OriginCm.Z;
+			FAIDAActionSeam::ProbeGroundZ(this, OriginCm, GroundZ);
+
+			const int32 YawDeg = FMath::RoundToInt32(YawDegIn);
+			const double YawRad = FMath::DegreesToRadians(static_cast<double>(YawDeg));
+			const FVector AxisX(FMath::Cos(YawRad), FMath::Sin(YawRad), 0.0);
+			const FVector AxisY(-AxisX.Y, AxisX.X, 0.0);
+
+			// Foundation slab under everything (1 m thick, tops at GroundZ + 100): the rows' bounding
+			// rect plus manifold corridors. Optional — an unresolved foundation just means terrain.
+			FAIDARecipeResolution Foundation;
+			const bool bFoundations = FAIDAActionSeam::ResolveBuildRecipe(this, TEXT("Foundation 8m x 1m"), Foundation);
+			double MaxRowWidthM = 0.0;
+			for (const FRow& Row : Rows)
+			{
+				MaxRowWidthM = FMath::Max(MaxRowWidthM, Row.Step->Machines * Row.StepXM);
+			}
+			const double SlabMinXM = -10.0, SlabMaxXM = MaxRowWidthM + 10.0;
+			const double SlabMinYM = -Rows[0].FootYM * 0.5 - 8.0;
+			const double SlabMaxYM = Rows.Last().RowYM + Rows.Last().FootYM * 0.5 + 8.0;
+			const double MachineZ = bFoundations ? GroundZ + 100.0 : GroundZ;
+
+			TArray<FString> PartRecipePaths;
+			TArray<FString> PartNames;
+			TArray<FTransform> Placements;
+			TArray<int32> PlacementPartIndex;
+			TArray<FString> MachineRecipeToSet;
+			TArray<double> MachineClockToSet;
+			int32 FoundationCount = 0;
+			if (bFoundations)
+			{
+				PartRecipePaths.Add(Foundation.RecipeClassPath);
+				PartNames.Add(Foundation.DisplayName);
+				for (double XM = SlabMinXM + 4.0; XM < SlabMaxXM; XM += 8.0)
+				{
+					for (double YM = SlabMinYM + 4.0; YM < SlabMaxYM; YM += 8.0)
+					{
+						const FVector Loc = OriginCm + AxisX * (XM * 100.0) + AxisY * (YM * 100.0)
+							+ FVector(0.0, 0.0, GroundZ + 50.0 - OriginCm.Z); // pivot mid-thickness
+						Placements.Emplace(FRotator(0.0, YawDeg, 0.0), FVector(Loc.X, Loc.Y, GroundZ + 50.0));
+						PlacementPartIndex.Add(0);
+						MachineRecipeToSet.Add(FString());
+						MachineClockToSet.Add(0.0);
+						++FoundationCount;
+					}
+				}
+			}
+			for (FRow& Row : Rows)
+			{
+				const int32 Part = PartRecipePaths.Num();
+				PartRecipePaths.Add(Row.BuildRecipePath);
+				PartNames.Add(Row.BuildName);
+				Row.PlacementStart = Placements.Num();
+				for (int32 m = 0; m < Row.Step->Machines; ++m)
+				{
+					const FVector Loc = OriginCm
+						+ AxisX * ((m * Row.StepXM + Row.StepXM * 0.5) * 100.0)
+						+ AxisY * (Row.RowYM * 100.0);
+					Placements.Emplace(FRotator(0.0, YawDeg, 0.0), FVector(Loc.X, Loc.Y, MachineZ));
+					PlacementPartIndex.Add(Part);
+					MachineRecipeToSet.Add(Row.ProductionRecipePath);
+					MachineClockToSet.Add(FMath::Clamp(Row.Step->Clock * 100.0, 1.0, 100.0));
+				}
+			}
+			if (Config.Actions.MaxProposalItems > 0 && Placements.Num() > Config.Actions.MaxProposalItems)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+					TEXT("the factory needs %d placements — more than maxProposalItems (%d); lower the rate or raise the cap"),
+					Placements.Num(), Config.Actions.MaxProposalItems), {}));
+			}
+
+			FAIDADryRunResult DryRun;
+			if (!FAIDAActionSeam::DryRunBuildParts(this, PartRecipePaths, PlacementPartIndex, Placements, DryRun, Ctx.PlayerId))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(DryRun.Error, {}));
+			}
+
+			// Manifold rows per step: every belt/pipe port rank on each side gets its own row (an
+			// assembler's two inputs = two feed rows). Attachment/transport recipes cache per kind.
+			FAIDAProposal Proposal;
+			TArray<FVector> UsedPorts;
+			struct FSetMeta { int32 Row = 0; bool bPipe = false; bool bOutput = false; int32 Ordinal = 0; };
+			TArray<FSetMeta> SetMeta;
+			FAIDARecipeResolution Splitter, Merger, Junction, Belt, Pipe;
+			const bool bHaveSplitter = FAIDAActionSeam::ResolveBuildRecipe(this, TEXT("Conveyor Splitter"), Splitter);
+			const bool bHaveMerger = FAIDAActionSeam::ResolveBuildRecipe(this, TEXT("Conveyor Merger"), Merger);
+			const bool bHaveJunction = FAIDAActionSeam::ResolveBuildRecipe(this, TEXT("Pipeline Junction Cross"), Junction);
+			bool bHaveBelt = false, bHavePipe = false;
+			for (const TCHAR* Name : { TEXT("Conveyor Belt Mk.6"), TEXT("Conveyor Belt Mk.5"), TEXT("Conveyor Belt Mk.4"),
+				TEXT("Conveyor Belt Mk.3"), TEXT("Conveyor Belt Mk.2"), TEXT("Conveyor Belt Mk.1") })
+			{
+				if (FAIDAActionSeam::ResolveBuildRecipe(this, Name, Belt)) { bHaveBelt = true; break; }
+			}
+			for (const TCHAR* Name : { TEXT("Pipeline Mk.2"), TEXT("Pipeline") })
+			{
+				if (FAIDAActionSeam::ResolveBuildRecipe(this, Name, Pipe)) { bHavePipe = true; break; }
+			}
+			int32 RowsSkippedNoKit = 0;
+			for (int32 r = 0; r < Rows.Num(); ++r)
+			{
+				const FRow& Row = Rows[r];
+				const TArray<FTransform> RowPlacements(Placements.GetData() + Row.PlacementStart, Row.Step->Machines);
+				for (const bool bPipeKind : { false, true })
+				{
+					for (const bool bOutput : { false, true })
+					{
+						for (int32 Ordinal = 0; Ordinal < 3; ++Ordinal)
+						{
+							TArray<FAIDAManifoldPort> Ports;
+							TArray<int32> PortIdx;
+							if (!FAIDAActionSeam::ResolvePlannedPorts(this, Row.BuildRecipePath, Row.BuildName,
+								RowPlacements, bPipeKind, bOutput, Ordinal, UsedPorts, Ports, PortIdx)
+								|| Ports.Num() == 0)
+							{
+								break; // no more ports of this kind/side
+							}
+							const FAIDARecipeResolution& Attachment = bPipeKind ? Junction : (bOutput ? Merger : Splitter);
+							const bool bHaveAttachment = bPipeKind ? bHaveJunction : (bOutput ? bHaveMerger : bHaveSplitter);
+							const bool bHaveTransport = bPipeKind ? bHavePipe : bHaveBelt;
+							if (!bHaveAttachment || !bHaveTransport)
+							{
+								++RowsSkippedNoKit;
+								break;
+							}
+
+							TArray<FAIDAManifoldPortPoint> Points;
+							FVector AvgNormal = FVector::ZeroVector;
+							for (const FAIDAManifoldPort& Port : Ports)
+							{
+								Points.Add({ Port.PosCm, Port.NormalCm });
+								AvgNormal += Port.NormalCm;
+							}
+							AvgNormal = AvgNormal.GetSafeNormal();
+							// Same-side rows on this step stack one lane further out.
+							int32 Lane = 0;
+							for (int32 s = 0; s < Proposal.ManifoldSets.Num(); ++s)
+							{
+								if (SetMeta[s].Row != r) { continue; }
+								FVector SetNormal = FVector::ZeroVector;
+								for (const FAIDAManifoldPort& Port : Proposal.ManifoldSets[s].Ports) { SetNormal += Port.NormalCm; }
+								if (FVector::DotProduct(SetNormal.GetSafeNormal(), AvgNormal) > 0.5) { ++Lane; }
+							}
+							FAIDAManifoldPlan RowPlan = AIDAActionSpec::PlanManifold(Points, bOutput, bPipeKind,
+								4.0 + Lane * 5.0, 4.0, /*MaxRunM*/ 56.0);
+							if (!RowPlan.Error.IsEmpty())
+							{
+								++RowsSkippedNoKit;
+								break;
+							}
+							for (FTransform& Placement : RowPlan.Attachments)
+							{
+								// Attachments sit at the ports' level — the slab is PENDING, so a
+								// terrain probe would bury them (same guard as propose_manifold).
+								FVector Location = Placement.GetLocation();
+								double AttachGroundZ;
+								if (FAIDAActionSeam::ProbeGroundZ(this, Location, AttachGroundZ)
+									&& Location.Z - AttachGroundZ <= 400.0)
+								{
+									Location.Z = AttachGroundZ;
+								}
+								else
+								{
+									Location.Z -= 100.0;
+								}
+								Placement.SetLocation(Location);
+							}
+
+							FAIDAManifoldSet NewSet;
+							NewSet.bPipe = bPipeKind;
+							NewSet.bOutput = bOutput;
+							NewSet.TransportRecipePath = (bPipeKind ? Pipe : Belt).RecipeClassPath;
+							NewSet.TransportName = (bPipeKind ? Pipe : Belt).DisplayName;
+							NewSet.AttachmentRecipePath = Attachment.RecipeClassPath;
+							NewSet.AttachmentName = Attachment.DisplayName;
+							for (const int32 P : RowPlan.PortOrder)
+							{
+								NewSet.Ports.Add(Ports[P]);
+								NewSet.PortMachineIndex.Add(Row.PlacementStart + PortIdx[P]);
+								UsedPorts.Add(Ports[P].PosCm);
+							}
+							NewSet.Attachments = MoveTemp(RowPlan.Attachments);
+							NewSet.RowAxis = RowPlan.RowAxis;
+							NewSet.DropDir = RowPlan.DropDir;
+							TArray<FAIDACostItem> AttachmentCost;
+							FAIDAActionSeam::TallyRecipeCost(this, NewSet.AttachmentRecipePath, NewSet.Attachments.Num(), AttachmentCost);
+							for (const FAIDACostItem& CostItem : AttachmentCost)
+							{
+								bool bMerged = false;
+								for (FAIDACostItem& Existing : DryRun.Cost)
+								{
+									if (Existing.Item == CostItem.Item) { Existing.Amount += CostItem.Amount; bMerged = true; break; }
+								}
+								if (!bMerged) { DryRun.Cost.Add(CostItem); }
+							}
+							Proposal.ManifoldSets.Add(MoveTemp(NewSet));
+							SetMeta.Add({ r, bPipeKind, bOutput, Ordinal });
+						}
+					}
+				}
+			}
+
+			// Inter-step links: consumer row's k-th same-kind ingredient row hooks to the producer's
+			// out row of that kind — recipe ingredients decide who feeds whom, not adjacency.
+			int32 LinksPlanned = 0;
+			for (int32 c = 0; c < Rows.Num(); ++c)
+			{
+				UClass* ProductionClass = FSoftClassPath(Rows[c].ProductionRecipePath).TryLoadClass<UFGRecipe>();
+				if (!ProductionClass) { continue; }
+				int32 SolidOrdinal = 0, FluidOrdinal = 0;
+				for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(this, ProductionClass))
+				{
+					if (!Ingredient.ItemClass) { continue; }
+					const EResourceForm Form = UFGItemDescriptor::GetForm(Ingredient.ItemClass);
+					const bool bFluid = Form == EResourceForm::RF_LIQUID || Form == EResourceForm::RF_GAS;
+					const int32 Ordinal = bFluid ? FluidOrdinal++ : SolidOrdinal++;
+					const FString IngredientName = UFGItemDescriptor::GetItemName(Ingredient.ItemClass).ToString();
+
+					int32 Producer = INDEX_NONE;
+					for (int32 p = 0; p < Rows.Num(); ++p)
+					{
+						if (p != c && Rows[p].Step->Item == IngredientName) { Producer = p; break; }
+					}
+					if (Producer == INDEX_NONE) { continue; } // a raw input — listed for taps
+
+					int32 FromSet = INDEX_NONE, ToSet = INDEX_NONE;
+					for (int32 s = 0; s < SetMeta.Num(); ++s)
+					{
+						if (SetMeta[s].Row == Producer && SetMeta[s].bOutput && SetMeta[s].bPipe == bFluid
+							&& SetMeta[s].Ordinal == 0) { FromSet = s; }
+						if (SetMeta[s].Row == c && !SetMeta[s].bOutput && SetMeta[s].bPipe == bFluid
+							&& SetMeta[s].Ordinal == Ordinal) { ToSet = s; }
+					}
+					if (ToSet == INDEX_NONE)
+					{
+						for (int32 s = 0; s < SetMeta.Num(); ++s)
+						{
+							if (SetMeta[s].Row == c && !SetMeta[s].bOutput && SetMeta[s].bPipe == bFluid) { ToSet = s; break; }
+						}
+					}
+					if (FromSet != INDEX_NONE && ToSet != INDEX_NONE)
+					{
+						Proposal.StepLinks.Add(FIntPoint(FromSet, ToSet));
+						++LinksPlanned;
+					}
+				}
+			}
+
+			// Auto-power: one kit across all rows (poles behind each row chunk, machines wired to
+			// their chunk's pole, poles chained + tied to the grid at execute).
+			FAIDAActionSeam::FAIDAPowerInfo Power;
+			FString PowerError;
+			bool bAutoPower = false;
+			if (Rows.Num() > 0 && FAIDAActionSeam::ResolveAutoPower(this, Rows[0].BuildRecipePath, FString(), Power, PowerError))
+			{
+				const int32 PerPole = FMath::Max(1, Power.PoleConnectionCap - 2);
+				for (const FRow& Row : Rows)
+				{
+					const int32 Chunks = FMath::DivideAndRoundUp(Row.Step->Machines, PerPole);
+					for (int32 ChunkIdx = 0; ChunkIdx < Chunks; ++ChunkIdx)
+					{
+						const int32 First = ChunkIdx * PerPole;
+						const int32 Count = FMath::Min(PerPole, Row.Step->Machines - First);
+						const double MidXM = (First + Count * 0.5) * Row.StepXM;
+						const FVector Loc = OriginCm + AxisX * (MidXM * 100.0)
+							+ AxisY * ((Row.RowYM + Row.FootYM * 0.5 + 2.0) * 100.0);
+						const int32 PoleIdx = Proposal.PolePlacements.Num();
+						Proposal.PolePlacements.Emplace(FRotator(0.0, YawDeg, 0.0), FVector(Loc.X, Loc.Y, MachineZ));
+						for (int32 m = 0; m < Count; ++m)
+						{
+							Proposal.MachineWires.Add(FIntPoint(Row.PlacementStart + First + m, PoleIdx));
+						}
+						if (PoleIdx > 0)
+						{
+							Proposal.ChainWires.Add(FIntPoint(PoleIdx - 1, PoleIdx));
+						}
+					}
+				}
+				if (Proposal.PolePlacements.Num() > 0)
+				{
+					Proposal.PoleRecipePath = Power.PoleRecipePath;
+					Proposal.PoleName = Power.PoleName;
+					Proposal.WireRecipePath = Power.WireRecipePath;
+					bAutoPower = true;
+					TArray<FAIDACostItem> PoleCost;
+					FAIDAActionSeam::TallyRecipeCost(this, Power.PoleRecipePath, Proposal.PolePlacements.Num(), PoleCost);
+					for (const FAIDACostItem& CostItem : PoleCost)
+					{
+						bool bMerged = false;
+						for (FAIDACostItem& Existing : DryRun.Cost)
+						{
+							if (Existing.Item == CostItem.Item) { Existing.Amount += CostItem.Amount; bMerged = true; break; }
+						}
+						if (!bMerged) { DryRun.Cost.Add(CostItem); }
+					}
+				}
+			}
+
+			if (Config.Actions.CostMode == TEXT("central")
+				&& !FAIDAActionSeam::CheckAffordable(this, DryRun.Cost, Ctx.PlayerId))
+			{
+				FString Msg = TEXT("not affordable from central storage + your inventory: needs ");
+				for (int32 i = 0; i < DryRun.Cost.Num(); ++i)
+				{
+					Msg += FString::Printf(TEXT("%s%d %s"), i > 0 ? TEXT(", ") : TEXT(""), DryRun.Cost[i].Amount, *DryRun.Cost[i].Item);
+				}
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
+			}
+
+			Proposal.Id = FGuid::NewGuid();
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.Placements = MoveTemp(Placements);
+			Proposal.RecipeClassPath = PartRecipePaths[0];
+			Proposal.PartRecipePaths = MoveTemp(PartRecipePaths);
+			Proposal.PlacementPartIndex = MoveTemp(PlacementPartIndex);
+			Proposal.MachineRecipeToSet = MoveTemp(MachineRecipeToSet);
+			Proposal.MachineClockToSet = MoveTemp(MachineClockToSet);
+			Proposal.bAutoPower = bAutoPower;
+			Proposal.Cost = DryRun.Cost;
+			Proposal.InvalidCount = DryRun.Failures.Num();
+			{
+				FString StepsDesc;
+				for (int32 i = Rows.Num() - 1; i >= 0; --i)
+				{
+					StepsDesc += FString::Printf(TEXT("%s%d x %s @ %.0f%%"), StepsDesc.IsEmpty() ? TEXT("") : TEXT(", "),
+						Rows[i].Step->Machines, *Rows[i].BuildName, Rows[i].Step->Clock * 100.0);
+				}
+				Proposal.Summary = FString::Printf(TEXT("factory for %.4g %s/min: %s — %d manifold row(s), %d step link(s)%s%s"),
+					Plan.TargetPerMin, *Plan.TargetItem, *StepsDesc,
+					Proposal.ManifoldSets.Num(), LinksPlanned,
+					bAutoPower ? *FString::Printf(TEXT(", %d pole(s)"), Proposal.PolePlacements.Num()) : TEXT(""),
+					bFoundations ? *FString::Printf(TEXT(", %d foundation(s)"), FoundationCount) : TEXT(""));
+			}
+			{
+				TSharedRef<FJsonObject> StoredSpec = MakeShared<FJsonObject>();
+				StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_factory"));
+				StoredSpec->SetStringField(TEXT("item"), Plan.TargetItem);
+				StoredSpec->SetNumberField(TEXT("ratePerMin"), Plan.TargetPerMin);
+				Proposal.SpecJson = AIDAToCompactJson(StoredSpec);
+			}
+
+			if (ReplaceId.IsValid())
+			{
+				SupersedeProposal(ReplaceId);
+			}
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (factory): %s (by %s, %d blocked placement(s))"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author, Proposal.InvalidCount);
+			PublishProposal(Proposal.Id);
+
+			FString RawList;
+			for (const FAIDAPlanResource& Raw : Plan.RawInputs)
+			{
+				RawList += FString::Printf(TEXT("%s%.4g %s/min"), RawList.IsEmpty() ? TEXT("") : TEXT(", "), Raw.RatePerMin, *Raw.Item);
+			}
+			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s — cost %s. Awaiting approval."),
+				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""),
+				*Proposal.Summary, *AIDACostSummaryString(Proposal.Cost));
+			if (!RawList.IsEmpty())
+			{
+				Announce += FString::Printf(TEXT(" Raw inputs to feed after approval: %s."), *RawList);
+			}
+			AnnounceSystem(Announce);
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			Root->SetStringField(TEXT("proposalId"), Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens));
+			Root->SetStringField(TEXT("summary"), Proposal.Summary);
+			Root->SetNumberField(TEXT("placements"), Proposal.Placements.Num());
+			Root->SetNumberField(TEXT("manifoldRows"), Proposal.ManifoldSets.Num());
+			Root->SetNumberField(TEXT("stepLinks"), LinksPlanned);
+			if (Proposal.InvalidCount > 0) { Root->SetNumberField(TEXT("invalidCount"), Proposal.InvalidCount); }
+			if (RowsSkippedNoKit > 0) { Root->SetNumberField(TEXT("manifoldRowsSkipped"), RowsSkippedNoKit); }
+			if (!RawList.IsEmpty())
+			{
+				Root->SetStringField(TEXT("rawInputs"), RawList);
+				Root->SetStringField(TEXT("rawInputsHint"), TEXT("offer propose_belt_tap / propose_pipe_tap with forProposalId to feed these from existing lines"));
+			}
+			Root->SetNumberField(TEXT("expiresInSeconds"), Config.Actions.TtlSeconds);
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
 		}
 	});
 

@@ -96,6 +96,14 @@ screw buffer here fed from the nearest screw belt" builds container + splitter r
 
 ### Slice 4 — `propose_factory` (the flagship)
 
+> **Status (2026-07-18): CODE SHIPPED** — 4a generator + 4b inter-step routing in one pass, per
+> the user's call to defer ALL live testing to one consolidated session (the belt-tap-chain-first
+> rule below is superseded by that decision). Implementation notes: rows raw-most-first along +Y,
+> per-port-rank manifold rows, ingredient-driven StepLinks (a new TickConnected phase joining
+> open-end attachments), MachineRecipeToSet/MachineClockToSet applied right after the machine
+> phase, chunked pole kit. Raw-input feeds stay taps-by-follow-up, exactly as sketched. The P8
+> exit gate below is now the live session's headline test.
+
 `plan_factory` already computes machines-per-step, exact clocks, belt marks, power, raw inputs.
 This slice turns a chosen plan into ONE connected proposal:
 

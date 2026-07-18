@@ -349,10 +349,11 @@ bool FAIDAActionEngine::Tick(UObject* WorldContext, const FAIDAActionsConfig& Co
 		// Standalone tap: the machines/manifold already EXIST — only the tap + feed chain build.
 		return TickTapOnly(WorldContext, Config, Memory, *Proposal);
 	}
-	if (Proposal->ManifoldSets.Num() > 0 && !Proposal->bDismantle)
+	if ((Proposal->ManifoldSets.Num() > 0 || Proposal->MachineRecipeToSet.Num() > 0) && !Proposal->bDismantle)
 	{
 		// Connected build (machines + manifold sets, revise-by-prompt) — runs its own power
-		// phases when bAutoPower, so it must dispatch ahead of the plain powered path.
+		// phases when bAutoPower, so it must dispatch ahead of the plain powered path. Factory
+		// proposals route here even with zero sets so their recipe/clock assignment runs.
 		return TickConnected(WorldContext, Config, Memory, *Proposal);
 	}
 	if (Proposal->bAutoPower && !Proposal->bDismantle)
@@ -962,6 +963,35 @@ bool FAIDAActionEngine::TickConnected(UObject* WorldContext, const FAIDAActionsC
 				Set.Ports[i].Machine = AttachmentActors.IsValidIndex(MachineIdx) ? AttachmentActors[MachineIdx] : nullptr;
 			}
 		}
+
+		// propose_factory: freshly built machines get their production recipe + clock NOW, before
+		// drops or wires — Slice 2's apply code, journaled as part of the build (undo dismantles).
+		if (Proposal.MachineRecipeToSet.Num() > 0 || Proposal.MachineClockToSet.Num() > 0)
+		{
+			for (int32 i = 0; i < AttachmentActors.Num(); ++i)
+			{
+				AActor* Machine = AttachmentActors[i].Get();
+				if (!Machine) { continue; }
+				if (Proposal.MachineRecipeToSet.IsValidIndex(i) && !Proposal.MachineRecipeToSet[i].IsEmpty())
+				{
+					FString Before, Error;
+					if (!FAIDAActionSeam::ApplyRecipeMutation(WorldContext, Machine,
+						Proposal.MachineRecipeToSet[i], /*bForce*/ true, Before, Error))
+					{
+						++RunFailCount;
+						if (RunFailures.Num() < 5)
+						{
+							RunFailures.Add(FString::Printf(TEXT("recipe for machine %d: %s"), i, *Error));
+						}
+					}
+				}
+				if (Proposal.MachineClockToSet.IsValidIndex(i) && Proposal.MachineClockToSet[i] > 0.0)
+				{
+					double BeforePct = 0.0;
+					FAIDAActionSeam::ApplyClockMutation(Machine, Proposal.MachineClockToSet[i], BeforePct);
+				}
+			}
+		}
 		SetAttachmentActors.SetNum(Sets);
 		Proposal.Phase = 1;
 		Proposal.Cursor = 0;
@@ -1190,6 +1220,45 @@ bool FAIDAActionEngine::TickConnected(UObject* WorldContext, const FAIDAActionsC
 			{
 				return true;
 			}
+		}
+	}
+
+	// propose_factory inter-step links (P8 Slice 4): one run per step boundary, from an OUT row's
+	// open-end attachment to the next step's IN row open end — both index 0, both already built.
+	if (Proposal.StepLinks.Num() > 0)
+	{
+		const int32 LinkPhase = WirePhase + 4; // beyond every tap phase, tap or no tap
+		if (Proposal.Phase < LinkPhase)
+		{
+			Proposal.Phase = LinkPhase;
+			Proposal.Cursor = 0;
+			return true;
+		}
+		if (Proposal.Cursor < Proposal.StepLinks.Num())
+		{
+			const int32 Index = Proposal.Cursor++;
+			const FIntPoint& Link = Proposal.StepLinks[Index];
+			if (Proposal.ManifoldSets.IsValidIndex(Link.X) && Proposal.ManifoldSets.IsValidIndex(Link.Y))
+			{
+				const FAIDAManifoldSet& FromSet = Proposal.ManifoldSets[Link.X];
+				const FAIDAManifoldSet& ToSet = Proposal.ManifoldSets[Link.Y];
+				AActor* From = (SetAttachmentActors.IsValidIndex(Link.X) && SetAttachmentActors[Link.X].Num() > 0)
+					? SetAttachmentActors[Link.X][0].Get() : nullptr;
+				AActor* To = (SetAttachmentActors.IsValidIndex(Link.Y) && SetAttachmentActors[Link.Y].Num() > 0)
+					? SetAttachmentActors[Link.Y][0].Get() : nullptr;
+				// Merger trunks collect toward index 0, so the link leaves along -RowAxis; splitter
+				// rows feed at index 0, arriving against their -RowAxis.
+				RunOne(FromSet, From, -FromSet.RowAxis, To, -ToSet.RowAxis, TEXT("step link"), Index);
+			}
+			else
+			{
+				++RunFailCount;
+				if (RunFailures.Num() < 5)
+				{
+					RunFailures.Add(FString::Printf(TEXT("step link %d: set missing"), Index));
+				}
+			}
+			if (Proposal.Cursor < Proposal.StepLinks.Num()) { return true; }
 		}
 	}
 

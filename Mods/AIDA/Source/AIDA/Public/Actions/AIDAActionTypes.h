@@ -460,6 +460,15 @@ struct FAIDAProposal
 	bool bLabel = false;
 	TArray<FAIDALabelTarget> LabelTargets; // index-aligned with Placements
 
+	//~ propose_factory extensions (P8 Slice 4). StepLinks execute AFTER every manifold set: one
+	//  belt/pipe run from FromSet's open-end attachment (index 0) to ToSet's open end, wiring one
+	//  step's collected output into the next step's feed row. MachineRecipeToSet/MachineClockToSet
+	//  are parallel to Placements (empty path / clock <= 0 = leave alone) and apply right after
+	//  the machine phase builds — journaled as part of the build, so undo just dismantles.
+	TArray<FIntPoint> StepLinks;           // (from set index = an OUT row, to set index = an IN row)
+	TArray<FString> MachineRecipeToSet;
+	TArray<double> MachineClockToSet;      // percent (100 = full speed)
+
 	//~ In-place mutation extensions (P8 Slice 2). No placements, no ghosts: targets re-resolve at
 	//  approve from the stored selector (never trusted from the dry-run), execute journals
 	//  per-entity before/after values (journal MutationJson), undo restores the before values.
