@@ -26,13 +26,17 @@ enum class EAIDAProposalState : uint8
 	Undone      // executed, then reversed via /aida undo
 };
 
-/** N×M repeat pattern for a build spec. Steps in metres; 0 = use the buildable's footprint. */
+/** N×M repeat pattern for a build spec. v1 grids pack EDGE TO EDGE (user rule) — the pitch is
+ *  the buildable's hard-clearance footprint plus the explicit Gap fields; the legacy Step fields
+ *  are parsed for v2 composite parts only (the model kept guessing pitches and scattering rows). */
 struct FAIDAGridSpec
 {
 	int32 CountX = 1;
 	int32 CountY = 1;
-	double StepXM = 0.0;
+	double StepXM = 0.0;   // v2 composite parts only; IGNORED by v1 grid expansion
 	double StepYM = 0.0;
+	double GapXM = 0.0;    // metres of clear space BETWEEN machines (only when the player asks)
+	double GapYM = 0.0;
 };
 
 /** One part of a spec-v2 composite build: a buildable placed (optionally grid-repeated) at an

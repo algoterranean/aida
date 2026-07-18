@@ -294,17 +294,20 @@ bool AIDAActionSpec::ParseBuildSpec(const TSharedPtr<FJsonObject>& Spec, int32 M
 		int32 I;
 		if ((*Grid)->TryGetNumberField(TEXT("countX"), I)) { Parsed.Grid.CountX = I; }
 		if ((*Grid)->TryGetNumberField(TEXT("countY"), I)) { Parsed.Grid.CountY = I; }
-		(*Grid)->TryGetNumberField(TEXT("stepX"), Parsed.Grid.StepXM);
+		(*Grid)->TryGetNumberField(TEXT("stepX"), Parsed.Grid.StepXM); // legacy — v1 ignores them
 		(*Grid)->TryGetNumberField(TEXT("stepY"), Parsed.Grid.StepYM);
+		(*Grid)->TryGetNumberField(TEXT("gapX"), Parsed.Grid.GapXM);
+		(*Grid)->TryGetNumberField(TEXT("gapY"), Parsed.Grid.GapYM);
 	}
 	if (Parsed.Grid.CountX < 1 || Parsed.Grid.CountY < 1)
 	{
 		OutError = TEXT("grid counts must be >= 1");
 		return false;
 	}
-	if (Parsed.Grid.StepXM < 0.0 || Parsed.Grid.StepYM < 0.0)
+	if (Parsed.Grid.StepXM < 0.0 || Parsed.Grid.StepYM < 0.0
+		|| Parsed.Grid.GapXM < 0.0 || Parsed.Grid.GapYM < 0.0)
 	{
-		OutError = TEXT("grid steps must be >= 0 (0 = buildable footprint)");
+		OutError = TEXT("grid steps/gaps must be >= 0");
 		return false;
 	}
 	const int64 Total = static_cast<int64>(Parsed.Grid.CountX) * Parsed.Grid.CountY;
@@ -1020,11 +1023,12 @@ FString AIDAActionSpec::SummarizeManifold(const FAIDAManifoldSpec& Spec, const F
 
 TArray<FTransform> AIDAActionSpec::ExpandGrid(const FAIDABuildSpec& Spec, double DefaultStepXM, double DefaultStepYM)
 {
-	// Steps smaller than the footprint stack tiles on top of each other — never what a player wants
-	// (live-verify: the model kept assuming a "Foundation (1 m)" tile is 1 m wide and packed 100
-	// overlapping tiles). Clamp UP to the footprint; deliberate gaps (larger steps) stay allowed.
-	const double StepXCm = FMath::Max(Spec.Grid.StepXM, DefaultStepXM) * AIDAMetersToCm;
-	const double StepYCm = FMath::Max(Spec.Grid.StepYM, DefaultStepYM) * AIDAMetersToCm;
+	// v1 grids pack EDGE TO EDGE (user rule: "in a row" means as close as the game allows). The
+	// pitch is the buildable's hard-clearance footprint plus the EXPLICIT gap fields; the legacy
+	// stepX/stepY are ignored here — the model kept treating them as a required pitch and
+	// scattering rows however carefully the description said to omit them (live-verify, twice).
+	const double StepXCm = (DefaultStepXM + FMath::Max(0.0, Spec.Grid.GapXM)) * AIDAMetersToCm;
+	const double StepYCm = (DefaultStepYM + FMath::Max(0.0, Spec.Grid.GapYM)) * AIDAMetersToCm;
 
 	// Step axes rotate with the yaw so a rotated grid stays coherent (rows follow the buildable's X).
 	const double YawRad = FMath::DegreesToRadians(static_cast<double>(Spec.YawDeg));

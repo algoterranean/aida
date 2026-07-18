@@ -2344,17 +2344,19 @@ bool FAIDAActionsGridExpandTest::RunTest(const FString&)
 		TestTrue(TEXT("rotation applied"), FMath::IsNearlyEqual(T[0].Rotator().Yaw, 90.0, 0.01));
 	}
 
-	// Explicit steps: gaps (larger than the footprint) are honored; sub-footprint steps clamp UP —
-	// they would stack tiles on top of each other (live-verify: "Foundation (1 m)" is 8 m wide).
+	// v1 pitch = footprint + explicit gap; model-guessed steps are IGNORED entirely (user rule:
+	// "in a row" packs edge to edge — the model kept scattering rows with guessed pitches).
 	{
 		Spec.YawDeg = 0;
-		Spec.Grid.StepXM = 12.0;
+		Spec.Grid.StepXM = 12.0; // legacy step: no effect on v1 grids
 		const TArray<FTransform> T = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
-		TestEqual(TEXT("gap stepX honored"), T[1].GetLocation().X, 2200.0);
+		TestEqual(TEXT("guessed stepX ignored — footprint pitch"), T[1].GetLocation().X, 1800.0);
 
-		Spec.Grid.StepXM = 1.0;
-		const TArray<FTransform> Clamped = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
-		TestEqual(TEXT("sub-footprint stepX clamps to footprint"), Clamped[1].GetLocation().X, 1800.0);
+		Spec.Grid.StepXM = 0.0;
+		Spec.Grid.GapXM = 4.0; // the ONE way to space a row out
+		const TArray<FTransform> Gapped = AIDAActionSpec::ExpandGrid(Spec, 8.0, 8.0);
+		TestEqual(TEXT("explicit gap adds to the footprint"), Gapped[1].GetLocation().X, 2200.0);
+		Spec.Grid.GapXM = 0.0;
 	}
 	return true;
 }
