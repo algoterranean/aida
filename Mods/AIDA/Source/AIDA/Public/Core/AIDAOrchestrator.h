@@ -147,6 +147,18 @@ private:
 	/** Assemble the privacy-filtered chat context (one conversation's recent transcript) sent to the LLM. */
 	void BuildChatContext(const FGuid& ConversationId, TArray<FAIDAChatMessage>& OutMessages) const;
 
+	/**
+	 * Terminal step of a chat reply, with the fabrication SELF-REPAIR loop: when the finished text
+	 * invites approval of a proposal but NO proposal was created during this request, the reply is
+	 * not accepted — the fabricated turn goes back into the history with a corrective user turn and
+	 * the tool loop re-runs (RetriesLeft bounds it) so the model actually calls the propose_* tool.
+	 * Only when repair is exhausted does the old heads-up note post. Streaming continues into the
+	 * same widget message either way.
+	 */
+	void FinishChatReply(const FGuid& MsgId, const FGuid& ConversationId, int64 ReplyStartUtc,
+		TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages, FAIDARequester Requester,
+		int32 RetriesLeft, const FString& FinalText);
+
 	/** Resolves the config path: server admin override first, then the mod's shipped example. */
 	FString ResolveConfigPath(FString& OutSource) const;
 

@@ -51,7 +51,13 @@ namespace
 		return Text.Contains(TEXT("/aida approve"), ESearchCase::IgnoreCase)
 			|| Text.Contains(TEXT("awaiting approval"), ESearchCase::IgnoreCase)
 			|| Text.Contains(TEXT("approve with"), ESearchCase::IgnoreCase)
-			|| Text.Contains(TEXT("awaiting your approval"), ESearchCase::IgnoreCase);
+			|| Text.Contains(TEXT("awaiting your approval"), ESearchCase::IgnoreCase)
+			// The fabricated form seen live omits approve wording sometimes — the announcement
+			// itself is the tell. False positives are harmless: the check only acts when NO real
+			// proposal exists.
+			|| Text.Contains(TEXT("proposal ready"), ESearchCase::IgnoreCase)
+			|| Text.Contains(TEXT("proposal is ready"), ESearchCase::IgnoreCase)
+			|| Text.Contains(TEXT("proposal created"), ESearchCase::IgnoreCase);
 	}
 
 	/** Map a tool's declared tier onto the permission tier the orchestrator gates it with. */
@@ -155,6 +161,14 @@ namespace
 		"for coordinates and NEVER refuse a request for lack of a location — omitting the field IS the "
 		"correct way to say 'where I'm looking'.\n\n"
 		"World-modifying proposal tools (only registered when the server enables them):\n"
+		"FABRICATION RULE (absolute): NEVER write 'proposal ready', a cost list, or 'awaiting approval' "
+		"unless a propose_* TOOL RESULT in THIS very reply returned a proposalId. Describing a proposal "
+		"without calling the tool creates NOTHING: there is no ghost, /aida approve fails, and the server "
+		"posts a public correction under your reply — it is the most damaging mistake you can make. When "
+		"the player asks you to build/place/change something, your reply MUST START with the propose_* "
+		"tool call — never with prose announcing what you 'will' do or 'have' proposed. The server "
+		"announces every real proposal itself with an 'AIDA proposes …' system line; if that line has "
+		"not appeared, no proposal exists, whatever the conversation says.\n"
 		"- propose_build(spec): propose placing buildables on a snapped grid. NOTHING is built until a "
 		"player with act permission approves the proposal. Only call it when the player explicitly asks "
 		"you to build/place something. Omit the spec's 'origin' to build where the player is aiming ('here', "
@@ -922,36 +936,13 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 				O->Session->AppendDelta(MsgId, Delta);
 			}
 		},
-		[Weak, MsgId, ConversationId, ReplyStartUtc](const FString& FullText)
+		[Weak, MsgId, ConversationId, ReplyStartUtc, Messages, Requester](const FString& FullText)
 		{
 			if (UAIDAOrchestrator* O = Weak.Get(); O && O->Session.IsValid())
 			{
-				O->Session->CompleteMessage(MsgId);
-
-				// Fabrication tripwire (live-verify: the model announced "approve with /aida approve"
-				// after reading get_proposal_status, without ever calling propose_build). If the reply
-				// invites approval but NOTHING is pending and nothing was proposed during this reply,
-				// correct the record IMMEDIATELY — not when the player's approve bounces.
-				if (O->Config.Actions.bEnabled && AIDATextInvitesApproval(FullText))
-				{
-					O->SweepProposals();
-					bool bRealProposal = false;
-					for (const FAIDAProposal& Proposal : O->Actions.Store().All())
-					{
-						if (Proposal.State == EAIDAProposalState::Pending || Proposal.ProposedUtc >= ReplyStartUtc)
-						{
-							bRealProposal = true;
-							break;
-						}
-					}
-					if (!bRealProposal)
-					{
-						UE_LOG(LogAIDA, Warning, TEXT("[actions] reply invited approval but created no proposal — posting correction."));
-						O->Session->PostSystemMessage(
-							TEXT("(Heads up: that reply mentions approving a proposal, but none was actually created — real proposals always get an 'AIDA proposes …' line. Tell AIDA to 'propose it' to get a real one.)"),
-							ConversationId);
-					}
-				}
+				// Terminal step runs the fabrication SELF-REPAIR loop (one retry) before accepting.
+				O->FinishChatReply(MsgId, ConversationId, ReplyStartUtc, Messages, Requester,
+					/*RetriesLeft*/ 1, FullText);
 			}
 		},
 		[Weak, MsgId](int32 Status, const FString& Message)
@@ -963,6 +954,98 @@ void UAIDAOrchestrator::StartAIDAReply(const FAIDARequester& Requester, const FG
 				O->Session->CompleteMessage(MsgId);
 			}
 		});
+}
+
+void UAIDAOrchestrator::FinishChatReply(const FGuid& MsgId, const FGuid& ConversationId, int64 ReplyStartUtc,
+	TSharedRef<TArray<FAIDAChatMessage>, ESPMode::ThreadSafe> Messages, FAIDARequester Requester,
+	int32 RetriesLeft, const FString& FinalText)
+{
+	if (!Session.IsValid())
+	{
+		return;
+	}
+
+	// Fabrication check (live-verify, repeatedly: the model announces "Proposal ready … /aida
+	// approve" without ever calling a propose_* tool — it pattern-completes the announcement shape
+	// it sees all over the transcript). A reply that invites approval while NOTHING was proposed
+	// during this request is a false statement about server state.
+	bool bFabricated = false;
+	if (Config.Actions.bEnabled && AIDATextInvitesApproval(FinalText))
+	{
+		SweepProposals();
+		bFabricated = true;
+		for (const FAIDAProposal& Proposal : Actions.Store().All())
+		{
+			if (Proposal.State == EAIDAProposalState::Pending || Proposal.ProposedUtc >= ReplyStartUtc)
+			{
+				bFabricated = false;
+				break;
+			}
+		}
+	}
+
+	if (bFabricated && RetriesLeft > 0)
+	{
+		// ROOT-CAUSE REPAIR: don't accept the reply — put the fabricated turn on the record, tell
+		// the model exactly what is wrong, and re-run the loop so it makes the REAL tool call. The
+		// already-streamed text stays visible; the repair continues in the same message, and a
+		// successful retry ends with a genuine proposal + the server's own announce line.
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] reply invited approval but created no proposal — running self-repair round."));
+		FAIDAChatMessage Fabricated;
+		Fabricated.Role = TEXT("assistant");
+		Fabricated.Content = FinalText;
+		Messages->Add(MoveTemp(Fabricated));
+		FAIDAChatMessage Correction;
+		Correction.Role = TEXT("user");
+		Correction.Content = TEXT(
+			"SERVER CHECK FAILED: that reply describes a proposal and invites approval, but you never called a"
+			" propose_* tool this turn — NOTHING exists for the player to approve, and your text cannot be"
+			" retracted. Fix it NOW: call the appropriate propose_* tool with exactly what you described"
+			" (omit origin/center to use the player's aim). After the tool result, reply with ONE short line"
+			" relaying the real summary. Do not apologize at length, and never announce a proposal without a"
+			" tool result again.");
+		Messages->Add(MoveTemp(Correction));
+		Session->AppendDelta(MsgId, TEXT("\n"));
+
+		TWeakObjectPtr<UAIDAOrchestrator> Weak(this);
+		RunToolLoop(Messages, Requester, MaxToolRoundTrips,
+			[Weak, MsgId](const FString& Delta)
+			{
+				if (UAIDAOrchestrator* O = Weak.Get(); O && O->Session.IsValid())
+				{
+					O->Session->AppendDelta(MsgId, Delta);
+				}
+			},
+			[Weak, MsgId, ConversationId, ReplyStartUtc, Messages, Requester, RetriesLeft](const FString& RetryText)
+			{
+				if (UAIDAOrchestrator* O = Weak.Get(); O && O->Session.IsValid())
+				{
+					O->FinishChatReply(MsgId, ConversationId, ReplyStartUtc, Messages, Requester,
+						RetriesLeft - 1, RetryText);
+				}
+			},
+			[Weak, MsgId](int32 Status, const FString& Message)
+			{
+				if (UAIDAOrchestrator* O = Weak.Get(); O && O->Session.IsValid())
+				{
+					UE_LOG(LogAIDA, Error, TEXT("AIDA self-repair round failed (HTTP %d): %s"), Status, *Message);
+					O->Session->AppendDelta(MsgId, TEXT("\n[response interrupted]"));
+					O->Session->CompleteMessage(MsgId);
+				}
+			});
+		return;
+	}
+
+	Session->CompleteMessage(MsgId);
+	if (bFabricated)
+	{
+		// Repair exhausted (or disabled) — at least correct the record immediately, not when the
+		// player's approve bounces.
+		UE_LOG(LogAIDA, Warning, TEXT("[actions] reply STILL invited approval without a proposal after self-repair — posting correction."));
+		Session->PostSystemMessage(
+			TEXT("(Heads up: that reply mentions approving a proposal, but none was actually created — real proposals always get an 'AIDA proposes …' line. Tell AIDA to 'propose it' to get a real one.)"),
+			ConversationId);
+	}
 }
 
 void UAIDAOrchestrator::RegisterTools()
