@@ -123,6 +123,13 @@ recipes/clocks, belts connected across steps, powered → `get_item_balance` con
 
 ### Slice 5 — Standing tasks (unchanged design from P7 Slice 6)
 
+> **Status (2026-07-18): SHIPPED (5fe94a2)** — `/aida task` commands (act tier, quoted prompt,
+> Nm/Nh cadence), in-save `FAIDAStandingTask`, 60 s scheduler (one run at a time, most-overdue
+> first, `minIntervalMinutes` floor, `maxPerDay` UTC budget, pre-stamped LastRunUtc), and a
+> `bReadOnly` cap on the tool loop so Act tools are refused mid-check. OK contract swallows quiet
+> runs. Built AHEAD of Slice 4 because 4 is gated on the belt-tap live-verify. Gate still pending
+> a live pass (container-consistency watch + "warn me when coal drops below 500").
+
 Human-created only, Query-tier only, opt-in, budgeted — exactly as PHASE7.md specifies. Two
 refinements now available: the default task prompt is effectively "call `get_alerts`, report only
 changes," and results can anchor against `take_snapshot` for drift detection. Ship AFTER Slice 1 so
