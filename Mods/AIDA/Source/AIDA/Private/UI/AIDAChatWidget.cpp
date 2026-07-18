@@ -50,6 +50,7 @@ void UAIDAChatWidget::NativeConstruct()
 	UpdateCanTick();
 
 	// Self-wire the optional sub-widgets so the Blueprint can stay a pure layout (no event graph).
+	if (SendButton) { SendButton->SetClickMethod(EButtonClickMethod::MouseDown); } // press-fired (focus-flip race)
 	if (SendButton && !SendButton->OnClicked.IsAlreadyBound(this, &UAIDAChatWidget::HandleSendClicked))
 	{
 		SendButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleSendClicked);
@@ -367,6 +368,10 @@ void UAIDAChatWidget::BuildProposalPanel(UFont* GameFont, float FontSize)
 	Column->AddChildToVerticalBox(Row);
 
 	ApproveButton = WidgetTree->ConstructWidget<UButton>();
+	// Fire on PRESS: the press steals keyboard focus from the input box, and the focus-driven
+	// input-mode flip could re-capture the mouse before a release-fired click ever completed
+	// (live-verify: "click approve, nothing happens").
+	ApproveButton->SetClickMethod(EButtonClickMethod::MouseDown);
 	ApproveButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleApproveClicked);
 	ApproveButton->SetBackgroundColor(FLinearColor(0.25f, 0.6f, 0.25f, 1.0f));
 	ApproveButton->AddChild(MakeText(TEXT("Approve"), FontSize, FLinearColor::White));
@@ -376,6 +381,7 @@ void UAIDAChatWidget::BuildProposalPanel(UFont* GameFont, float FontSize)
 	}
 
 	RejectButton = WidgetTree->ConstructWidget<UButton>();
+	RejectButton->SetClickMethod(EButtonClickMethod::MouseDown); // press-fired, like Approve
 	RejectButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleRejectClicked);
 	RejectButton->SetBackgroundColor(FLinearColor(0.6f, 0.25f, 0.25f, 1.0f));
 	RejectButton->AddChild(MakeText(TEXT("Reject"), FontSize, FLinearColor::White));
@@ -468,18 +474,31 @@ void UAIDAChatWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 	// Focus drives the input mode (user rule): typing needs UI routing + the cursor; the rest of
 	// the time the window is a pure overlay and the player moves/looks with normal game input.
 	// Polling covers every way focus can change — clicks, ESC, Ctrl+Enter, Slate steals.
+	// Focus GAIN flips immediately; focus LOSS waits a short grace — pressing a UI button steals
+	// focus from the input box, and an instant flip to game-only re-captured the mouse mid-click
+	// so the button never fired (live-verify: "click approve, nothing happens").
 	const bool bInputFocused = IsInputFocused();
-	if (bInputFocused != bLastInputFocused)
+	if (bInputFocused)
 	{
-		bLastInputFocused = bInputFocused;
-		if (APlayerController* PC = GetOwningPlayer())
+		UnfocusGraceSeconds = 0.f;
+		if (!bLastInputFocused)
 		{
-			if (bInputFocused)
+			bLastInputFocused = true;
+			if (APlayerController* PC = GetOwningPlayer())
 			{
 				PC->SetInputMode(FInputModeGameAndUI());
 				PC->bShowMouseCursor = true;
 			}
-			else
+		}
+	}
+	else if (bLastInputFocused)
+	{
+		UnfocusGraceSeconds += InDeltaTime;
+		if (UnfocusGraceSeconds > 0.3f)
+		{
+			UnfocusGraceSeconds = 0.f;
+			bLastInputFocused = false;
+			if (APlayerController* PC = GetOwningPlayer())
 			{
 				PC->SetInputMode(FInputModeGameOnly());
 				PC->bShowMouseCursor = false;
@@ -1035,6 +1054,7 @@ void UAIDAChatWidget::RebuildTabBar()
 		const bool bActive = (ConvId == CurrentConversationId);
 
 		UAIDATabButton* Btn = WidgetTree->ConstructWidget<UAIDATabButton>();
+		Btn->SetClickMethod(EButtonClickMethod::MouseDown); // press-fired (focus-flip race)
 		Btn->InitTab(ConvId);
 		Btn->OnTabClickedNative.AddUObject(this, &UAIDAChatWidget::HandleTabClicked);
 		Btn->AddChild(MakeLabel(FString::Printf(TEXT("Chat %d"), i + 1),
@@ -1049,6 +1069,7 @@ void UAIDAChatWidget::RebuildTabBar()
 
 	// "+" new-tab button.
 	UButton* Plus = WidgetTree->ConstructWidget<UButton>();
+	Plus->SetClickMethod(EButtonClickMethod::MouseDown);
 	Plus->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleNewTabClicked);
 	Plus->AddChild(MakeLabel(TEXT("+"), FLinearColor(0.9f, 0.9f, 0.9f, 1.0f)));
 	if (UHorizontalBoxSlot* PSlot = TabBar->AddChildToHorizontalBox(Plus))
@@ -1084,6 +1105,7 @@ void UAIDAChatWidget::BuildAttachmentRow(UFont* GameFont, float FontSize, float 
 
 	// Attach button: bottom-left, square, in the slot the input box was shifted right to clear.
 	AttachButton = WidgetTree->ConstructWidget<UButton>();
+	AttachButton->SetClickMethod(EButtonClickMethod::MouseDown);
 	AttachButton->OnClicked.AddDynamic(this, &UAIDAChatWidget::HandleAttachClicked);
 	AttachButton->SetToolTipText(FText::FromString(TEXT("Attach a reference image (or type /aida attach <path>)")));
 	AttachButton->AddChild(MakeLabel(TEXT("+img"), FLinearColor(0.9f, 0.9f, 0.9f, 1.0f)));
@@ -1324,6 +1346,7 @@ void UAIDAChatWidget::RebuildAttachmentChips()
 		if (!Att.bUploading)
 		{
 			UAIDAIndexButton* Remove = WidgetTree->ConstructWidget<UAIDAIndexButton>();
+			Remove->SetClickMethod(EButtonClickMethod::MouseDown);
 			Remove->InitIndex(i);
 			Remove->OnIndexClickedNative.AddUObject(this, &UAIDAChatWidget::HandleChipRemoveClicked);
 			UTextBlock* X = WidgetTree->ConstructWidget<UTextBlock>();

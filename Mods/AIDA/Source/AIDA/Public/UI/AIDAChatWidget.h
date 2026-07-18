@@ -198,6 +198,10 @@ private:
 	 *  player moves/looks freely whenever they are NOT typing — user rule). */
 	bool bLastInputFocused = false;
 
+	/** Seconds since the input box lost focus — the game-only flip waits ~0.3 s so a UI click
+	 *  (which steals focus at press) completes before the mouse is re-captured. */
+	float UnfocusGraceSeconds = 0.f;
+
 	UFUNCTION()
 	void HandleSliderValueChanged(float Value);
 	UFUNCTION()
