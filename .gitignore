@@ -41,3 +41,6 @@ tools/devserver/mods/
 # --- OS ---
 Thumbs.db
 .DS_Store
+
+# Machine-local MCP tooling config (absolute local paths)
+.mcp.json
