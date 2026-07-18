@@ -176,7 +176,9 @@ bool FAIDAActionEngine::Approve(UObject* WorldContext, const FAIDAActionsConfig&
 	Proposal->Phase = 0;
 
 	const int32 Total = Proposal->bDismantle ? DismantleQueue.Num()
-		: (Proposal->MutationKind != EAIDAMutationKind::None ? MutationQueue.Num() : Proposal->Placements.Num());
+		: (Proposal->MutationKind != EAIDAMutationKind::None ? MutationQueue.Num()
+		: (Proposal->bTap && Proposal->Placements.Num() == 0 ? Proposal->TapChainPointsCm.Num() + 1
+		: Proposal->Placements.Num()));
 	OutMessage = FString::Printf(TEXT("approved — %s (%d item(s), batched)"), *Proposal->Summary, Total);
 	UE_LOG(LogAIDA, Log, TEXT("[actions] %s: executing %s"), *Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal->Summary);
 	return true;
@@ -704,6 +706,14 @@ bool FAIDAActionEngine::TickFeedHop(UObject* WorldContext, const FAIDAActionsCon
 		: Proposal.TapChainPointsCm[Hop];
 	FVector FromDir = NextPos - From->GetActorLocation();
 	FromDir = FVector(FromDir.X, FromDir.Y, 0.0).GetSafeNormal(UE_SMALL_NUMBER, Proposal.TapDirCm);
+	// Hop 0 from a DANGLING source must leave through the exact port recorded at propose (its
+	// outward normal) — steering by "toward the destination" rejects ports that face away, and
+	// the port picker's 60° alignment gate then finds nothing (live-verify: a merger open end
+	// facing west with the generator to the east — the run failed with 0 entities affected).
+	if (Hop == 0 && Proposal.bTapDangling && !Proposal.TapDirCm.IsNearlyZero())
+	{
+		FromDir = Proposal.TapDirCm.GetSafeNormal();
+	}
 
 	TArray<FAIDACostItem> Cost;
 	FString Error;
@@ -1341,11 +1351,16 @@ void FAIDAActionEngine::FinishExecution(UObject* WorldContext, const FAIDAAction
 			RunReport.Append(RunFailures);
 		}
 	}
-	else if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel || Proposal.ManifoldSets.Num() > 0)
+	// bTap/StepLinks joined the family — standalone tap and connect proposals fell into the plain
+	// "built N" branch, so their RUN failures were SILENT ("0 entities affected", no reason).
+	else if (Proposal.bManifold || Proposal.bAutoPower || Proposal.bLabel || Proposal.ManifoldSets.Num() > 0
+		|| Proposal.bTap || Proposal.StepLinks.Num() > 0)
 	{
 		const TCHAR* Kind = Proposal.ManifoldSets.Num() > 0 ? TEXT("connected")
-			: (Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels") : TEXT("power")));
-		const TCHAR* Piece = (Proposal.bManifold || Proposal.ManifoldSets.Num() > 0) ? TEXT("run")
+			: (Proposal.bManifold ? TEXT("manifold") : (Proposal.bLabel ? TEXT("labels")
+			: (Proposal.bTap ? TEXT("connect") : (Proposal.bAutoPower ? TEXT("power") : TEXT("links")))));
+		const TCHAR* Piece = (Proposal.bManifold || Proposal.ManifoldSets.Num() > 0 || Proposal.bTap
+			|| Proposal.StepLinks.Num() > 0) ? TEXT("run")
 			: (Proposal.bLabel ? TEXT("sign") : TEXT("wire"));
 		int32 PlacementTotal = Proposal.bPowerOnly
 			? Proposal.PolePlacements.Num() // Placements mirror the poles for ghosts — don't double count
