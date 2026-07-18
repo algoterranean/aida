@@ -1187,6 +1187,43 @@ bool FAIDAActionSeam::FindFreePipeInputPort(UObject* WorldContext, const FVector
 	return true;
 }
 
+bool FAIDAActionSeam::InspectAimTarget(UObject* WorldContext, const FString& PlayerId,
+	AActor*& OutActor, FString& OutName, FVector& OutHitCm)
+{
+	OutActor = nullptr;
+	OutName.Reset();
+	OutHitCm = FVector::ZeroVector;
+	UWorld* World = ResolveWorld(WorldContext);
+	FHitResult Hit;
+	if (!TraceAimHit(World, PlayerId, Hit))
+	{
+		return false;
+	}
+	OutHitCm = Hit.ImpactPoint;
+
+	const auto NameOf = [](const AFGBuildable* Buildable)
+	{
+		const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
+		const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
+		return Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Buildable->GetClass());
+	};
+	if (AFGBuildable* Direct = Cast<AFGBuildable>(Hit.GetActor()))
+	{
+		OutActor = Direct;
+		OutName = NameOf(Direct);
+		return true;
+	}
+	// Lightweight-instanced structures (foundations/walls): stand a throwaway instance actor up
+	// just long enough to read its identity — there is no live state behind it anyway.
+	if (AFGBuildable* Temp = ResolveInstanceHit(Hit))
+	{
+		OutName = NameOf(Temp);
+		Temp->Destroy();
+		return true;
+	}
+	return true; // aimed at terrain / something non-structural
+}
+
 bool FAIDAActionSeam::FindFreePort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
 	bool bPipe, bool bOutput, const FString& NameFilter,
 	FAIDAManifoldPort& OutPort, FString& OutError)

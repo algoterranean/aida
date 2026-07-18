@@ -103,6 +103,16 @@ public:
 		FAIDAManifoldPort& OutPort, FString& OutError);
 
 	/**
+	 * What is the requesting player LOOKING AT (inspect_aim)? Resolves the aim trace to a live
+	 * buildable (OutActor + display name), or — for lightweight-instanced structures like
+	 * foundations/walls — to a name only (identity via a throwaway resolved instance; no live
+	 * state to read). False = the aim couldn't be traced at all; true with an empty OutName =
+	 * the player is aiming at terrain/nothing structural. OutHitCm is the impact point.
+	 */
+	static bool InspectAimTarget(UObject* WorldContext, const FString& PlayerId,
+		AActor*& OutActor, FString& OutName, FVector& OutHitCm);
+
+	/**
 	 * Validate-only twin of BuildConnectingRun: drive the spline hologram through the two-step
 	 * flow between the EXPLICIT ports given, collect the game's own disqualifiers, destroy — no
 	 * cost, no construct. False = the game would refuse this exact run (OutReason = its text, e.g.

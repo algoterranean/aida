@@ -32,6 +32,8 @@
 #include "FGRecipe.h"
 #include "Hologram/FGHologram.h"
 #include "Equipment/FGBuildGun.h"
+#include "Buildables/FGBuildableConveyorBase.h"
+#include "Buildables/FGBuildablePipeline.h"
 #include "ItemAmount.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Engine/World.h"
@@ -121,6 +123,10 @@ namespace
 		"nothing, machines with open ports. Use for 'is anything disconnected / nothing is arriving'.\n"
 		"- find_belt_mismatch(): slow belts/pipes sandwiched in faster paths or undersized for their "
 		"producer. Use for 'slow belts mixed in / throughput is mysteriously low'.\n"
+		"- inspect_aim(): what the player is LOOKING AT — name, live recipe/clock/rates for machines "
+		"(a miner's actual output rate included), container contents, belt/pipe marks. ALWAYS call this "
+		"first when they say 'this machine/miner/thing' or 'what I'm looking at' — never ask them to "
+		"name or describe what is in their crosshair.\n"
 		"- get_alerts(): ONE consolidated health sweep — tripped fuses, out-of-fuel generators, stopped "
 		"machines split by cause (input starved vs output full), paused machines, dangling belts/pipes. "
 		"Call this FIRST for 'is something wrong / why did everything stop / factory status'.\n"
@@ -1165,6 +1171,115 @@ void UAIDAOrchestrator::RegisterTools()
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
 			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildBeltMismatchJson(FAIDAFactoryAggregator::FindBeltMismatch(Snapshot)));
+		}
+	});
+
+	// Live-verify gap: "this miner" while staring at it drew an interrogation — no tool answered
+	// "what is the player looking at". The aim trace + snapshot make it one call.
+	Tools.Register({
+		TEXT("inspect_aim"),
+		TEXT("Identify EXACTLY what the requesting player is LOOKING AT right now: the buildable's display name, its position, and — for production machines — the live recipe, clock, running state and per-minute input/output rates (a miner's ACTUAL extraction rate included, purity and clock already applied). Containers report contents; belts/pipes report their mark/fluid. ALWAYS call this FIRST when the player says 'this machine / this miner / the one I'm looking at / right here' — NEVER ask them to name, describe, or read off the thing in their crosshair. Combine with the static catalog (lookup_recipe/lookup_building) and arithmetic to answer questions about the aimed machine."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			AActor* Actor = nullptr;
+			FString Name;
+			FVector HitCm = FVector::ZeroVector;
+			if (!FAIDAActionSeam::InspectAimTarget(this, Ctx.PlayerId, Actor, Name, HitCm))
+			{
+				return FAIDAToolResult::Error(TEXT("couldn't trace where the player is aiming — are they in the game world?"));
+			}
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			TArray<TSharedPtr<FJsonValue>> Loc;
+			Loc.Add(MakeShared<FJsonValueNumber>(FMath::RoundToDouble(HitCm.X / 100.0)));
+			Loc.Add(MakeShared<FJsonValueNumber>(FMath::RoundToDouble(HitCm.Y / 100.0)));
+			Root->SetArrayField(TEXT("location_m"), Loc);
+			if (Name.IsEmpty())
+			{
+				Root->SetStringField(TEXT("note"), TEXT("the player is not aiming at a structure (terrain or empty space)"));
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+			}
+			Root->SetStringField(TEXT("name"), Name);
+			if (!Actor)
+			{
+				Root->SetStringField(TEXT("kind"), TEXT("structure")); // foundation/wall — no live state
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+			}
+
+			if (const AFGBuildableConveyorBase* Belt = Cast<AFGBuildableConveyorBase>(Actor))
+			{
+				Root->SetStringField(TEXT("kind"), TEXT("belt"));
+				Root->SetField(TEXT("capacityPerMin"), AIDANumber(Belt->GetSpeed() / 2.0));
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+			}
+			if (const AFGBuildablePipeline* Pipe = Cast<AFGBuildablePipeline>(Actor))
+			{
+				Root->SetStringField(TEXT("kind"), TEXT("pipe"));
+				const TSubclassOf<UFGItemDescriptor> Fluid = Pipe->GetFluidDescriptor();
+				Root->SetStringField(TEXT("fluid"), Fluid ? UFGItemDescriptor::GetItemName(Fluid).ToString() : TEXT("empty"));
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+			}
+
+			// Machines and containers enrich from the snapshot (matched by position — the snapshot
+			// ids aren't actor handles).
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+			const FVector ActorLoc = Actor->GetActorLocation();
+			const FAIDAMachine* Machine = nullptr;
+			for (const FAIDAMachine& Candidate : Snapshot.Machines)
+			{
+				if (Candidate.Location.Equals(ActorLoc, 300.0)
+					&& (!Machine || FVector::DistSquared(Candidate.Location, ActorLoc) < FVector::DistSquared(Machine->Location, ActorLoc)))
+				{
+					Machine = &Candidate;
+				}
+			}
+			if (Machine && !Machine->bLogisticsOnly)
+			{
+				Root->SetStringField(TEXT("kind"), TEXT("machine"));
+				if (!Machine->Recipe.IsEmpty()) { Root->SetStringField(TEXT("recipe"), Machine->Recipe); }
+				Root->SetNumberField(TEXT("clock_pct"), FMath::RoundToInt(Machine->Clock * 100.f));
+				Root->SetBoolField(TEXT("producing"), Machine->bProducing);
+				if (Machine->bPaused) { Root->SetBoolField(TEXT("paused"), true); }
+				const auto Rates = [](const TArray<FAIDAItemRate>& List)
+				{
+					TArray<TSharedPtr<FJsonValue>> Arr;
+					for (const FAIDAItemRate& Rate : List)
+					{
+						const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+						O->SetStringField(TEXT("item"), Rate.Item);
+						O->SetField(TEXT("perMin"), AIDANumber(Rate.PerMinute));
+						Arr.Add(MakeShared<FJsonValueObject>(O));
+					}
+					return Arr;
+				};
+				if (Machine->Outputs.Num() > 0) { Root->SetArrayField(TEXT("outputsPerMin"), Rates(Machine->Outputs)); }
+				if (Machine->Inputs.Num() > 0) { Root->SetArrayField(TEXT("inputsPerMin"), Rates(Machine->Inputs)); }
+				if (Machine->CircuitId != 0) { Root->SetNumberField(TEXT("circuitId"), Machine->CircuitId); }
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+			}
+			for (const FAIDAContainerInfo& Container : Snapshot.Containers)
+			{
+				if (!Container.Location.Equals(ActorLoc, 300.0)) { continue; }
+				Root->SetStringField(TEXT("kind"), TEXT("container"));
+				Root->SetNumberField(TEXT("slotsUsed"), Container.SlotsUsed);
+				Root->SetNumberField(TEXT("slotsTotal"), Container.SlotsTotal);
+				TArray<TSharedPtr<FJsonValue>> Contents;
+				for (int32 i = 0; i < Container.Contents.Num() && i < 5; ++i)
+				{
+					const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+					O->SetStringField(TEXT("item"), Container.Contents[i].Item);
+					O->SetNumberField(TEXT("count"), Container.Contents[i].Count);
+					Contents.Add(MakeShared<FJsonValueObject>(O));
+				}
+				Root->SetArrayField(TEXT("contents"), Contents);
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+			}
+			Root->SetStringField(TEXT("kind"), TEXT("buildable"));
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
 		}
 	});
 
