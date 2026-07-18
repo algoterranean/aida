@@ -92,6 +92,17 @@ public:
 		FAIDAManifoldPort& OutPort, FString& OutError);
 
 	/**
+	 * P8 propose_connect: the nearest FREE port of a chosen kind and direction on BUILT structures
+	 * near a point. bOutput picks FCD_OUTPUT / PCT_PRODUCER (PCT_ANY counts either way);
+	 * NameFilter (optional, display-name substring like the dismantle selector) narrows the owning
+	 * buildable. Belts/pipes themselves are excluded (their ends are handled by the tap tools);
+	 * attachment open ends (splitters/mergers/junctions) beat machine ports at equal distance.
+	 */
+	static bool FindFreePort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+		bool bPipe, bool bOutput, const FString& NameFilter,
+		FAIDAManifoldPort& OutPort, FString& OutError);
+
+	/**
 	 * P8 Slice 3 — the pipe mirror of ExecuteTapSplice: drive the junction hologram onto the LIVE
 	 * pipeline at OffsetCm (the game's attachment-on-pipe snap splits the pipe and wires both
 	 * halves through the junction), Construct, then verify ≥2 connected pipe ports — an unspliced

@@ -238,7 +238,17 @@ namespace
 		"player's aim on machines or a BUILT manifold row — use this whenever the manifold already "
 		"executed ('connect it' after the fact). NEVER hand-build feeds with propose_build; never "
 		"tell the player to run belts manually — call this tool (raise spec.maxDistanceM, default "
-		"250, when the source is far). The item match reads what is riding each belt RIGHT NOW.\n"
+		"250, when the source is far). The item match reads what is riding each belt RIGHT NOW. The "
+		"SOURCE must be an existing belt with items — to join two BUILT structures, use propose_connect.\n"
+		"- propose_connect(spec): run a belt (or pipe) between two things that are ALREADY BUILT — from "
+		"a free OUTPUT port to a free INPUT port (a miner's output into a generator's fuel input, a "
+		"manifold's open end into a machine, a container into a constructor). THE tool for 'connect A "
+		"to B / belt this to that' when both ends exist — never ask where the target is: omit one "
+		"endpoint and the thing the player is AIMING AT fills it, and name the other side "
+		"({from:{buildable:'Miner'}} searches near the player). If the direction is stated backwards "
+		"the server flips it automatically (items only flow output -> input). Belts chain up to ~2 km; "
+		"pipes are one ~56 m run. Do NOT interrogate the player about positions, port types, or what "
+		"carries what — call the tool and relay what it found or why it failed.\n"
 		"- get_proposal_status(proposalId?): check whether proposals were approved/executed/expired. "
 		"Pending proposals include their full stored 'spec' — the input for revisions.\n"
 		"REVISING A PENDING PROPOSAL (very common): when the player asks to change or extend a proposed "
@@ -4789,6 +4799,253 @@ void UAIDAOrchestrator::RegisterActionTools()
 			AnnounceSystem(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds, true, 0.0));
+		}
+	});
+
+	// P8 (live-verify gap): propose_connect — run a belt/pipe between two BUILT structures. The
+	// most basic logistics verb ("belt the miner to the generator") had NO tool: manifolds build
+	// rows, taps need an existing FLOWING belt as source. Executes as a standalone dangling tap —
+	// PrepareTapSource takes any source actor, and BuildConnectingRun picks live ports.
+	Tools.Register({
+		TEXT("propose_connect"),
+		TEXT("Run a belt (or pipe) between two things that are ALREADY BUILT: from a free OUTPUT port to a free INPUT port — a miner's output into a generator's fuel input, a splitter row's open end into a machine, a storage container into a constructor. THE tool for 'connect A to B / belt this to that' when both ends exist. Endpoints: from = the source (items leave it), to = the destination (items enter it); each is {buildable?: display-name substring, center?: {x,y,z metres}, radiusM?}. Give a buildable name (searched near the player) OR a center, and you may OMIT ONE endpoint entirely — the thing the PLAYER IS AIMING AT fills it. If the stated direction is impossible (the 'from' has no free output) but the reverse works, the server flips it and says so — items always flow output -> input. Belts chain runs automatically for long distances (up to ~2 km, charged as built); pipes are one run (~56 m). Spec: {version:1, kind?: 'belt' (default) | 'pipe', from?, to?, transport?: belt/pipe display name}. NOT for tapping a flowing belt mid-run (propose_belt_tap) or plumbing a whole machine row (propose_manifold). Undo removes the run."),
+		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"{version:1, kind?: 'belt'|'pipe', from?: {buildable?, center?:{x,y,z m}, radiusM?}, to?: {buildable?, center?, radiusM?} — omit ONE endpoint to use the player's aim, transport?: feed belt/pipe name}"},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises."}},"required":["spec"]})"),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			SweepProposals();
+
+			const TSharedPtr<FJsonObject>* SpecObj = nullptr;
+			Args->TryGetObjectField(TEXT("spec"), SpecObj);
+			FString Kind = TEXT("belt");
+			FString TransportName;
+			if (SpecObj && SpecObj->IsValid())
+			{
+				(*SpecObj)->TryGetStringField(TEXT("kind"), Kind);
+				(*SpecObj)->TryGetStringField(TEXT("transport"), TransportName);
+			}
+			const bool bPipe = Kind.Equals(TEXT("pipe"), ESearchCase::IgnoreCase);
+
+			FGuid ReplaceId;
+			{
+				FString ReplaceIdStr;
+				Args->TryGetStringField(TEXT("replaceProposalId"), ReplaceIdStr);
+				if (!ReplaceIdStr.TrimStartAndEnd().IsEmpty())
+				{
+					const FAIDAProposal* Replaced = FGuid::Parse(ReplaceIdStr.TrimStartAndEnd(), ReplaceId)
+						? Actions.Store().Find(ReplaceId) : nullptr;
+					if (!Replaced || Replaced->State != EAIDAProposalState::Pending)
+					{
+						return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+							TEXT("replaceProposalId doesn't match a pending proposal — call get_proposal_status"), {}));
+					}
+				}
+			}
+
+			// Endpoint search spots: explicit center > named-thing-near-the-player > the player's
+			// aim. At most ONE side may ride on the aim (one crosshair, two ends).
+			struct FEndpoint
+			{
+				FString Buildable;
+				FVector CenterCm = FVector::ZeroVector;
+				double RadiusCm = 5000.0;
+				bool bFromAim = false;
+			};
+			FVector AimCm = FVector::ZeroVector;
+			const bool bHasAim = FAIDAActionSeam::ResolveAimPoint(this, Ctx.PlayerId, AimCm);
+			int32 AimUses = 0;
+			const auto ParseEndpoint = [&](const TCHAR* Field, FEndpoint& Out) -> bool
+			{
+				const TSharedPtr<FJsonObject>* Obj = nullptr;
+				bool bHasCenter = false;
+				if (SpecObj && SpecObj->IsValid() && (*SpecObj)->TryGetObjectField(Field, Obj) && Obj->IsValid())
+				{
+					(*Obj)->TryGetStringField(TEXT("buildable"), Out.Buildable);
+					double RadiusM = 0.0;
+					if ((*Obj)->TryGetNumberField(TEXT("radiusM"), RadiusM) && RadiusM > 0.0)
+					{
+						Out.RadiusCm = FMath::Clamp(RadiusM, 5.0, 250.0) * 100.0;
+					}
+					const TSharedPtr<FJsonObject>* Center = nullptr;
+					if ((*Obj)->TryGetObjectField(TEXT("center"), Center) && Center->IsValid())
+					{
+						FVector CenterM = FVector::ZeroVector;
+						(*Center)->TryGetNumberField(TEXT("x"), CenterM.X);
+						(*Center)->TryGetNumberField(TEXT("y"), CenterM.Y);
+						(*Center)->TryGetNumberField(TEXT("z"), CenterM.Z);
+						Out.CenterCm = CenterM * 100.0;
+						bHasCenter = true;
+					}
+				}
+				if (bHasCenter) { return true; }
+				if (!Out.Buildable.IsEmpty())
+				{
+					// A named thing with no location: search around the player.
+					if (!Ctx.bHasLocation) { return false; }
+					Out.CenterCm = Ctx.Location;
+					return true;
+				}
+				// Nothing at all: this side is whatever the player is aiming at.
+				if (!bHasAim) { return false; }
+				Out.CenterCm = AimCm;
+				Out.RadiusCm = 3000.0;
+				Out.bFromAim = true;
+				++AimUses;
+				return true;
+			};
+			FEndpoint From, To;
+			if (!ParseEndpoint(TEXT("from"), From) || !ParseEndpoint(TEXT("to"), To))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("couldn't resolve the endpoints — name a buildable or give a center for each side (one side may be the player's aim)"), {}));
+			}
+			if (AimUses >= 2)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("both endpoints can't be 'where the player is aiming' — name or place at least one side ({buildable} or {center})"), {}));
+			}
+
+			// Ports: from = output, to = input; when that direction is impossible but the reverse
+			// exists, FLIP it — players say 'connect the generator to the splitter' with the flow
+			// backwards all the time, and output->input is the only physical possibility.
+			FAIDAManifoldPort FromPort, ToPort;
+			FString FromError, ToError;
+			const bool bFromOk = FAIDAActionSeam::FindFreePort(this, From.CenterCm, From.RadiusCm, bPipe, /*bOutput*/ true, From.Buildable, FromPort, FromError);
+			const bool bToOk = FAIDAActionSeam::FindFreePort(this, To.CenterCm, To.RadiusCm, bPipe, /*bOutput*/ false, To.Buildable, ToPort, ToError);
+			bool bFlipped = false;
+			if (!bFromOk || !bToOk)
+			{
+				FAIDAManifoldPort AltFrom, AltTo;
+				FString AltError;
+				if (FAIDAActionSeam::FindFreePort(this, To.CenterCm, To.RadiusCm, bPipe, /*bOutput*/ true, To.Buildable, AltFrom, AltError)
+					&& FAIDAActionSeam::FindFreePort(this, From.CenterCm, From.RadiusCm, bPipe, /*bOutput*/ false, From.Buildable, AltTo, AltError))
+				{
+					FromPort = AltFrom;
+					ToPort = AltTo;
+					bFlipped = true;
+				}
+				else
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("%s; %s — nothing to connect in either direction"), *FromError, *ToError), {}));
+				}
+			}
+			if (FromPort.Machine == ToPort.Machine)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(
+					TEXT("both endpoints resolved to the SAME structure — name the other side or aim at it"), {}));
+			}
+
+			const double GapCm = FVector::Dist(FromPort.PosCm, ToPort.PosCm);
+			const double GapM = GapCm / AIDAMetersToCm;
+			if (bPipe && GapM > 56.0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+					TEXT("the endpoints are %.0f m apart — pipe connections are one run (~56 m); build closer or bridge with propose_build pipes"), GapM), {}));
+			}
+			if (!bPipe && GapM > 2000.0)
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+					TEXT("the endpoints are %.0f m apart — beyond the 2 km chained-belt limit"), GapM), {}));
+			}
+			// Long belts chain hops through ground-probed waypoints, exactly like the belt tap.
+			TArray<FVector> ChainPoints;
+			if (!bPipe)
+			{
+				constexpr double HopCm = 5000.0;
+				const int32 Hops = FMath::CeilToInt32(GapCm / HopCm);
+				for (int32 i = 1; i < Hops; ++i)
+				{
+					FVector Point = FMath::Lerp(FromPort.PosCm, ToPort.PosCm, static_cast<double>(i) / Hops);
+					double GroundZ;
+					if (FAIDAActionSeam::ProbeGroundZ(this, Point, GroundZ))
+					{
+						Point.Z = GroundZ + 150.0;
+					}
+					ChainPoints.Add(Point);
+				}
+			}
+
+			FAIDARecipeResolution Transport;
+			{
+				TArray<FString> Candidates;
+				if (!TransportName.IsEmpty())
+				{
+					Candidates.Add(TransportName);
+				}
+				else if (bPipe)
+				{
+					Candidates = { TEXT("Pipeline Mk.2"), TEXT("Pipeline") };
+				}
+				else
+				{
+					Candidates = { TEXT("Conveyor Belt Mk.6"), TEXT("Conveyor Belt Mk.5"), TEXT("Conveyor Belt Mk.4"),
+						TEXT("Conveyor Belt Mk.3"), TEXT("Conveyor Belt Mk.2"), TEXT("Conveyor Belt Mk.1") };
+				}
+				bool bResolved = false;
+				for (const FString& Candidate : Candidates)
+				{
+					if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Transport))
+					{
+						bResolved = true;
+						break;
+					}
+				}
+				if (!bResolved)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("no unlocked %s matches '%s'"), bPipe ? TEXT("pipeline") : TEXT("belt"),
+						TransportName.IsEmpty() ? TEXT("any") : *TransportName), {}));
+				}
+			}
+
+			// A standalone DANGLING tap: source = the from-actor itself (no cut, no splitter);
+			// the executor's feed hops + BuildConnectingRun do the rest, runs charged as built.
+			FAIDAProposal Proposal;
+			Proposal.Id = FGuid::NewGuid();
+			Proposal.RequesterId = Ctx.PlayerId;
+			Proposal.RequesterName = Ctx.Author;
+			Proposal.bTap = true;
+			Proposal.bTapPipe = bPipe;
+			Proposal.bTapDangling = true;
+			Proposal.TapBelt = FromPort.Machine;
+			Proposal.TapBeltName = FromPort.MachineName;
+			Proposal.TapPointCm = FromPort.PosCm;
+			Proposal.TapDirCm = FromPort.NormalCm;
+			Proposal.TapChainPointsCm = MoveTemp(ChainPoints);
+			Proposal.Ports.Add(ToPort);
+			Proposal.TransportRecipePath = Transport.RecipeClassPath;
+			Proposal.TransportName = Transport.DisplayName;
+			const int32 Runs = Proposal.TapChainPointsCm.Num() + 1;
+			Proposal.Summary = FString::Printf(TEXT("connect %s's free output to %s's input — %d x %s run(s), %.0f m, charged as built%s"),
+				*FromPort.MachineName, *ToPort.MachineName, Runs, *Transport.DisplayName, GapM,
+				bFlipped ? TEXT(" (direction flipped — items can only flow output to input)") : TEXT(""));
+			{
+				TSharedRef<FJsonObject> StoredSpec = MakeShared<FJsonObject>();
+				StoredSpec->SetStringField(TEXT("tool"), TEXT("propose_connect"));
+				StoredSpec->SetStringField(TEXT("from"), FromPort.MachineName);
+				StoredSpec->SetStringField(TEXT("to"), ToPort.MachineName);
+				StoredSpec->SetStringField(TEXT("kind"), bPipe ? TEXT("pipe") : TEXT("belt"));
+				Proposal.SpecJson = AIDAToCompactJson(StoredSpec);
+			}
+
+			if (ReplaceId.IsValid())
+			{
+				SupersedeProposal(ReplaceId);
+			}
+			const int64 Now = FDateTime::UtcNow().ToUnixTimestamp();
+			FString Error;
+			if (!Actions.Store().Add(Proposal, Now, Config.Actions.MaxPendingProposals, Error))
+			{
+				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
+			}
+			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (connect): %s (by %s)"),
+				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
+			PublishProposal(Proposal.Id);
+			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s%s): %s. Awaiting approval."),
+				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""), *Proposal.Summary));
+
+			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, true, 0.0));
 		}
 	});
 

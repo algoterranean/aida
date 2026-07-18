@@ -1177,6 +1177,110 @@ bool FAIDAActionSeam::FindFreePipeInputPort(UObject* WorldContext, const FVector
 	return true;
 }
 
+bool FAIDAActionSeam::FindFreePort(UObject* WorldContext, const FVector& CenterCm, double RadiusCm,
+	bool bPipe, bool bOutput, const FString& NameFilter,
+	FAIDAManifoldPort& OutPort, FString& OutError)
+{
+	OutPort = FAIDAManifoldPort();
+	OutError.Reset();
+	UWorld* World = ResolveWorld(WorldContext);
+	AFGBuildableSubsystem* Subsystem = World ? AFGBuildableSubsystem::Get(World) : nullptr;
+	if (!Subsystem)
+	{
+		OutError = TEXT("no buildables to search");
+		return false;
+	}
+
+	const double RadiusSq = RadiusCm * RadiusCm;
+	const FString WantedName = NormalizeName(NameFilter);
+	AActor* BestActor = nullptr;
+	FVector BestPos = FVector::ZeroVector;
+	FVector BestNormal = FVector::XAxisVector;
+	int32 BestTier = MAX_int32;
+	double BestDistSq = TNumericLimits<double>::Max();
+	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+	{
+		if (!IsValid(Buildable)) { continue; }
+		if (Buildable->IsA<AFGBuildableConveyorBase>() || Buildable->IsA<AFGBuildablePipeBase>()) { continue; }
+		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+		if (!WantedName.IsEmpty())
+		{
+			const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe();
+			const TArray<FItemAmount> Products = Recipe ? UFGRecipe::GetProducts(Recipe) : TArray<FItemAmount>();
+			const FString Name = Products.Num() > 0 ? DescriptorName(Products[0].ItemClass) : GetNameSafe(Buildable->GetClass());
+			if (!NormalizeName(Name).Contains(WantedName)) { continue; }
+		}
+		const int32 Tier = (Buildable->IsA<AFGBuildableConveyorAttachment>() || Buildable->IsA<AFGBuildablePipelineAttachment>()) ? 0 : 1;
+
+		if (!bPipe)
+		{
+			TInlineComponentArray<UFGFactoryConnectionComponent*> Connections;
+			Buildable->GetComponents(Connections);
+			for (UFGFactoryConnectionComponent* Conn : Connections)
+			{
+				if (!Conn || Conn->IsConnected()) { continue; }
+				const EFactoryConnectionDirection Dir = Conn->GetDirection();
+				const bool bMatches = Dir == EFactoryConnectionDirection::FCD_ANY
+					|| (bOutput ? Dir == EFactoryConnectionDirection::FCD_OUTPUT : Dir == EFactoryConnectionDirection::FCD_INPUT);
+				if (!bMatches) { continue; }
+				const double DistSq = FVector::DistSquared(Conn->GetConnectorLocation(), CenterCm);
+				if (Tier < BestTier || (Tier == BestTier && DistSq < BestDistSq))
+				{
+					BestTier = Tier;
+					BestDistSq = DistSq;
+					BestActor = Buildable;
+					BestPos = Conn->GetConnectorLocation();
+					BestNormal = Conn->GetConnectorNormal();
+				}
+			}
+		}
+		else
+		{
+			TInlineComponentArray<UFGPipeConnectionComponent*> Connections;
+			Buildable->GetComponents(Connections);
+			for (UFGPipeConnectionComponent* Conn : Connections)
+			{
+				if (!Conn || Conn->IsConnected()) { continue; }
+				const EPipeConnectionType Kind = Conn->GetPipeConnectionType();
+				const bool bMatches = Kind == EPipeConnectionType::PCT_ANY
+					|| (bOutput ? Kind == EPipeConnectionType::PCT_PRODUCER : Kind == EPipeConnectionType::PCT_CONSUMER);
+				if (!bMatches) { continue; }
+				const double DistSq = FVector::DistSquared(Conn->GetConnectorLocation(), CenterCm);
+				if (Tier < BestTier || (Tier == BestTier && DistSq < BestDistSq))
+				{
+					BestTier = Tier;
+					BestDistSq = DistSq;
+					BestActor = Buildable;
+					BestPos = Conn->GetConnectorLocation();
+					BestNormal = Conn->GetConnectorNormal();
+				}
+			}
+		}
+	}
+	if (!BestActor)
+	{
+		OutError = FString::Printf(TEXT("no free %s %s port%s within %.0f m of that point"),
+			bPipe ? TEXT("pipe") : TEXT("belt"), bOutput ? TEXT("output") : TEXT("input"),
+			NameFilter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" on anything matching '%s'"), *NameFilter),
+			RadiusCm / AIDAMetersToCm);
+		return false;
+	}
+
+	OutPort.Machine = BestActor;
+	OutPort.PosCm = BestPos;
+	OutPort.NormalCm = BestNormal;
+	OutPort.MachineName = GetNameSafe(BestActor->GetClass());
+	if (const AFGBuildable* Buildable = Cast<AFGBuildable>(BestActor))
+	{
+		if (const TSubclassOf<UFGRecipe> Recipe = Buildable->GetBuiltWithRecipe())
+		{
+			const TArray<FItemAmount> Products = UFGRecipe::GetProducts(Recipe);
+			if (Products.Num() > 0) { OutPort.MachineName = DescriptorName(Products[0].ItemClass); }
+		}
+	}
+	return true;
+}
+
 bool FAIDAActionSeam::ExecutePipeTapSplice(UObject* WorldContext, AActor* PipeActor, double OffsetCm,
 	const FString& JunctionRecipePath, TArray<FString>& OutEntityIds,
 	TArray<TWeakObjectPtr<AActor>>& OutActors, TWeakObjectPtr<AActor>& OutTapActor, FString& OutError)
