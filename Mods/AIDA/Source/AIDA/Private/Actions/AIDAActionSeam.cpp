@@ -218,10 +218,20 @@ namespace
 		TArray<FFGClearanceData> Clearances;
 		IFGClearanceInterface::Execute_GetClearanceData(const_cast<AFGBuildable*>(CDO), Clearances);
 
+		// HARD clearances only: soft zones merely warn on overlap, and including them inflated the
+		// footprint — "put them in a row" then left visible gaps between machines (live feedback:
+		// packing should be as tight as the game allows without a BLOCKING overlap).
 		FBox Union(ForceInit);
 		for (const FFGClearanceData& Data : Clearances)
 		{
-			if (Data.IsValid()) { Union += Data.GetTransformedClearanceBox(); }
+			if (Data.IsValid() && Data.Type != EClearanceType::CT_Soft) { Union += Data.GetTransformedClearanceBox(); }
+		}
+		if (!Union.IsValid)
+		{
+			for (const FFGClearanceData& Data : Clearances) // soft-only buildables keep the old union
+			{
+				if (Data.IsValid()) { Union += Data.GetTransformedClearanceBox(); }
+			}
 		}
 		if (Union.IsValid)
 		{

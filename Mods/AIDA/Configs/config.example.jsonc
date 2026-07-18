@@ -38,7 +38,8 @@
     "batchPerTick": 10,                           // executor slice size (10 Hz)
     "undoWindow": 25,                             // how far back /aida undo may reach
     "costMode": "central",                        // "central" (deduct vs central storage) | "free"
-    "allowDirectFuseReset": true                  // reset_fuse acts immediately; false disables it
+    "allowDirectFuseReset": true,                 // reset_fuse acts immediately; false disables it
+    "announceProposals": false                    // echo "AIDA proposes ..." into chat (card+ghost already show it)
   },
   // P8 standing tasks: "/aida task add \"<prompt>\" every 10m" — recurring READ-ONLY checks that
   // spend LLM tokens unattended, so they are opt-in and budgeted.

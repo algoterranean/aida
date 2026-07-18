@@ -88,6 +88,8 @@ struct FAIDAActionsConfig
 	UPROPERTY() FString CostMode = TEXT("central");
 	/** reset_fuse executes immediately (trivially reversible); false disables the tool's direct path. */
 	UPROPERTY() bool bAllowDirectFuseReset = true;
+	/** Echo "AIDA proposes …" lines into chat. Off: the proposal card + ghost carry the info. */
+	UPROPERTY() bool bAnnounceProposals = false;
 };
 
 /** P8 Slice 5 standing tasks: guard-rails-first — off by default, tokens are spent unattended. */

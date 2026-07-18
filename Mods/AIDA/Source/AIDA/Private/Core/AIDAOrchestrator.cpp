@@ -166,9 +166,9 @@ namespace
 		"without calling the tool creates NOTHING: there is no ghost, /aida approve fails, and the server "
 		"posts a public correction under your reply — it is the most damaging mistake you can make. When "
 		"the player asks you to build/place/change something, your reply MUST START with the propose_* "
-		"tool call — never with prose announcing what you 'will' do or 'have' proposed. The server "
-		"announces every real proposal itself with an 'AIDA proposes …' system line; if that line has "
-		"not appeared, no proposal exists, whatever the conversation says.\n"
+		"tool call — never with prose announcing what you 'will' do or 'have' proposed. Every real "
+		"proposal shows every player an on-screen proposal card and a ghost preview; if the tool result "
+		"in this reply carried no proposalId, no proposal exists, whatever the conversation says.\n"
 		"- propose_build(spec): propose placing buildables on a snapped grid. NOTHING is built until a "
 		"player with act permission approves the proposal. Only call it when the player explicitly asks "
 		"you to build/place something. Omit the spec's 'origin' to build where the player is aiming ('here', "
@@ -594,7 +594,7 @@ void UAIDAOrchestrator::HandleChatRequest(const FAIDARequester& Requester, const
 			}
 			if (!Target.IsValid())
 			{
-				Session->PostSystemMessage(TEXT("No pending proposal to decide. (Real proposals always get an 'AIDA proposes …' system line — if AIDA claimed one without it, it was mistaken; ask it to propose again.)"), ConversationId);
+				Session->PostSystemMessage(TEXT("No pending proposal to decide. (Real proposals always show an on-screen proposal card and a ghost — if AIDA claimed one without them, it was mistaken; ask it to propose again.)"), ConversationId);
 				return;
 			}
 
@@ -1055,7 +1055,7 @@ void UAIDAOrchestrator::FinishChatReply(const FGuid& MsgId, const FGuid& Convers
 		// player's approve bounces.
 		UE_LOG(LogAIDA, Warning, TEXT("[actions] reply STILL invited approval without a proposal after self-repair — posting correction."));
 		Session->PostSystemMessage(
-			TEXT("(Heads up: that reply mentions approving a proposal, but none was actually created — real proposals always get an 'AIDA proposes …' line. Tell AIDA to 'propose it' to get a real one.)"),
+			TEXT("(Heads up: that reply mentions approving a proposal, but none was actually created — real proposals always show a proposal card and a ghost. Tell AIDA to 'propose it' to get a real one.)"),
 			ConversationId);
 	}
 }
@@ -1947,6 +1947,20 @@ void UAIDAOrchestrator::AnnounceSystem(const FString& Text)
 	}
 }
 
+void UAIDAOrchestrator::AnnounceProposal(const FString& Text)
+{
+	// The proposal card + ghost replicate to every player already; the chat echo is opt-in
+	// (actions.announceProposals) — live feedback: the lines were clutter.
+	if (Config.Actions.bAnnounceProposals)
+	{
+		AnnounceSystem(Text);
+	}
+	else
+	{
+		UE_LOG(LogAIDA, Log, TEXT("[actions] (announce suppressed) %s"), *Text);
+	}
+}
+
 void UAIDAOrchestrator::SupersedeProposal(const FGuid& ProposalId)
 {
 	Actions.Store().Remove(ProposalId);
@@ -2064,7 +2078,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// NEVER executes (docs/PHASE4.md §1); execution needs a player approval (Slice 2+3).
 	Tools.Register({
 		TEXT("propose_build"),
-		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool} — ALWAYS the form for a row/line/grid of IDENTICAL buildables ('three refineries in a line' = v1 with grid countX 3), never a composite. v2 COMPOSITE — the form for MULTI-PART structures with DIFFERENT parts (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY — they default to the buildable's real footprint (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
+		TEXT("PROPOSE placing buildables. Nothing is built until a player with act permission approves. Returns a dry-run report (count, cost, validity, the RESOLVED origin in metres) and a proposalId. TWO SPEC FORMS. v1 single grid: {version:1, buildable:'display name', origin?:{x,y,z metres}, yawDeg:0|90|180|270, grid:{countX,countY,stepX?,stepY?}, followTerrain?:bool} — ALWAYS the form for a row/line/grid of IDENTICAL buildables ('three refineries in a line' = v1 with grid countX 3), never a composite. v2 COMPOSITE — the form for MULTI-PART structures with DIFFERENT parts (buildings, reference-image reconstructions): {version:2, origin?:{x,y,z}, yawDeg:0, parts:[{buildable:'display name', at:{x,y,z metres RELATIVE to the origin — z stacks upward}, yawDeg?:0, grid?:{countX,countY,stepX?,stepY?}}, ...]} — up to 32 parts place together, preview together, and get ONE approval; part offsets rotate with the composite yawDeg. OMIT origin to build where the requesting player is aiming (falls back to their position) — never ask the player for coordinates. OMIT stepX/stepY ALWAYS unless the player EXPLICITLY asked for spacing ('every 15 m', 'leave a gap') — omitted steps pack machines edge to edge, which is what 'in a row/line/next to each other' means; the SERVER knows every buildable's true footprint and you do not, so a guessed step just scatters the row (a 'Foundation (2 m)' tile is 8x8 m; the 2 m is THICKNESS — stack floors with at.z, e.g. next storey at z 4 on '4 m' walls). v1 grids are FLAT at the origin's height (followTerrain:true ONLY if the player asks to trace the ground). v1 machines that need power are wired AUTOMATICALLY (poles + lines + grid tie; power:false to skip; pole:'display name' to override) — v2 composites are NOT auto-wired: include poles as parts and wire later. Costs are paid from central storage (dimensional depot) FIRST and then the REQUESTING PLAYER'S INVENTORY — materials in the player's pockets count toward affordability; never tell a player to move items into storage first. BLOCKED GROUND NEVER FAILS A PROPOSAL: uneven terrain/obstructions produce a proposal anyway (invalidCount + firstFailures in the result) with the ghost preview up — tell the player to NUDGE the ghost onto clear ground before approving (approving as-is builds only the valid placements and refunds the rest); never report blocked ground as 'can't build there'. REVISING: when the player asks to CHANGE a pending proposal ('make it 20', 'use mk.2', 'actually 2 rows'), read its spec from get_proposal_status, merge the change, and call this tool again with replaceProposalId set to the old id — the ghost swaps to the revision, no reject needed. To ADD A MANIFOLD to a pending build use propose_manifold with forProposalId instead."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned build spec (see tool description)."},"replaceProposalId":{"type":"string","description":"Optional: a PENDING proposal this one revises — it is retired and its ghost swaps to this proposal atomically. Use when the player asks to change a proposed build (get its spec from get_proposal_status, merge the change, re-propose here)."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -2160,6 +2174,11 @@ void UAIDAOrchestrator::RegisterActionTools()
 				const FAIDAGridSpec& AnchorGrid = bComposite ? Spec.Parts[0].Grid : Spec.Grid;
 				const double StepXCm = FMath::Max(AnchorGrid.StepXM, Recipe.FootprintXM) * 100.0;
 				const double StepYCm = FMath::Max(AnchorGrid.StepYM, Recipe.FootprintYM) * 100.0;
+				// Spacing diagnosis (live feedback: rows kept coming out scattered) — the log shows
+				// whether a gap came from the MODEL's spec step or the server's footprint.
+				UE_LOG(LogAIDA, Log, TEXT("[actions] grid step: %.1f x %.1f m (spec %.1f x %.1f, footprint %.1f x %.1f) for %s"),
+					StepXCm / 100.0, StepYCm / 100.0, AnchorGrid.StepXM, AnchorGrid.StepYM,
+					Recipe.FootprintXM, Recipe.FootprintYM, *Recipe.DisplayName);
 				FVector AimCm;
 				TArray<FVector> Alternates;
 				if (FAIDAActionSeam::ResolveAimSnappedOrigin(this, Ctx.PlayerId, Recipe.RecipeClassPath, /*InOut*/ Spec.YawDeg,
@@ -2441,7 +2460,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Announce += TEXT(" NOTE: the previous revision's manifolds were dropped — re-add them with propose_manifold (forProposalId).");
 			}
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0,
 				&Spec.OriginM, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
@@ -2601,7 +2620,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving (approving as-is builds only the valid ones and refunds the rest)."),
 					Proposal.InvalidCount, Proposal.Placements.Num());
 			}
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds,
 				DryRun.bAffordable, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
@@ -2877,7 +2896,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 				Announce += FString::Printf(TEXT(" NOTE: %d of %d placement(s) are blocked at this spot — approving as-is builds only the valid ones and refunds the rest (a belt crossing the perimeter keeps its gap)."),
 					Proposal.InvalidCount, Proposal.Placements.Num());
 			}
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds,
 				DryRun.bAffordable, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
@@ -2941,7 +2960,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			FString Announce = FString::Printf(TEXT("AIDA proposes (for %s%s): %s. Awaiting approval."),
 				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""), *Proposal.Summary);
 			if (!Warning.IsEmpty()) { Announce += FString::Printf(TEXT(" NOTE: %s"), *Warning); }
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 			Root->SetStringField(TEXT("proposalId"), Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens));
@@ -3277,7 +3296,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
 			PublishProposal(Proposal.Id);
-			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — refunds %s. Awaiting approval."),
+			AnnounceProposal(FString::Printf(TEXT("AIDA proposes (for %s): %s — refunds %s. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, /*bAffordable*/ true, 0.0));
@@ -3685,7 +3704,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 					Announce += FString::Printf(TEXT(" NOTE: %d placement(s) are blocked at this spot — nudge the ghost onto clear ground before approving."),
 						Combined.InvalidCount);
 				}
-				AnnounceSystem(Announce);
+				AnnounceProposal(Announce);
 
 				return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds,
 					/*bAffordable*/ true, 0.0, nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
@@ -3944,7 +3963,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
 			PublishProposal(Proposal.Id);
-			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — attachments cost %s; runs charged as built. Awaiting approval."),
+			AnnounceProposal(FString::Printf(TEXT("AIDA proposes (for %s): %s — attachments cost %s; runs charged as built. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 			Stage(TEXT("published — done"));
 
@@ -4141,7 +4160,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
 			PublishProposal(Proposal.Id);
-			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — poles cost %s; wires charged as built. Awaiting approval."),
+			AnnounceProposal(FString::Printf(TEXT("AIDA proposes (for %s): %s — poles cost %s; wires charged as built. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, PoleDryRun.bAffordable, 0.0,
@@ -4259,7 +4278,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored: %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
 			PublishProposal(Proposal.Id);
-			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s): %s — costs %s. Awaiting approval."),
+			AnnounceProposal(FString::Printf(TEXT("AIDA proposes (for %s): %s — costs %s. Awaiting approval."),
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, true, 0.0));
@@ -4542,7 +4561,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Announce += TEXT(" NOTE: approving cuts the source belt to splice the tap in (undo removes the tap but the cut stays).");
 			}
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds, true, 0.0));
 		}
@@ -4802,7 +4821,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Announce += TEXT(" NOTE: approving cuts the source pipe to splice the junction in (undo removes the tap but the cut stays).");
 			}
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Combined, Config.Actions.TtlSeconds, true, 0.0));
 		}
@@ -5109,7 +5128,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			UE_LOG(LogAIDA, Log, TEXT("[actions] proposal %s stored (connect): %s (by %s)"),
 				*Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens), *Proposal.Summary, *Ctx.Author);
 			PublishProposal(Proposal.Id);
-			AnnounceSystem(FString::Printf(TEXT("AIDA proposes (for %s%s): %s. Awaiting approval."),
+			AnnounceProposal(FString::Printf(TEXT("AIDA proposes (for %s%s): %s. Awaiting approval."),
 				*Ctx.Author, ReplaceId.IsValid() ? TEXT(", revised") : TEXT(""), *Proposal.Summary));
 
 			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, true, 0.0));
@@ -5617,7 +5636,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 			{
 				Announce += FString::Printf(TEXT(" Raw inputs to feed after approval: %s."), *RawList);
 			}
-			AnnounceSystem(Announce);
+			AnnounceProposal(Announce);
 
 			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 			Root->SetStringField(TEXT("proposalId"), Proposal.Id.ToString(EGuidFormats::DigitsWithHyphens));

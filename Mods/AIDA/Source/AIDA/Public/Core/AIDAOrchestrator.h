@@ -119,6 +119,10 @@ private:
 	/** Post a System line to the shared default conversation (proposal announcements/outcomes). */
 	void AnnounceSystem(const FString& Text);
 
+	/** Proposal-created announcements only — OFF by default (the replicated proposal card + ghost
+	 *  already show everything; the chat lines were clutter). actions.announceProposals re-enables. */
+	void AnnounceProposal(const FString& Text);
+
 	/** Kick off the streaming LLM reply (through the tool loop) for an accepted request in a conversation. */
 	void StartAIDAReply(const FAIDARequester& Requester, const FGuid& ConversationId);
 
