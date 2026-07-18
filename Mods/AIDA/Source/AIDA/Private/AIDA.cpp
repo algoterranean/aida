@@ -117,7 +117,8 @@ namespace
 		// tick swaps modes whenever focus changes (click in, ESC out, Ctrl+Enter back in).
 		if (bFocusInput)
 		{
-			PC->SetInputMode(FInputModeGameAndUI());
+			// UI ONLY while typing — GameAndUI leaks unconsumed key-downs into game keybinds.
+			PC->SetInputMode(FInputModeUIOnly());
 			PC->bShowMouseCursor = true;
 			Widget->FocusInput();
 		}

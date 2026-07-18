@@ -486,7 +486,10 @@ void UAIDAChatWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 			bLastInputFocused = true;
 			if (APlayerController* PC = GetOwningPlayer())
 			{
-				PC->SetInputMode(FInputModeGameAndUI());
+				// UI ONLY while typing: GameAndUI leaks key-DOWN events the text box doesn't
+				// consume straight into the game's keybinds (live-verify: typing "x" toggled the
+				// game's X binding). Focus loss flips back to pure game input below.
+				PC->SetInputMode(FInputModeUIOnly());
 				PC->bShowMouseCursor = true;
 			}
 		}
