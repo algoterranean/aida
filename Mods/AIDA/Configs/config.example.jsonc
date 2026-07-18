@@ -37,7 +37,8 @@
     "maxPendingProposals": 3,
     "batchPerTick": 10,                           // executor slice size (10 Hz)
     "undoWindow": 25,                             // how far back /aida undo may reach
-    "costMode": "central"                         // "central" (deduct vs central storage) | "free"
+    "costMode": "central",                        // "central" (deduct vs central storage) | "free"
+    "allowDirectFuseReset": true                  // reset_fuse acts immediately; false disables it
   },
   // Phase 5 reference-image uploads. PRIVACY: attached images are sent to the configured LLM
   // provider (that is the feature); "enabled": false is the server admin's off switch.

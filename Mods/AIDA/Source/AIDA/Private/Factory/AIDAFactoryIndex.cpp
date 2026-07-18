@@ -9,6 +9,7 @@
 #include "Buildables/FGBuildableResourceExtractor.h"
 #include "Buildables/FGBuildableStorage.h"
 #include "Buildables/FGBuildableGenerator.h"
+#include "Buildables/FGBuildableGeneratorFuel.h"
 #include "Buildables/FGBuildableConveyorBase.h"
 #include "Buildables/FGBuildableConveyorAttachment.h"
 #include "Buildables/FGBuildablePipeline.h"
@@ -169,6 +170,27 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 				{
 					if (Ingredient.ItemClass) { Machine.Inputs.Add({ ExtractItemKey(Ingredient.ItemClass), PerMinuteFor(Ingredient, Cycle) }); }
 				}
+
+				// P8 Slice 1 stall causes: empty input hopper vs full output. A slot counts as
+				// free when it is empty or its stack is below the item's stack size.
+				if (UFGInventoryComponent* InputInventory = Manufacturer->GetInputInventory())
+				{
+					Machine.bInputStarved = InputInventory->IsEmpty();
+				}
+				if (UFGInventoryComponent* OutputInventory = Manufacturer->GetOutputInventory())
+				{
+					bool bAnyFree = OutputInventory->GetSizeLinear() == 0;
+					for (int32 Idx = 0; Idx < OutputInventory->GetSizeLinear() && !bAnyFree; ++Idx)
+					{
+						FInventoryStack Stack;
+						if (!OutputInventory->GetStackFromIndex(Idx, Stack) || !Stack.HasItems()
+							|| Stack.NumItems < UFGItemDescriptor::GetStackSize(Stack.Item.GetItemClass()))
+						{
+							bAnyFree = true;
+						}
+					}
+					Machine.bOutputFull = !bAnyFree;
+				}
 			}
 		}
 		else if (Cast<AFGBuildablePipelineAttachment>(Factory))
@@ -177,11 +199,16 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 			bIsMachine = true;
 			Machine.bLogisticsOnly = true;
 		}
-		else if (Cast<AFGBuildableGenerator>(Factory))
+		else if (AFGBuildableGenerator* Generator = Cast<AFGBuildableGenerator>(Factory))
 		{
 			// Generators carry no recipe rates (circuit stats are authoritative for power), but they
 			// must exist as nodes or every fuel belt/pipe into them would read as dangling.
 			bIsMachine = true;
+			if (const AFGBuildableGeneratorFuel* FuelGenerator = Cast<AFGBuildableGeneratorFuel>(Generator))
+			{
+				Machine.bFuelGenerator = true;
+				Machine.bHasFuel = FuelGenerator->HasFuel();
+			}
 		}
 		else if (AFGBuildableStorage* Storage = Cast<AFGBuildableStorage>(Factory))
 		{
@@ -244,6 +271,7 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 		Machine.Clock = Factory->GetCurrentPotential();
 		Machine.bProducing = Factory->IsProducing();
 		Machine.Productivity = Factory->GetProductivity();
+		Machine.bPaused = Factory->IsProductionPaused();
 		if (PowerInfo)
 		{
 			Machine.PowerMW = PowerInfo->GetActualConsumption();
@@ -322,6 +350,7 @@ void FAIDAFactoryIndex::ExtractInto(UObject* WorldContext, FAIDAFactorySnapshot&
 		Report.ConsumedMW = Stats.PowerConsumed;
 		Report.BatteryMWh = Circuit->GetBatterySumPowerStore();
 		Report.BatteryDrainSeconds = Circuit->GetTimeToBatteriesEmpty();
+		Report.bFuseTriggered = Circuit->IsFuseTriggered();
 		Out.Circuits.Add(MoveTemp(Report));
 	}
 

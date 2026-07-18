@@ -77,6 +77,15 @@ public:
 	static FAIDADisconnectedReport FindDisconnected(const FAIDAFactorySnapshot& Snapshot);
 
 	/**
+	 * get_alerts (P8 Slice 1): one consolidated health sweep — tripped fuses (located at the
+	 * centroid of the circuit's machines), fuel generators without fuel, stopped producers split by
+	 * cause (input starved / output full / unknown), player-paused machines, and dangling belt/pipe
+	 * ends (FindDisconnected's edge findings). Machines dead because their circuit's fuse tripped
+	 * are FOLDED into the fuse alert (counted, not listed) — the fuse is the cause.
+	 */
+	static FAIDAAlertsReport BuildAlerts(const FAIDAFactorySnapshot& Snapshot);
+
+	/**
 	 * find_belt_mismatch (P7 Slice 1): links slower than BOTH the fastest link into their source and
 	 * the fastest link out of their sink (a slow belt sandwiched in fast traffic), and links slower
 	 * than their source machine's total output rate (an undersized outfeed).

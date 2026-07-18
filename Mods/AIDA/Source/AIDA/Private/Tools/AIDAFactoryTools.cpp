@@ -17,6 +17,7 @@ namespace
 	constexpr int32 MaxItemsPerContainer = 10;
 	constexpr int32 MaxDisconnectedFindings = 25;
 	constexpr int32 MaxBeltMismatches = 20;
+	constexpr int32 MaxAlerts = 40;
 
 	/** Centroid humanized to whole metres (world units are cm), as [x, y] — Z dropped for the overview. */
 	TArray<TSharedPtr<FJsonValue>> CentroidMetres(const FVector& Centroid)
@@ -273,6 +274,61 @@ FString AIDAFactoryTools::BuildDisconnectedJson(const FAIDADisconnectedReport& R
 	}
 	Root->SetArrayField(TEXT("findingList"), Arr);
 	if (Report.Findings.Num() > Shown) { Root->SetNumberField(TEXT("findingsOmitted"), Report.Findings.Num() - Shown); }
+	return AIDAToCompactJson(Root);
+}
+
+FString AIDAFactoryTools::BuildAlertsJson(const FAIDAAlertsReport& Report)
+{
+	const auto KindString = [](const FAIDAAlert& Alert) -> const TCHAR*
+	{
+		switch (Alert.Kind)
+		{
+		case EAIDAAlertKind::FuseTripped:     return TEXT("fuse_tripped");
+		case EAIDAAlertKind::GeneratorNoFuel: return TEXT("generator_no_fuel");
+		case EAIDAAlertKind::MachineStarved:  return TEXT("machine_starved");
+		case EAIDAAlertKind::MachineBlocked:  return TEXT("machine_blocked");
+		case EAIDAAlertKind::MachinePaused:   return TEXT("machine_paused");
+		case EAIDAAlertKind::DanglingEdge:    return Alert.bPipe ? TEXT("dangling_pipe") : TEXT("dangling_belt");
+		default:                              return TEXT("machine_stopped");
+		}
+	};
+
+	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("alerts"), Report.Alerts.Num());
+
+	// Per-kind headline counts so the model can summarize without walking the list.
+	TMap<FString, int32> KindCounts;
+	for (const FAIDAAlert& Alert : Report.Alerts) { ++KindCounts.FindOrAdd(KindString(Alert)); }
+	const TSharedRef<FJsonObject> Counts = MakeShared<FJsonObject>();
+	for (const TPair<FString, int32>& Pair : KindCounts) { Counts->SetNumberField(Pair.Key, Pair.Value); }
+	Root->SetObjectField(TEXT("byKind"), Counts);
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	const int32 Shown = FMath::Min(Report.Alerts.Num(), MaxAlerts);
+	for (int32 i = 0; i < Shown; ++i)
+	{
+		const FAIDAAlert& Alert = Report.Alerts[i];
+		const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("kind"), KindString(Alert));
+		if (!Alert.BuildingClass.IsEmpty()) { O->SetStringField(TEXT("building"), Alert.BuildingClass); }
+		if (Alert.NodeId != 0) { O->SetNumberField(TEXT("nodeId"), Alert.NodeId); }
+		if (Alert.CircuitId != 0) { O->SetNumberField(TEXT("circuitId"), Alert.CircuitId); }
+		O->SetArrayField(TEXT("location_m"), CentroidMetres(Alert.Location));
+		O->SetStringField(TEXT("detail"), Alert.Detail);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("alertList"), Arr);
+	if (Report.Alerts.Num() > Shown) { Root->SetNumberField(TEXT("alertsOmitted"), Report.Alerts.Num() - Shown); }
+
+	Root->SetNumberField(TEXT("circuitsChecked"), Report.CircuitsChecked);
+	Root->SetNumberField(TEXT("machinesChecked"), Report.MachinesChecked);
+	Root->SetNumberField(TEXT("generatorsChecked"), Report.GeneratorsChecked);
+	Root->SetNumberField(TEXT("edgesChecked"), Report.EdgesChecked);
+	if (Report.StalledOnTrippedCircuits > 0)
+	{
+		Root->SetNumberField(TEXT("stalledOnTrippedCircuits"), Report.StalledOnTrippedCircuits);
+		Root->SetStringField(TEXT("stalledHint"), TEXT("these machines are dark because of the tripped fuse(s) above, not separate problems"));
+	}
 	return AIDAToCompactJson(Root);
 }
 

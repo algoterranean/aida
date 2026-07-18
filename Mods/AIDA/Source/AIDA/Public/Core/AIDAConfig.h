@@ -86,6 +86,8 @@ struct FAIDAActionsConfig
 	UPROPERTY() int32 UndoWindow = 25;
 	/** "central" (tally + deduct vs central storage) | "free" (report only, never deduct). */
 	UPROPERTY() FString CostMode = TEXT("central");
+	/** reset_fuse executes immediately (trivially reversible); false disables the tool's direct path. */
+	UPROPERTY() bool bAllowDirectFuseReset = true;
 };
 
 USTRUCT()

@@ -1203,6 +1203,108 @@ namespace
 	}
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryAlertsTest, "AIDA.Factory.Alerts",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+bool FAIDAFactoryAlertsTest::RunTest(const FString&)
+{
+	FAIDAFactorySnapshot Snap;
+
+	// Circuit 7 tripped with two dead machines on it (they must FOLD into the fuse alert);
+	// circuit 1 healthy carrying one starved, one blocked, one paused, one fine machine.
+	{
+		FAIDAPowerCircuitStats Tripped;
+		Tripped.CircuitId = 7;
+		Tripped.CapacityMW = 300.0;
+		Tripped.bFuseTriggered = true;
+		Snap.Circuits.Add(Tripped);
+		FAIDAPowerCircuitStats Fine;
+		Fine.CircuitId = 1;
+		Fine.CapacityMW = 100.0;
+		Fine.ConsumedMW = 40.0;
+		Snap.Circuits.Add(Fine);
+	}
+	const auto Producer = [](int32 Id, const FVector& Loc, int32 CircuitId, bool bRunning)
+	{
+		FAIDAMachine M = AIDAMakeTestMachine(Id, Loc, TEXT("Constructor"));
+		M.Recipe = TEXT("Iron Plate");
+		M.CircuitId = CircuitId;
+		M.bProducing = bRunning;
+		M.Productivity = bRunning ? 1.0f : 0.0f;
+		return M;
+	};
+	Snap.Machines.Add(Producer(1, FVector(0, 0, 0), 7, false));      // dark: fuse
+	Snap.Machines.Add(Producer(2, FVector(2000, 0, 0), 7, false));   // dark: fuse
+	{
+		FAIDAMachine Starved = Producer(3, FVector(3000, 0, 0), 1, false);
+		Starved.bInputStarved = true;
+		Snap.Machines.Add(Starved);
+		FAIDAMachine Blocked = Producer(4, FVector(4000, 0, 0), 1, false);
+		Blocked.bOutputFull = true;
+		Snap.Machines.Add(Blocked);
+		FAIDAMachine Paused = Producer(5, FVector(5000, 0, 0), 1, true);
+		Paused.bPaused = true;
+		Snap.Machines.Add(Paused);
+		Snap.Machines.Add(Producer(6, FVector(6000, 0, 0), 1, true)); // healthy
+		FAIDAMachine DryGenerator = AIDAMakeTestMachine(7, FVector(7000, 0, 0), TEXT("GeneratorCoal"));
+		DryGenerator.bFuelGenerator = true;
+		DryGenerator.bHasFuel = false;
+		Snap.Machines.Add(DryGenerator);
+		FAIDAMachine FedGenerator = AIDAMakeTestMachine(8, FVector(8000, 0, 0), TEXT("GeneratorCoal"));
+		FedGenerator.bFuelGenerator = true;
+		Snap.Machines.Add(FedGenerator);
+	}
+	Snap.Edges.Add({ 6, 0, TEXT("Iron Plate"), 120.0 }); // belt from the healthy machine leads nowhere
+
+	const FAIDAAlertsReport Report = FAIDAFactoryAggregator::BuildAlerts(Snap);
+	TestEqual(TEXT("six alerts"), Report.Alerts.Num(), 6);
+	TestEqual(TEXT("two circuits checked"), Report.CircuitsChecked, 2);
+	TestEqual(TEXT("six producers checked"), Report.MachinesChecked, 6);
+	TestEqual(TEXT("two generators checked"), Report.GeneratorsChecked, 2);
+	TestEqual(TEXT("fuse-dark machines fold into the fuse alert"), Report.StalledOnTrippedCircuits, 2);
+
+	int32 Fuses = 0, NoFuel = 0, Starved = 0, Blocked = 0, Paused = 0, Stopped = 0, Dangling = 0;
+	for (const FAIDAAlert& Alert : Report.Alerts)
+	{
+		switch (Alert.Kind)
+		{
+		case EAIDAAlertKind::FuseTripped:
+			++Fuses;
+			TestEqual(TEXT("fuse alert names the circuit"), Alert.CircuitId, 7);
+			TestTrue(TEXT("fuse alert sits at the dark machines' centroid"),
+				Alert.Location.Equals(FVector(1000, 0, 0), 1.0));
+			break;
+		case EAIDAAlertKind::GeneratorNoFuel: ++NoFuel; TestEqual(TEXT("the dry generator"), Alert.NodeId, 7); break;
+		case EAIDAAlertKind::MachineStarved:  ++Starved; TestEqual(TEXT("the starved machine"), Alert.NodeId, 3); break;
+		case EAIDAAlertKind::MachineBlocked:  ++Blocked; TestEqual(TEXT("the blocked machine"), Alert.NodeId, 4); break;
+		case EAIDAAlertKind::MachinePaused:   ++Paused;  TestEqual(TEXT("the paused machine"), Alert.NodeId, 5); break;
+		case EAIDAAlertKind::MachineStopped:  ++Stopped; break;
+		case EAIDAAlertKind::DanglingEdge:    ++Dangling; break;
+		}
+	}
+	TestEqual(TEXT("one fuse alert"), Fuses, 1);
+	TestEqual(TEXT("one dry generator"), NoFuel, 1);
+	TestEqual(TEXT("one starved"), Starved, 1);
+	TestEqual(TEXT("one blocked"), Blocked, 1);
+	TestEqual(TEXT("one paused"), Paused, 1);
+	TestEqual(TEXT("no unexplained stalls"), Stopped, 0);
+	TestEqual(TEXT("one dangling belt"), Dangling, 1);
+	TestTrue(TEXT("fuses sort first"), Report.Alerts.Num() > 0 && Report.Alerts[0].Kind == EAIDAAlertKind::FuseTripped);
+
+	const TSharedPtr<FJsonObject> J = AIDAParseTestJson(AIDAFactoryTools::BuildAlertsJson(Report));
+	if (TestTrue(TEXT("alerts json parses"), J.IsValid()))
+	{
+		TestEqual(TEXT("json alert count"), J->GetIntegerField(TEXT("alerts")), 6);
+		TestEqual(TEXT("json folded-stall count"), J->GetIntegerField(TEXT("stalledOnTrippedCircuits")), 2);
+		const TSharedPtr<FJsonObject>* ByKind = nullptr;
+		if (TestTrue(TEXT("json has byKind"), J->TryGetObjectField(TEXT("byKind"), ByKind)))
+		{
+			TestEqual(TEXT("byKind counts starved"), (*ByKind)->GetIntegerField(TEXT("machine_starved")), 1);
+			TestEqual(TEXT("byKind counts the fuse"), (*ByKind)->GetIntegerField(TEXT("fuse_tripped")), 1);
+		}
+	}
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAIDAFactoryPlannerTest, "AIDA.Planner.PlanFactory",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 bool FAIDAFactoryPlannerTest::RunTest(const FString&)

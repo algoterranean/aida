@@ -381,6 +381,128 @@ namespace
 	};
 }
 
+FAIDAAlertsReport FAIDAFactoryAggregator::BuildAlerts(const FAIDAFactorySnapshot& Snapshot)
+{
+	FAIDAAlertsReport Report;
+
+	// Fuses first — and remember tripped circuits so their dead machines fold into the fuse alert
+	// instead of flooding the list as individual stalls.
+	TSet<int32> TrippedCircuits;
+	for (const FAIDAPowerCircuitStats& Circuit : Snapshot.Circuits)
+	{
+		++Report.CircuitsChecked;
+		if (!Circuit.bFuseTriggered) { continue; }
+		TrippedCircuits.Add(Circuit.CircuitId);
+
+		FVector Centroid = FVector::ZeroVector;
+		int32 OnCircuit = 0;
+		for (const FAIDAMachine& M : Snapshot.Machines)
+		{
+			if (M.CircuitId == Circuit.CircuitId)
+			{
+				Centroid += M.Location;
+				++OnCircuit;
+			}
+		}
+		if (OnCircuit > 0) { Centroid /= OnCircuit; }
+
+		FAIDAAlert Alert;
+		Alert.Kind = EAIDAAlertKind::FuseTripped;
+		Alert.CircuitId = Circuit.CircuitId;
+		Alert.Location = Centroid;
+		Alert.Detail = FString::Printf(TEXT("fuse tripped on circuit %d (%d machine(s) dark, %.0f MW generation capacity)"),
+			Circuit.CircuitId, OnCircuit, Circuit.CapacityMW);
+		Report.Alerts.Add(MoveTemp(Alert));
+	}
+
+	// Fuel generators before generic stalls — "out of fuel" is the better diagnosis.
+	for (const FAIDAMachine& M : Snapshot.Machines)
+	{
+		if (!M.bFuelGenerator) { continue; }
+		++Report.GeneratorsChecked;
+		if (M.bHasFuel) { continue; }
+		FAIDAAlert Alert;
+		Alert.Kind = EAIDAAlertKind::GeneratorNoFuel;
+		Alert.NodeId = M.Id;
+		Alert.CircuitId = M.CircuitId;
+		Alert.BuildingClass = M.BuildingClass;
+		Alert.Location = M.Location;
+		Alert.Detail = TEXT("out of fuel — nothing left to burn");
+		Report.Alerts.Add(MoveTemp(Alert));
+	}
+
+	for (const FAIDAMachine& M : Snapshot.Machines)
+	{
+		// Producers only: something with a recipe or an extraction output. Logistics nodes never
+		// stall and fuel generators were handled above.
+		if (M.bLogisticsOnly || M.bFuelGenerator) { continue; }
+		if (M.Recipe.IsEmpty() && M.Outputs.Num() == 0) { continue; }
+		++Report.MachinesChecked;
+
+		if (M.bPaused)
+		{
+			FAIDAAlert Alert;
+			Alert.Kind = EAIDAAlertKind::MachinePaused;
+			Alert.NodeId = M.Id;
+			Alert.CircuitId = M.CircuitId;
+			Alert.BuildingClass = M.BuildingClass;
+			Alert.Location = M.Location;
+			Alert.Detail = TEXT("production paused by a player");
+			Report.Alerts.Add(MoveTemp(Alert));
+			continue;
+		}
+		if (M.bProducing || M.Productivity > 0.05f) { continue; }
+		if (TrippedCircuits.Contains(M.CircuitId))
+		{
+			++Report.StalledOnTrippedCircuits;
+			continue;
+		}
+
+		FAIDAAlert Alert;
+		Alert.NodeId = M.Id;
+		Alert.CircuitId = M.CircuitId;
+		Alert.BuildingClass = M.BuildingClass;
+		Alert.Location = M.Location;
+		if (M.bInputStarved)
+		{
+			Alert.Kind = EAIDAAlertKind::MachineStarved;
+			Alert.Detail = TEXT("stopped — input inventory empty (nothing is arriving)");
+		}
+		else if (M.bOutputFull)
+		{
+			Alert.Kind = EAIDAAlertKind::MachineBlocked;
+			Alert.Detail = TEXT("stopped — output inventory full (nothing takes its products)");
+		}
+		else
+		{
+			Alert.Kind = EAIDAAlertKind::MachineStopped;
+			Alert.Detail = M.Recipe.IsEmpty()
+				? TEXT("stopped — inputs and output look fine (depleted node, or check power)")
+				: TEXT("stopped — inputs and output look fine (check power or the recipe)");
+		}
+		Report.Alerts.Add(MoveTemp(Alert));
+	}
+
+	// Dangling belt/pipe ends — reuse find_disconnected, keep only its edge findings (open ports
+	// and half-wired splitters are construction noise, not alerts).
+	const FAIDADisconnectedReport Disconnected = FindDisconnected(Snapshot);
+	Report.EdgesChecked = Disconnected.EdgesChecked;
+	for (const FAIDADisconnectedFinding& Finding : Disconnected.Findings)
+	{
+		if (Finding.Kind != EAIDADisconnectKind::DanglingEdge) { continue; }
+		FAIDAAlert Alert;
+		Alert.Kind = EAIDAAlertKind::DanglingEdge;
+		Alert.NodeId = Finding.NodeId;
+		Alert.BuildingClass = Finding.BuildingClass;
+		Alert.Location = Finding.Location;
+		Alert.bPipe = Finding.bPipe;
+		Alert.Detail = Finding.Detail;
+		Report.Alerts.Add(MoveTemp(Alert));
+	}
+
+	return Report;
+}
+
 FAIDADisconnectedReport FAIDAFactoryAggregator::FindDisconnected(const FAIDAFactorySnapshot& Snapshot)
 {
 	FAIDADisconnectedReport Report;

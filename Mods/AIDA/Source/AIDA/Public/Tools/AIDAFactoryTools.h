@@ -32,6 +32,9 @@ namespace AIDAFactoryTools
 	/** find_disconnected: dangling nodes/runs first, then open-port machines, with checked totals. */
 	FString BuildDisconnectedJson(const FAIDADisconnectedReport& Report);
 
+	/** get_alerts: everything wrong right now, worst first, with per-kind counts and checked totals. */
+	FString BuildAlertsJson(const FAIDAAlertsReport& Report);
+
 	/** find_belt_mismatch: links slower than their surroundings, biggest choke first. */
 	FString BuildBeltMismatchJson(const TArray<FAIDABeltMismatch>& Mismatches);
 

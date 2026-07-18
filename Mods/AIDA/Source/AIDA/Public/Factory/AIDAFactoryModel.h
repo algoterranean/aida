@@ -36,6 +36,13 @@ struct FAIDAMachine
 	float Clock = 1.0f;              // overclock potential, 1.0 = 100%
 	bool bProducing = true;          // currently running (not starved/paused/unpowered)
 	float Productivity = 1.0f;       // [0,1] recent uptime fraction (game's GetProductivity)
+
+	//~ Alert inputs (P8 Slice 1) — why a stopped machine is stopped, read cheaply at extract time.
+	bool bPaused = false;            // production paused by a player (IsProductionPaused)
+	bool bInputStarved = false;      // manufacturer with a recipe and an EMPTY input inventory
+	bool bOutputFull = false;        // manufacturer whose output inventory has no room left
+	bool bFuelGenerator = false;     // fuel-burning generator (coal/fuel/nuclear)
+	bool bHasFuel = true;            // fuel generators only: false = tank/hopper is empty
 	TArray<FAIDAItemRate> Inputs;    // items/min consumed at Clock
 	TArray<FAIDAItemRate> Outputs;   // items/min produced at Clock
 	double PowerMW = 0.0;            // electrical load; >0 draws, <0 generates
@@ -74,6 +81,7 @@ struct FAIDAPowerCircuitStats
 	double ConsumedMW = 0.0;         // current draw (authoritative, from the circuit)
 	double BatteryMWh = 0.0;         // stored battery energy
 	double BatteryDrainSeconds = -1.0; // time-to-empty; <0 = not draining / no batteries
+	bool bFuseTriggered = false;     // the circuit's fuse is blown — everything on it is dark
 };
 
 /** One item kind inside a container, aggregated across its stacks. */
@@ -204,6 +212,41 @@ struct FAIDADisconnectedReport
 	int32 NodesChecked = 0;                    // logistics nodes examined
 	int32 MachinesChecked = 0;                 // producing machines examined
 	int32 EdgesChecked = 0;
+};
+
+/** What a get_alerts finding is (P8 Slice 1) — something wrong RIGHT NOW, with where and why. */
+enum class EAIDAAlertKind : uint8
+{
+	FuseTripped,     // circuit fuse blown — everything on it is dark
+	GeneratorNoFuel, // fuel generator with an empty tank/hopper
+	MachineStarved,  // producer stopped with an empty input inventory
+	MachineBlocked,  // producer stopped with a full output inventory
+	MachineStopped,  // producer stopped with no visible inventory cause
+	MachinePaused,   // production paused by a player
+	DanglingEdge     // belt/pipe to/from nothing (find_disconnected's edge findings)
+};
+
+struct FAIDAAlert
+{
+	EAIDAAlertKind Kind = EAIDAAlertKind::MachineStopped;
+	int32 NodeId = 0;                // machine/node id (0 for circuit alerts)
+	int32 CircuitId = 0;             // fuse alerts; also set on machine alerts when known
+	FString BuildingClass;           // empty for circuit alerts
+	FVector Location = FVector::ZeroVector; // fuse alerts: centroid of the circuit's machines
+	bool bPipe = false;              // dangling-edge alerts
+	FString Detail;                  // one-line cause
+};
+
+/** get_alerts output: everything wrong right now (fuses, fuel, stalls, pauses, dangling ends). */
+struct FAIDAAlertsReport
+{
+	TArray<FAIDAAlert> Alerts;
+	int32 CircuitsChecked = 0;
+	int32 MachinesChecked = 0;          // producing machines examined (logistics nodes excluded)
+	int32 GeneratorsChecked = 0;        // fuel generators examined
+	int32 EdgesChecked = 0;
+	/** Stalled machines NOT listed individually because their circuit's fuse alert explains them. */
+	int32 StalledOnTrippedCircuits = 0;
 };
 
 /** One suspiciously slow link (P7 Slice 1): a belt/pipe slower than the traffic around it. */

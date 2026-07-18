@@ -22,6 +22,15 @@
 #include "Net/AIDAChatRelay.h"
 #include "Net/AIDAProposalRelay.h"
 #include "Subsystem/SubsystemActorManager.h"
+// P8 Slice 1 (reset_fuse / get_milestone_status): live circuit + schematic reads.
+#include "FGBuildableSubsystem.h"
+#include "Buildables/FGBuildableFactory.h"
+#include "FGPowerInfoComponent.h"
+#include "FGPowerCircuit.h"
+#include "FGSchematicManager.h"
+#include "FGSchematic.h"
+#include "ItemAmount.h"
+#include "Resources/FGItemDescriptor.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/GameModeBase.h"
@@ -103,6 +112,14 @@ namespace
 		"nothing, machines with open ports. Use for 'is anything disconnected / nothing is arriving'.\n"
 		"- find_belt_mismatch(): slow belts/pipes sandwiched in faster paths or undersized for their "
 		"producer. Use for 'slow belts mixed in / throughput is mysteriously low'.\n"
+		"- get_alerts(): ONE consolidated health sweep — tripped fuses, out-of-fuel generators, stopped "
+		"machines split by cause (input starved vs output full), paused machines, dangling belts/pipes. "
+		"Call this FIRST for 'is something wrong / why did everything stop / factory status'.\n"
+		"- get_milestone_status(): the active milestone's remaining cost plus the next milestones "
+		"available to pick. Use for 'what do we still owe / what should we unlock next'.\n"
+		"- reset_fuse(): reset ALL tripped power fuses immediately (no approval needed). Use when 'the "
+		"power is out / everything went dark'; afterwards WARN the player if load still exceeds capacity "
+		"(the fuse will trip again — suggest pausing machines or adding generators).\n"
 		"- get_container_contents(item?, radius_m?): storage containers and what they hold (per-item "
 		"counts, nearest first). Use for 'what's in these containers / where is my X stored'.\n"
 		"- get_resource_nodes(resource?, untapped_only?): map resource nodes by purity and occupancy.\n"
@@ -1002,6 +1019,155 @@ void UAIDAOrchestrator::RegisterTools()
 			const double Now = World ? World->GetTimeSeconds() : 0.0;
 			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
 			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildBeltMismatchJson(FAIDAFactoryAggregator::FindBeltMismatch(Snapshot)));
+		}
+	});
+
+	// P8 Slice 1: one consolidated health sweep — the model's first call for "is something wrong".
+	Tools.Register({
+		TEXT("get_alerts"),
+		TEXT("ONE consolidated factory health sweep: tripped fuses (located at the dark machines' centroid), fuel generators out of fuel, stopped machines split by cause (input starved vs output full vs unknown), player-paused machines, and belts/pipes ending in nothing. ALWAYS call this first for 'is something wrong / why did production stop / factory status'. Machines dark because of a tripped fuse are folded into that fuse alert, not listed one by one. Locations in metres."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			UWorld* World = GetWorld();
+			const double Now = World ? World->GetTimeSeconds() : 0.0;
+			const FAIDAFactorySnapshot& Snapshot = FactoryIndex.GetSnapshot(World, Now);
+			return FAIDAToolResult::Ok(AIDAFactoryTools::BuildAlertsJson(FAIDAFactoryAggregator::BuildAlerts(Snapshot)));
+		}
+	});
+
+	// P8 Slice 1: milestone progress — live schematic-manager read (not snapshot data).
+	Tools.Register({
+		TEXT("get_milestone_status"),
+		TEXT("The active HUB milestone: name, tier, and the REMAINING cost to pay off, plus the next few milestones available to select. Use for 'what do we still owe / how far along is the milestone / what should we unlock next' — and as the target for planning ('plan production for the remaining milestone cost')."),
+		TEXT(""),
+		EAIDAToolTier::Query,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& /*Ctx*/) -> FAIDAToolResult
+		{
+			AFGSchematicManager* Schematics = GetWorld() ? AFGSchematicManager::Get(GetWorld()) : nullptr;
+			if (!Schematics)
+			{
+				return FAIDAToolResult::Error(TEXT("no schematic manager in this world — is a save loaded?"));
+			}
+			const auto CostToJson = [](const TArray<FItemAmount>& Cost)
+			{
+				TArray<TSharedPtr<FJsonValue>> Arr;
+				for (const FItemAmount& Entry : Cost)
+				{
+					if (!Entry.ItemClass) { continue; }
+					const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+					O->SetStringField(TEXT("item"), UFGItemDescriptor::GetItemName(Entry.ItemClass).ToString());
+					O->SetNumberField(TEXT("amount"), Entry.Amount);
+					Arr.Add(MakeShared<FJsonValueObject>(O));
+				}
+				return Arr;
+			};
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			const TSubclassOf<UFGSchematic> Active = Schematics->GetActiveSchematic();
+			if (Active)
+			{
+				const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetStringField(TEXT("name"), UFGSchematic::GetSchematicDisplayName(Active).ToString());
+				O->SetNumberField(TEXT("tier"), UFGSchematic::GetTechTier(Active));
+				O->SetArrayField(TEXT("remainingCost"), CostToJson(Schematics->GetRemainingCostFor(Active)));
+				Root->SetObjectField(TEXT("active"), O);
+			}
+			else
+			{
+				Root->SetStringField(TEXT("active"), TEXT("none — no milestone selected at the HUB"));
+			}
+
+			// The next choices: available-but-unpurchased milestones, a handful is plenty.
+			TArray<TSubclassOf<UFGSchematic>> Available;
+			Schematics->GetAvailableSchematicsOfTypes({ ESchematicType::EST_Milestone }, Available);
+			TArray<TSharedPtr<FJsonValue>> Arr;
+			constexpr int32 MaxAvailableMilestones = 6;
+			for (int32 i = 0; i < Available.Num() && Arr.Num() < MaxAvailableMilestones; ++i)
+			{
+				if (!Available[i] || Available[i] == Active) { continue; }
+				const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetStringField(TEXT("name"), UFGSchematic::GetSchematicDisplayName(Available[i]).ToString());
+				O->SetNumberField(TEXT("tier"), UFGSchematic::GetTechTier(Available[i]));
+				O->SetArrayField(TEXT("cost"), CostToJson(UFGSchematic::GetCost(Available[i])));
+				Arr.Add(MakeShared<FJsonValueObject>(O));
+			}
+			Root->SetArrayField(TEXT("availableMilestones"), Arr);
+			if (Available.Num() > MaxAvailableMilestones)
+			{
+				Root->SetNumberField(TEXT("availableOmitted"), Available.Num() - MaxAvailableMilestones);
+			}
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
+		}
+	});
+
+	// P8 Slice 1: fuse reset — Act tier but DIRECT execute (docs/PHASE8.md: trivially reversible,
+	// players ask in a panic; precedent: tag_node writes world state without the proposal flow).
+	Tools.Register({
+		TEXT("reset_fuse"),
+		TEXT("Reset every tripped power fuse NOW (executes immediately — no proposal/approval; it is trivially reversible). Returns each reset circuit's load vs generation capacity AFTER the reset: when load exceeds capacity, WARN the player it will trip again and suggest pausing machines or adding generators. Use when 'the power is out / everything went dark / reset the breaker'. Says so if no fuse was tripped."),
+		TEXT(""),
+		EAIDAToolTier::Act,
+		[this](const TSharedRef<FJsonObject>& /*Args*/, const FAIDAToolContext& Ctx) -> FAIDAToolResult
+		{
+			if (!Config.Actions.bAllowDirectFuseReset)
+			{
+				return FAIDAToolResult::Error(TEXT("direct fuse reset is disabled on this server (actions.allowDirectFuseReset) — a player must reset the fuse at a power pole or switch."));
+			}
+			// Live circuit walk (the snapshot may be stale): every factory's power info leads to its
+			// circuit; the subsystem has no public enumeration.
+			AFGBuildableSubsystem* Subsystem = GetWorld() ? AFGBuildableSubsystem::Get(GetWorld()) : nullptr;
+			if (!Subsystem)
+			{
+				return FAIDAToolResult::Error(TEXT("no buildable subsystem in this world — is a save loaded?"));
+			}
+			TSet<UFGPowerCircuit*> Circuits;
+			for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
+			{
+				const AFGBuildableFactory* Factory = Cast<AFGBuildableFactory>(Buildable);
+				UFGPowerInfoComponent* PowerInfo = Factory ? Factory->GetPowerInfo() : nullptr;
+				if (UFGPowerCircuit* Circuit = PowerInfo ? PowerInfo->GetPowerCircuit() : nullptr)
+				{
+					Circuits.Add(Circuit);
+				}
+			}
+
+			const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+			TArray<TSharedPtr<FJsonValue>> Arr;
+			int32 ResetCount = 0;
+			int32 StillOverloaded = 0;
+			for (UFGPowerCircuit* Circuit : Circuits)
+			{
+				if (!Circuit || !Circuit->IsFuseTriggered()) { continue; }
+				Circuit->ResetFuse();
+				++ResetCount;
+
+				FPowerCircuitStats Stats;
+				Circuit->GetStats(Stats);
+				const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetNumberField(TEXT("circuitId"), Circuit->GetCircuitID());
+				O->SetField(TEXT("load_MW"), AIDANumber(Stats.PowerConsumed));
+				O->SetField(TEXT("capacity_MW"), AIDANumber(Stats.PowerProductionCapacity));
+				const bool bOverloaded = Stats.PowerConsumed > Stats.PowerProductionCapacity + 1e-3;
+				O->SetBoolField(TEXT("willTripAgain"), bOverloaded);
+				if (bOverloaded) { ++StillOverloaded; }
+				Arr.Add(MakeShared<FJsonValueObject>(O));
+			}
+			Root->SetNumberField(TEXT("fusesReset"), ResetCount);
+			Root->SetArrayField(TEXT("circuits"), Arr);
+			if (ResetCount == 0)
+			{
+				Root->SetStringField(TEXT("note"), TEXT("no tripped fuses found — the power problem is something else (check get_alerts)"));
+			}
+			else
+			{
+				UE_LOG(LogAIDA, Log, TEXT("[actions] reset %d tripped fuse(s) for %s (%d still overloaded)."),
+					ResetCount, *Ctx.Author, StillOverloaded);
+				AnnounceSystem(FString::Printf(TEXT("AIDA reset %d tripped fuse(s) for %s.%s"), ResetCount, *Ctx.Author,
+					StillOverloaded > 0 ? TEXT(" WARNING: load still exceeds capacity — it will trip again.") : TEXT("")));
+			}
+			return FAIDAToolResult::Ok(AIDAToCompactJson(Root));
 		}
 	});
 
