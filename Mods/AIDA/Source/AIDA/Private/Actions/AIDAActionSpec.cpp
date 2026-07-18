@@ -499,11 +499,20 @@ bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int3
 
 	FAIDAManifoldSpec Parsed;
 
-	FString Kind = TEXT("belt");
-	Spec->TryGetStringField(TEXT("kind"), Kind);
-	Kind = Kind.TrimStartAndEnd().ToLower();
-	if (Kind == TEXT("pipe")) { Parsed.bPipe = true; }
-	else if (Kind != TEXT("belt")) { OutError = TEXT("'kind' must be \"belt\" or \"pipe\""); return false; }
+	// Kind OMITTED (or 'auto'/'both') = every kind the machines support (user rule: unqualified
+	// "add manifolds" must cover belts AND pipes on machines that have both).
+	FString Kind;
+	if (!Spec->TryGetStringField(TEXT("kind"), Kind) || Kind.TrimStartAndEnd().IsEmpty())
+	{
+		Parsed.bAutoKind = true;
+	}
+	else
+	{
+		Kind = Kind.TrimStartAndEnd().ToLower();
+		if (Kind == TEXT("pipe")) { Parsed.bPipe = true; }
+		else if (Kind == TEXT("auto") || Kind == TEXT("both")) { Parsed.bAutoKind = true; }
+		else if (Kind != TEXT("belt")) { OutError = TEXT("'kind' must be \"belt\", \"pipe\", or \"both\""); return false; }
+	}
 
 	FString Direction = TEXT("in");
 	Spec->TryGetStringField(TEXT("direction"), Direction);
@@ -511,11 +520,9 @@ bool AIDAActionSpec::ParseManifoldSpec(const TSharedPtr<FJsonObject>& Spec, int3
 	if (Direction == TEXT("out")) { Parsed.bOutput = true; }
 	else if (Direction != TEXT("in")) { OutError = TEXT("'direction' must be \"in\" (feed inputs) or \"out\" (collect outputs)"); return false; }
 
-	if (!Spec->TryGetStringField(TEXT("transport"), Parsed.Transport) || Parsed.Transport.TrimStartAndEnd().IsEmpty())
-	{
-		OutError = TEXT("'transport' (belt or pipe display name, e.g. \"Conveyor Belt Mk.2\") is required");
-		return false;
-	}
+	// Transport is OPTIONAL — the server defaults to the best unlocked belt/pipeline per kind
+	// (the model shouldn't need to know the players' unlocked tiers).
+	Spec->TryGetStringField(TEXT("transport"), Parsed.Transport);
 	Parsed.Transport = Parsed.Transport.TrimStartAndEnd();
 	Spec->TryGetStringField(TEXT("attachment"), Parsed.Attachment);
 	Parsed.Attachment = Parsed.Attachment.TrimStartAndEnd();

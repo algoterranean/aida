@@ -102,8 +102,9 @@ struct FAIDAManifoldSpec
 {
 	int32 Version = 1;
 	bool bPipe = false;                    // kind: "belt" (default) | "pipe"
+	bool bAutoKind = false;                // kind omitted/'both': every kind the machines support
 	bool bOutput = false;                  // direction: "in" (feed inputs, default) | "out" (collect outputs)
-	FString Transport;                     // belt/pipe display name, fuzzy-resolved, unlocked only
+	FString Transport;                     // belt/pipe display name; "" = best unlocked per kind
 	FString Attachment;                    // optional override; "" = the kind/direction default
 	FAIDADismantleSpec Machines;           // selector reuse (buildable required, center optional = aim)
 	double StandoffM = 4.0;                // trunk-line distance in front of the ports

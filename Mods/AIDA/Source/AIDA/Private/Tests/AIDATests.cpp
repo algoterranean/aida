@@ -2393,8 +2393,17 @@ bool FAIDAActionsManifoldTest::RunTest(const FString&)
 		TestTrue(TEXT("center kept"), Spec.Machines.bHasCenter);
 		TestEqual(TEXT("port index"), Spec.PortIndex, 1);
 
-		TestFalse(TEXT("rejects missing transport"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+		// Kind omitted = auto (every supported kind); transport omitted = best unlocked per kind.
+		TestTrue(TEXT("bare spec parses"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
 			R"({ "version": 1, "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
+		TestTrue(TEXT("omitted kind = auto"), Spec.bAutoKind);
+		TestTrue(TEXT("omitted transport left empty"), Spec.Transport.IsEmpty());
+		TestTrue(TEXT("kind 'both' parses"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "kind": "both", "machines": { "buildable": "Refinery" } })")), 200, Spec, Error));
+		TestTrue(TEXT("kind 'both' = auto"), Spec.bAutoKind);
+		TestTrue(TEXT("explicit belt parses"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
+			R"({ "version": 1, "kind": "belt", "machines": { "buildable": "Smelter" } })")), 200, Spec, Error));
+		TestFalse(TEXT("explicit kind is not auto"), Spec.bAutoKind);
 		TestFalse(TEXT("rejects missing machines"), AIDAActionSpec::ParseManifoldSpec(AIDATestParseJson(TEXT(
 			R"({ "version": 1, "transport": "Belt" })")), 200, Spec, Error));
 		// forProposalId manifolds take their machines from the pending proposal — selector optional.

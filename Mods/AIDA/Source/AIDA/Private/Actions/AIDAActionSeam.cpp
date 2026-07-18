@@ -3395,14 +3395,58 @@ bool FAIDAActionSeam::ResolveMachinePorts(UObject* WorldContext, const FAIDADism
 	const double RadiusSq = FMath::Square(Selector.RadiusM * AIDAMetersToCm);
 	const int32 MaxCount = Selector.MaxCount > 0 ? Selector.MaxCount : MAX_int32;
 
+	// Phase 1 — every name-matching machine within a broad bound; the selector radius only SEEDS.
+	struct FCandidate
+	{
+		AFGBuildable* Machine = nullptr;
+		FVector Loc = FVector::ZeroVector;
+		double SeedDistSq = 0.0;
+		bool bIncluded = false;
+	};
+	TArray<FCandidate> Candidates;
+	const double BroadSq = FMath::Square(75000.0); // 750 m sanity bound on the row walk
 	for (AFGBuildable* Buildable : Subsystem->GetAllBuildablesRef())
 	{
-		if (OutPorts.Num() >= MaxCount) { break; }
 		if (!IsValid(Buildable)) { continue; }
-		if (FVector::DistSquared(Buildable->GetActorLocation(), CenterCm) > RadiusSq) { continue; }
+		const FVector Loc = Buildable->GetActorLocation();
+		const double DistSq = FVector::DistSquared(Loc, CenterCm);
+		if (DistSq > BroadSq) { continue; }
+		if (!NormalizeName(BuildableDisplayName(Buildable)).Contains(WantedName)) { continue; }
+		Candidates.Add({ Buildable, Loc, DistSq, DistSq <= RadiusSq });
+	}
 
+	// Phase 2 — GROW along the row (live feedback: "manifold my 8 generators" covered 4 — the
+	// aim-centered radius clipped the row). Any matching machine within ~22 m of an included one
+	// joins, to a fixpoint: a contiguous same-type row is always covered WHOLE, while separate
+	// clusters farther than a couple of machine widths away stay out.
+	const double NeighborSq = FMath::Square(2200.0);
+	bool bGrew = true;
+	while (bGrew)
+	{
+		bGrew = false;
+		for (FCandidate& Cand : Candidates)
+		{
+			if (Cand.bIncluded) { continue; }
+			for (const FCandidate& In : Candidates)
+			{
+				if (!In.bIncluded) { continue; }
+				if (FVector::DistSquared(Cand.Loc, In.Loc) <= NeighborSq)
+				{
+					Cand.bIncluded = true;
+					bGrew = true;
+					break;
+				}
+			}
+		}
+	}
+	Candidates.RemoveAll([](const FCandidate& Cand) { return !Cand.bIncluded; });
+	Candidates.Sort([](const FCandidate& A, const FCandidate& B) { return A.SeedDistSq < B.SeedDistSq; });
+
+	for (const FCandidate& Candidate : Candidates)
+	{
+		if (OutPorts.Num() >= MaxCount) { break; }
+		AFGBuildable* Buildable = Candidate.Machine;
 		const FString Name = BuildableDisplayName(Buildable);
-		if (!NormalizeName(Name).Contains(WantedName)) { continue; }
 
 		// The PortIndex-th UNCONNECTED port of the wanted kind/direction, in stable name order.
 		// A machine with matching ports that are all taken counts as skipped-connected; a machine

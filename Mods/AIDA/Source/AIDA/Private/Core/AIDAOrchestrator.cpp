@@ -236,9 +236,13 @@ namespace
 		"one-by-one with propose_build, and do NOT detour through clusters or the factory overview — the "
 		"tool selects machines by display name near a point, not by cluster. direction 'in' feeds machine "
 		"inputs, 'out' collects outputs; 'both ends' or 'inputs and outputs' means TWO calls, one 'in' and "
-		"one 'out'. Omit machines.center to use the machines the player is looking at ('these assemblers', "
+		"one 'out'. OMIT kind unless the player names belts or pipes — the server then covers EVERY kind "
+		"the machines support (both a pipe row and a belt row when they have both, as two proposals). "
+		"OMIT transport unless the player names a tier — the server picks the best unlocked one. Omit "
+		"machines.center to use the machines the player is looking at ('these assemblers', "
 		"'this row') — that is almost always right; only ask when you truly cannot tell which machine TYPE "
-		"they mean. Machines already connected on that port are skipped automatically. Every port on a "
+		"they mean. The row covers every same-type machine standing in it, not just those within a tight "
+		"radius. Machines already connected on that port are skipped automatically. Every port on a "
 		"machine side gets its OWN row distance automatically (pipes hug the machines, belt rows sit "
 		"further out, a second belt input gets the next row) — when machines need several manifolds "
 		"(refineries: belt + pipe, both sides), just propose each one; any order works, rows won't "
@@ -3450,7 +3454,7 @@ void UAIDAOrchestrator::RegisterActionTools()
 	// store Pending (docs/PHASE4-MANIFOLDS.md). Runs (belts/pipes) build + charge at execute time.
 	Tools.Register({
 		TEXT("propose_manifold"),
-		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind:'belt'|'pipe', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport:'belt or pipe display name', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, flow?:'left'|'right'|'forward'|'back'|compass (the direction ITEMS MOVE along the trunk, resolved against the player's facing — 'flowing left to right' = flow 'right': feed end lands on the left for in-rows, exit on the right for out-rows), standoffM?:4, port?:0}. OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). This works for v1 grids AND v2 composites (a composite's ports come from its machine parts; foundations/walls contribute none) — NEVER tell the player a pending proposal must be approved or built before manifolds can be added. Call again with the NEW id to add more manifolds (both sides = one call per side)."),
+		TEXT("PROPOSE the belt/pipe plumbing (a manifold) for a row of machines: one splitter or merger per machine on a straight trunk line in front of their ports, plus all connecting belt runs (or a pipe-junction + pipe equivalent). Nothing is built until a player with act permission approves. Spec: {version:1, kind?:'belt'|'pipe'|'both', direction:'in' (feed inputs, splitters) | 'out' (collect outputs, mergers), transport?:'belt or pipe display name (omit = best unlocked tier)', attachment?:'override display name', machines:{buildable:'machine display name', center?:{x,y in metres}, radiusM?:30, maxCount?:0=all}, flow?:'left'|'right'|'forward'|'back'|compass (the direction ITEMS MOVE along the trunk, resolved against the player's facing — 'flowing left to right' = flow 'right': feed end lands on the left for in-rows, exit on the right for out-rows), standoffM?:4, port?:0}. OMIT kind when the player didn't name one — the server probes the machines and covers EVERY kind they support (machines with both belt and pipe ports get a pipe row AND a belt row, stored as two proposals each needing approval). OMIT machines.center to use the machines the requesting player is looking at. Machines whose matching port is already connected are skipped automatically. The machines must roughly face the same direction. Every port on a machine side gets its OWN row distance automatically (pipes hug the machines, belt rows further out, a second belt input the next row) — propose multiple manifolds in any order; the rows will not collide. Returns the attachment dry-run (cost, count) + run count; runs are charged as they build. Blocked ground never fails the proposal: attachments that can't validate are reported (invalidCount), skipped at execute, and refunded — their runs then fail loudly. TO MANIFOLD A PENDING (UNBUILT) PROPOSAL: pass forProposalId with that proposal's id and OMIT spec.machines — the machines do NOT need to be built or approved first; the pending proposal is replaced by ONE combined proposal (machines + manifold ghosts together, one approval). This works for v1 grids AND v2 composites (a composite's ports come from its machine parts; foundations/walls contribute none) — NEVER tell the player a pending proposal must be approved or built before manifolds can be added. Call again with the NEW id to add more manifolds (both sides = one call per side)."),
 		TEXT(R"({"type":"object","properties":{"spec":{"type":"object","description":"The versioned manifold spec (see tool description)."},"forProposalId":{"type":"string","description":"Optional: a PENDING machine-build proposal to manifold — the machines do NOT need to exist yet. The pending proposal is replaced by ONE combined proposal (machines + manifold, ghosts for both, one approval). Omit spec.machines when using this."}},"required":["spec"]})"),
 		EAIDAToolTier::Act,
 		[this](const TSharedRef<FJsonObject>& Args, const FAIDAToolContext& Ctx) -> FAIDAToolResult
@@ -3482,57 +3486,102 @@ void UAIDAOrchestrator::RegisterActionTools()
 				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Error, {}));
 			}
 			Stage(FString::Printf(TEXT("parsed kind=%s direction=%s transport=%s machines=%s"),
-				Spec.bPipe ? TEXT("pipe") : TEXT("belt"), Spec.bOutput ? TEXT("out") : TEXT("in"),
-				*Spec.Transport, *Spec.Machines.Buildable));
+				Spec.bAutoKind ? TEXT("auto") : (Spec.bPipe ? TEXT("pipe") : TEXT("belt")),
+				Spec.bOutput ? TEXT("out") : TEXT("in"),
+				Spec.Transport.IsEmpty() ? TEXT("(best unlocked)") : *Spec.Transport, *Spec.Machines.Buildable));
+
+			// Auto-kind is a LIVE-ports question (probe both kinds below, after the center defaults);
+			// a manifold for a PENDING build has no live ports to probe, so it defaults to belt.
+			if (Spec.bAutoKind && !ForIdStr.IsEmpty())
+			{
+				Spec.bAutoKind = false;
+			}
 
 			// Transport (belt/pipe) and attachment (splitter/merger/junction) both resolve like any
-			// buildable — unlocked recipes only, suggestions on a miss.
+			// buildable — unlocked recipes only, suggestions on a miss. No transport named = the best
+			// unlocked tier for the kind. Behind a lambda because auto-kind only knows the kind after
+			// probing the machines' ports.
 			FAIDARecipeResolution Transport;
-			if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Transport, Transport))
-			{
-				FString Msg = FString::Printf(TEXT("no unlocked buildable matches transport '%s'"), *Spec.Transport);
-				if (Transport.Suggestions.Num() > 0)
-				{
-					Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Transport.Suggestions, TEXT(", ")));
-				}
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
-			}
-			// Default attachment names are TRIED IN ORDER — the game's display names drift ("Pipeline
-			// Junction Cross" vs "Pipeline Junction"; live-verify: a miss with no suggestions read as
-			// "you haven't unlocked junctions"). An explicit spec override is a single candidate.
-			TArray<FString> AttachmentNames;
-			if (!Spec.Attachment.IsEmpty())
-			{
-				AttachmentNames.Add(Spec.Attachment);
-			}
-			else if (Spec.bPipe)
-			{
-				AttachmentNames = { TEXT("Pipeline Junction Cross"), TEXT("Pipeline Junction"), TEXT("Junction") };
-			}
-			else
-			{
-				AttachmentNames.Add(Spec.bOutput ? TEXT("Conveyor Merger") : TEXT("Conveyor Splitter"));
-			}
 			FAIDARecipeResolution Attachment;
 			FString AttachmentName;
-			for (const FString& Candidate : AttachmentNames)
+			const auto ResolveKindHardware = [&]() -> FString
 			{
-				if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Attachment))
+				Transport = FAIDARecipeResolution();
+				Attachment = FAIDARecipeResolution();
+				AttachmentName.Reset();
+				if (!Spec.Transport.IsEmpty())
 				{
-					AttachmentName = Candidate;
-					break;
+					if (!FAIDAActionSeam::ResolveBuildRecipe(this, Spec.Transport, Transport))
+					{
+						FString Msg = FString::Printf(TEXT("no unlocked buildable matches transport '%s'"), *Spec.Transport);
+						if (Transport.Suggestions.Num() > 0)
+						{
+							Msg += FString::Printf(TEXT(" — closest: %s"), *FString::Join(Transport.Suggestions, TEXT(", ")));
+						}
+						return Msg;
+					}
 				}
-			}
-			if (AttachmentName.IsEmpty())
+				else
+				{
+					const TArray<FString> Ladder = Spec.bPipe
+						? TArray<FString>{ TEXT("Pipeline Mk.2"), TEXT("Pipeline") }
+						: TArray<FString>{ TEXT("Conveyor Belt Mk.6"), TEXT("Conveyor Belt Mk.5"), TEXT("Conveyor Belt Mk.4"),
+							TEXT("Conveyor Belt Mk.3"), TEXT("Conveyor Belt Mk.2"), TEXT("Conveyor Belt Mk.1") };
+					bool bFound = false;
+					for (const FString& Candidate : Ladder)
+					{
+						if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Transport)) { bFound = true; break; }
+					}
+					if (!bFound)
+					{
+						return FString::Printf(TEXT("no unlocked %s found for the manifold runs — pass 'transport' with the exact build-menu name"),
+							Spec.bPipe ? TEXT("pipeline") : TEXT("conveyor belt"));
+					}
+				}
+				// Default attachment names are TRIED IN ORDER — the game's display names drift ("Pipeline
+				// Junction Cross" vs "Pipeline Junction"; live-verify: a miss with no suggestions read as
+				// "you haven't unlocked junctions"). An explicit spec override is a single candidate.
+				TArray<FString> AttachmentNames;
+				if (!Spec.Attachment.IsEmpty())
+				{
+					AttachmentNames.Add(Spec.Attachment);
+				}
+				else if (Spec.bPipe)
+				{
+					AttachmentNames = { TEXT("Pipeline Junction Cross"), TEXT("Pipeline Junction"), TEXT("Junction") };
+				}
+				else
+				{
+					AttachmentNames.Add(Spec.bOutput ? TEXT("Conveyor Merger") : TEXT("Conveyor Splitter"));
+				}
+				for (const FString& Candidate : AttachmentNames)
+				{
+					if (FAIDAActionSeam::ResolveBuildRecipe(this, Candidate, Attachment))
+					{
+						AttachmentName = Candidate;
+						break;
+					}
+				}
+				if (AttachmentName.IsEmpty())
+				{
+					FString Msg = FString::Printf(TEXT("no unlocked buildable matches attachment '%s' — the name may differ from the build menu, or it may be locked"),
+						*FString::Join(AttachmentNames, TEXT("' / '")));
+					if (Attachment.Suggestions.Num() > 0)
+					{
+						Msg += FString::Printf(TEXT("; closest: %s"), *FString::Join(Attachment.Suggestions, TEXT(", ")));
+					}
+					Msg += TEXT("; you can pass 'attachment' with the exact build-menu name");
+					return Msg;
+				}
+				return FString();
+			};
+			if (!Spec.bAutoKind)
 			{
-				FString Msg = FString::Printf(TEXT("no unlocked buildable matches attachment '%s' — the name may differ from the build menu, or it may be locked"),
-					*FString::Join(AttachmentNames, TEXT("' / '")));
-				if (Attachment.Suggestions.Num() > 0)
+				const FString HardwareError = ResolveKindHardware();
+				if (!HardwareError.IsEmpty())
 				{
-					Msg += FString::Printf(TEXT("; closest: %s"), *FString::Join(Attachment.Suggestions, TEXT(", ")));
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(HardwareError, {}));
 				}
-				Msg += TEXT("; you can pass 'attachment' with the exact build-menu name");
-				return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(Msg, {}));
 			}
 
 			// ---- Manifold for a PENDING build (revise-by-prompt) --------------------------------
@@ -3895,6 +3944,45 @@ void UAIDAOrchestrator::RegisterActionTools()
 				}
 			}
 
+			// Kind omitted = every kind these machines support (user rule: unqualified "add
+			// manifolds" is hit-or-miss otherwise). Probe both kinds' free ports: one kind free →
+			// that kind; both free → THIS call builds the pipe row (junctions hug the machines, so
+			// pipes take the inner lane) and a second propose_manifold is dispatched for the belts
+			// after publish — two proposals, two approvals.
+			bool bAlsoBelts = false;
+			if (Spec.bAutoKind)
+			{
+				TArray<FAIDAManifoldPort> ProbePorts;
+				int32 ProbeSkipped = 0;
+				FString ProbeName;
+				FAIDAActionSeam::ResolveMachinePorts(this, Spec.Machines, /*bPipe*/ true, Spec.bOutput, Spec.PortIndex,
+					ProbePorts, ProbeSkipped, ProbeName);
+				const bool bPipePorts = ProbePorts.Num() > 0;
+				ProbePorts.Reset();
+				ProbeSkipped = 0;
+				ProbeName.Reset();
+				FAIDAActionSeam::ResolveMachinePorts(this, Spec.Machines, /*bPipe*/ false, Spec.bOutput, Spec.PortIndex,
+					ProbePorts, ProbeSkipped, ProbeName);
+				const bool bBeltPorts = ProbePorts.Num() > 0;
+				if (!bPipePorts && !bBeltPorts)
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(FString::Printf(
+						TEXT("no '%s' with a free %s belt or pipe port within %.0f m of the given point"),
+						*Spec.Machines.Buildable, Spec.bOutput ? TEXT("output") : TEXT("input"), Spec.Machines.RadiusM), {}));
+				}
+				Spec.bPipe = bPipePorts;
+				Spec.bAutoKind = false;
+				bAlsoBelts = bPipePorts && bBeltPorts;
+				(*SpecObj)->SetStringField(TEXT("kind"), Spec.bPipe ? TEXT("pipe") : TEXT("belt")); // stored spec is concrete
+				const FString HardwareError = ResolveKindHardware();
+				if (!HardwareError.IsEmpty())
+				{
+					return FAIDAToolResult::Error(AIDAActionSpec::BuildErrorJson(HardwareError, {}));
+				}
+				Stage(FString::Printf(TEXT("auto-kind resolved: %s%s"), Spec.bPipe ? TEXT("pipe") : TEXT("belt"),
+					bAlsoBelts ? TEXT(" (belts dispatched after publish)") : TEXT("")));
+			}
+
 			Stage(FString::Printf(TEXT("recipes+center resolved (attachment=%s center=%.0f,%.0f) — resolving ports"),
 				*AttachmentName, Spec.Machines.CenterM.X, Spec.Machines.CenterM.Y));
 			TArray<FAIDAManifoldPort> Ports;
@@ -4135,8 +4223,55 @@ void UAIDAOrchestrator::RegisterActionTools()
 				*Ctx.Author, *Proposal.Summary, *AIDACostSummaryString(Proposal.Cost)));
 			Stage(TEXT("published — done"));
 
-			return FAIDAToolResult::Ok(AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0,
-				nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr));
+			const FString ResultJson = AIDAActionSpec::BuildDryRunJson(Proposal, Config.Actions.TtlSeconds, DryRun.bAffordable, 0.0,
+				nullptr, DryRun.Failures.Num() > 0 ? &DryRun.Failures : nullptr);
+			if (bAlsoBelts)
+			{
+				// Companion belt row: the same spec with kind pinned to belt, transport left to the
+				// best-unlocked ladder, standoff re-derived (the belt lane steps out past the pipe
+				// row it can now see). Dispatched as a real tool call so it plans/stores/publishes
+				// exactly like a user-requested belt manifold. Two proposals, two approvals.
+				const TSharedRef<FJsonObject> BeltSpec = MakeShared<FJsonObject>();
+				for (const auto& Pair : (*SpecObj)->Values)
+				{
+					BeltSpec->SetField(Pair.Key, Pair.Value);
+				}
+				BeltSpec->SetStringField(TEXT("kind"), TEXT("belt"));
+				BeltSpec->RemoveField(TEXT("transport"));
+				BeltSpec->RemoveField(TEXT("standoffM"));
+				const TSharedRef<FJsonObject> BeltArgs = MakeShared<FJsonObject>();
+				BeltArgs->SetObjectField(TEXT("spec"), BeltSpec);
+				const FAIDAToolResult BeltResult = Tools.Dispatch(TEXT("propose_manifold"), AIDAToCompactJson(BeltArgs), Ctx);
+
+				const TSharedRef<FJsonObject> Both = MakeShared<FJsonObject>();
+				Both->SetStringField(TEXT("note"),
+					TEXT("kind was omitted and these machines support belts AND pipes — TWO manifold proposals were stored (pipes + belts); each needs its own approval"));
+				TSharedPtr<FJsonObject> PipeObj;
+				{
+					const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ResultJson);
+					FJsonSerializer::Deserialize(Reader, PipeObj);
+				}
+				if (PipeObj.IsValid())
+				{
+					Both->SetObjectField(TEXT("pipes"), PipeObj);
+				}
+				if (!BeltResult.bIsError)
+				{
+					TSharedPtr<FJsonObject> BeltObj;
+					const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BeltResult.Content);
+					FJsonSerializer::Deserialize(Reader, BeltObj);
+					if (BeltObj.IsValid())
+					{
+						Both->SetObjectField(TEXT("belts"), BeltObj);
+					}
+				}
+				else
+				{
+					Both->SetStringField(TEXT("beltsError"), BeltResult.Content);
+				}
+				return FAIDAToolResult::Ok(AIDAToCompactJson(Both));
+			}
+			return FAIDAToolResult::Ok(ResultJson);
 		}
 	});
 
