@@ -295,14 +295,17 @@ namespace
 		 *  Captured-mouse play (mouse-look, drags) falls through untouched. */
 		virtual bool HandleMouseWheelOrGestureEvent(FSlateApplication& SlateApp, const FPointerEvent& WheelEvent, const FPointerEvent* /*GestureEvent*/) override
 		{
-			if (WheelEvent.GetWheelDelta() == 0.f || SlateApp.HasAnyMouseCaptor())
+			if (WheelEvent.GetWheelDelta() == 0.f)
 			{
 				return false;
 			}
 			if (WheelEvent.IsControlDown())
 			{
-				// Only consumed while a pending proposal exists — otherwise the game keeps the
-				// chord. 90° per notch; Shift = 15°, Alt = 1° for fine alignment.
+				// NO mouse-captor guard here: game-only input (chat hidden — exactly when the
+				// player is walking around the ghost) captures the mouse PERMANENTLY, and the old
+				// guard let the wheel fall through to the hotbar (live-verify: Ctrl+Wheel scrolled
+				// weapons instead of rotating). Only consumed while a pending proposal exists —
+				// otherwise the game keeps the chord. 90° per notch; Shift = 15°, Alt = 1°.
 				const int32 Step = WheelEvent.IsAltDown() ? 1 : (WheelEvent.IsShiftDown() ? 15 : 90);
 				for (const auto& Pair : ShownChatWidgets())
 				{
@@ -314,6 +317,12 @@ namespace
 						return true; // consume — the hotbar must not also spin
 					}
 				}
+				return false;
+			}
+			// Plain wheel: transcript scroll only — this one DOES respect captured-mouse play
+			// (drags, mouse-look) and needs a real cursor position anyway.
+			if (SlateApp.HasAnyMouseCaptor())
+			{
 				return false;
 			}
 			for (const auto& Pair : ShownChatWidgets())
