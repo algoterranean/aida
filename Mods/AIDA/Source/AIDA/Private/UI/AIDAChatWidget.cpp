@@ -532,7 +532,10 @@ void UAIDAChatWidget::ScrollTranscriptBy(float DeltaPx)
 	if (TranscriptScroll)
 	{
 		const float End = FMath::Max(0.f, TranscriptScroll->GetScrollOffsetOfEnd());
-		TranscriptScroll->SetScrollOffset(FMath::Clamp(TranscriptScroll->GetScrollOffset() + DeltaPx, 0.f, End));
+		const float NewOffset = FMath::Clamp(TranscriptScroll->GetScrollOffset() + DeltaPx, 0.f, End);
+		TranscriptScroll->SetScrollOffset(NewOffset);
+		// A deliberate scroll away from the end pauses tail-following; returning resumes it.
+		bFollowTail = NewOffset >= End - 20.f;
 	}
 }
 
@@ -545,7 +548,9 @@ void UAIDAChatWidget::HandleSliderValueChanged(float Value)
 {
 	if (TranscriptScroll)
 	{
-		TranscriptScroll->SetScrollOffset((1.f - Value) * FMath::Max(0.f, TranscriptScroll->GetScrollOffsetOfEnd()));
+		const float End = FMath::Max(0.f, TranscriptScroll->GetScrollOffsetOfEnd());
+		TranscriptScroll->SetScrollOffset((1.f - Value) * End);
+		bFollowTail = (1.f - Value) * End >= End - 20.f; // dragging to the bottom resumes following
 	}
 }
 
@@ -639,7 +644,8 @@ void UAIDAChatWidget::SendChat(const FString& Text)
 	{
 		R->SubmitChat(Text, CurrentConversationId);
 	}
-	// Typing always snaps the view to the tail (user rule) — the reply lands where you're looking.
+	// Typing always resumes tail-following (user rule) — the reply lands where you're looking.
+	bFollowTail = true;
 	if (TranscriptScroll)
 	{
 		TranscriptScroll->ScrollToEnd();
@@ -697,14 +703,11 @@ void UAIDAChatWidget::HandleMsgBegin(const FAIDAMessageHeader& Header)
 	}
 	if (Header.ConversationId == CurrentConversationId)
 	{
+		// A NEW message (the player's echo, AIDA's reply opening, a system line) always resumes
+		// tail-following (user rule: fresh text must be visible); a deliberate scroll-up only
+		// pauses it until the next message or until the reader returns to the bottom.
+		bFollowTail = true;
 		RenderActiveConversation();
-		// A NEW message (the player's echo, AIDA's reply opening, a system line) always snaps to
-		// the tail (user rule: fresh text must be visible). Mid-stream deltas stay sticky-only so
-		// deliberately scrolling up during a long reply still works.
-		if (TranscriptScroll)
-		{
-			TranscriptScroll->ScrollToEnd();
-		}
 	}
 
 	OnMessageBegin(Header);
@@ -746,6 +749,7 @@ void UAIDAChatWidget::SwitchToConversation(const FGuid& ConvId)
 {
 	CurrentConversationId = ConvId;
 	HistoryCursor = INDEX_NONE; // each tab recalls its own history from its newest line
+	bFollowTail = true;         // a fresh tab always opens at its newest text
 	EnsureConversation(ConvId);
 	RebuildTabBar();
 	RenderActiveConversation();
@@ -1017,16 +1021,12 @@ void UAIDAChatWidget::RenderActiveConversation()
 	{
 		TranscriptText->SetText(FText::FromString(RenderedTranscript));
 	}
-	if (TranscriptScroll)
+	if (TranscriptScroll && bFollowTail)
 	{
-		// Stick to the end only when the reader is already there — a player scrolled up to read
-		// must not be yanked back down by every streamed delta. (Offsets are PRE-append here;
-		// content only grows, so "within a line of the end" is the right stickiness test.)
-		const float End = TranscriptScroll->GetScrollOffsetOfEnd();
-		if (End <= 1.f || TranscriptScroll->GetScrollOffset() >= End - 20.f)
-		{
-			TranscriptScroll->ScrollToEnd();
-		}
+		// Follow-tail flag, not offset inference: the offsets lag layout and broke exactly when
+		// content first exceeded the window (end jumps, offset still 0 → "not near the end" →
+		// following never started). The flag clears only on a deliberate scroll away.
+		TranscriptScroll->ScrollToEnd();
 	}
 	OnTranscriptChanged.Broadcast(RenderedTranscript);
 }

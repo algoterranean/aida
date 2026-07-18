@@ -211,6 +211,12 @@ private:
 	 *  (which steals focus at press) completes before the mouse is re-captured. */
 	float UnfocusGraceSeconds = 0.f;
 
+	/** Follow the transcript tail (VS-Code style): every render snaps to the bottom while true.
+	 *  Cleared ONLY when the user scrolls away from the end (wheel/slider/PgUp); restored when
+	 *  they scroll back down, send a line, or a new message opens. Offset-inference broke at the
+	 *  fits→overflow transition (end jumps, offset lags) and following never started. */
+	bool bFollowTail = true;
+
 	UFUNCTION()
 	void HandleSliderValueChanged(float Value);
 	UFUNCTION()
